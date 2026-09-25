@@ -5,13 +5,24 @@
 
 #include "SystemState.h"
 #include "IModule.h"
+// D-021/D-023: while no moto-rt-core exists, this node is the TEMPORARY sole tester on
+// the vehicle bus (its TWAI is wired to the CL250 DLC). When rt-core starts polling, this
+// poller must be switched off -- two testers are never allowed -- and the TWAI moves to
+// the platform bus to read rt-core's republished values (platform.dbc VehiclePowertrain /
+// VehicleSpeed). That receive path does not exist yet, so building without the tester
+// role fails loudly instead of silently producing a node with no data source.
+#ifndef CONN_VEHICLE_TESTER
+#error "CONN_VEHICLE_TESTER must be defined (1 = temporary vehicle-bus tester, D-023)."
+#elif !CONN_VEHICLE_TESTER
+#error "Platform-bus receive of rt-core's republished signals is not implemented yet."
+#endif
+
 #ifdef MOCK_CAN_DATA
 #include "MockCANModule.h"
 #else
 #include "HondaCANModule.h"
 #include "hal/TwaiCanBus.h"
 #endif
-#include "IMUModule.h"
 #include "NextionModule.h"
 #include "BLEServerModule.h"
 #include "WiFiServerModule.h"
@@ -23,14 +34,11 @@
 #define CAN_TX_PIN      GPIO_NUM_4
 #define CAN_RX_PIN      GPIO_NUM_5
 
-#define I2C_SDA_PIN     GPIO_NUM_1
-#define I2C_SCL_PIN     GPIO_NUM_2
-
 #define UART2_TX_PIN    GPIO_NUM_17
 #define UART2_RX_PIN    GPIO_NUM_18
 
 // Free GPIO used purely for loop-timing observation (oscilloscope / logic analyzer probe).
-// Not wired to any peripheral above (4,5,1,2,17,18 are taken).
+// Not wired to any peripheral above (4,5,17,18 are taken; 1/2 were the dropped IMU's I2C).
 #define DEBUG_LOOP_PIN  GPIO_NUM_8
 
 // G1.4 -- Task Watchdog Timer. If loop() ever stalls (a module hangs) for longer than
@@ -64,14 +72,13 @@ MockCANModule      canModule;
 TwaiCanBus         canBus(CAN_TX_PIN, CAN_RX_PIN);
 HondaCANModule     canModule(canBus);
 #endif
-IMUModule          imuModule(I2C_SDA_PIN, I2C_SCL_PIN);
 NextionModule      displayModule(NextionSerial, UART2_RX_PIN, UART2_TX_PIN);
 BLEServerModule    bleModule;
 WiFiServerModule   wifiModule(80);      // SoftAP HTTP JSON Backend Server on port 80
 SerialLoggerModule loggerModule(1000); // Prints serial log every 1000ms
 
 // G3.1 -- Producer/consumer module arrays, not one polymorphic IModule[]. Producers
-// (CAN, IMU, BLE) are the only modules that ever write into SystemState; consumers
+// (CAN, BLE) are the only modules that ever write into SystemState; consumers
 // (Nextion, WiFi, Logger) get a const SystemState& so the compiler rejects any
 // accidental write. Producers run first each pass so every consumer in that same
 // pass sees that pass's freshest data (see PR discussion: this is not an added-latency
@@ -79,7 +86,6 @@ SerialLoggerModule loggerModule(1000); // Prints serial log every 1000ms
 // reaching Nextion, since BLE used to run after Nextion in the old single array).
 IProducerModule* producers[] = {
     &canModule,
-    &imuModule,
     &bleModule,
 };
 IConsumerModule* consumers[] = {
@@ -90,7 +96,7 @@ IConsumerModule* consumers[] = {
 
 const uint8_t PRODUCER_COUNT = sizeof(producers) / sizeof(producers[0]);
 const uint8_t CONSUMER_COUNT = sizeof(consumers) / sizeof(consumers[0]);
-const char* PRODUCER_NAMES[PRODUCER_COUNT] = {"CAN", "IMU", "BLE"};
+const char* PRODUCER_NAMES[PRODUCER_COUNT] = {"CAN", "BLE"};
 const char* CONSUMER_NAMES[CONSUMER_COUNT] = {"Nextion", "WiFi", "Logger"};
 
 // ============================================================================
@@ -124,7 +130,7 @@ const unsigned long TIMING_REPORT_INTERVAL_MS = 10000;
 // ============================================================================
 // G0.2 -- MODULE HEALTH TRACKING
 // A module whose begin() fails (or that later reports unhealthy) is excluded
-// from update() so one broken peripheral (e.g. IMU not wired) cannot stall
+// from update() so one broken peripheral (e.g. Nextion not wired) cannot stall
 // or crash the modules that are working.
 // ============================================================================
 bool producerActive[PRODUCER_COUNT];
@@ -136,7 +142,7 @@ bool consumerActive[CONSUMER_COUNT];
 // main.cpp is the single place that decides, from that declaration, whether this
 // pass is due to call update() -- replacing the old pattern of every module doing
 // its own internal millis() comparison. Modules that need every-pass execution
-// (CAN/UDS timing, IMU sample rate, WiFi HTTP responsiveness, BLE queue draining)
+// (CAN/UDS timing, WiFi HTTP responsiveness, BLE queue draining)
 // simply report period 0 (IModule's default) and are unaffected.
 // ============================================================================
 unsigned long producerLastRunMs[PRODUCER_COUNT] = {0};
@@ -217,7 +223,7 @@ void setup() {
     delay(500);
 
     Serial.println("\n==================================================");
-    Serial.println("   HONDA CL250 DUAL-TRANSPORT TELEMETRY STARTING  ");
+    Serial.println("   MOTO-CONNECTIVITY-NODE (CL250 TELEMETRY) START  ");
     Serial.println("==================================================");
     Serial.printf(" [BOOT] Reset reason: %s\n", resetReasonName(esp_reset_reason()));
 

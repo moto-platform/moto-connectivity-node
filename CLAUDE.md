@@ -21,7 +21,7 @@ Firmware running on **ESP32-S3**. Its role is narrow and clear: Wi-Fi/BLE connec
 
 Simple messaging with `moto-rt-core` (STM32H7) over SPI/UART (future target: SOME/IP). The message format is not yet finalized (Q-004; proposal: COBS + CRC16 + msg-id, defined in moto-vehicle-defs) — leave a placeholder/TODO here; the real format will be settled once both repos design it together.
 
-Connected to the platform CAN via TWAI (classic CAN, 500 kbps): receives the io-node's park-mode alarm and relays it over Wi-Fi, publishes its own heartbeat. Not connected to the vehicle bus.
+Target state: connected to the platform CAN via TWAI (classic CAN, 500 kbps): receives the io-node's park-mode alarm and relays it over Wi-Fi, publishes its own heartbeat, not connected to the vehicle bus. Until rt-core takes over, the single TWAI is on the vehicle bus instead (temporary tester, see below), so no heartbeat is sent yet.
 
 ## Dependencies
 
@@ -29,13 +29,17 @@ Reads signal definitions from `moto-vehicle-defs` (submodule: `external/moto-veh
 
 ## Build
 
-PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espidf`, D-023). Target chip: `esp32s3`. Native unit tests with `pio test -e native`.
+PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espidf`, D-023). Target chip: `esp32s3`.
+- `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`)
+- `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock`; needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
+- `pio test -e native`, or `scripts/native_tests.sh` (g++ + Unity, no PlatformIO registry needed)
 
 ## Legacy telemetry port (D-023)
 
 The code comes from the read-only reference repo `moto-platform/HondaCl250_Telemetry` (archived). Ported as-is: CAN/UDS module, `ICanBus`/`TwaiCanBus`, mock CAN, BLE server + packet schema, Nextion, serial logger, native tests. Rewritten: WiFi server (no Arduino `String`). Dropped: web PWA and the complementary-filter lean angle.
 - This node is the **temporary sole tester** on the vehicle bus until rt-core takes over. Then its poller must be disabled; two testers are never allowed (D-021). Only the D-020 service allow-list may be sent.
-- Hand-written DIDs/IDs are temporary. Replace them with `external/moto-vehicle-defs/gen/c/conn/` once codegen exists (`vss-schema-guardian` flags leftovers).
+- Vehicle IDs, DIDs, formulas and UDS timing come from `external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.h`; every frame passes `vehicle_cl250_frame_allowed()` (D-020). Never hand-write them again (`vss-schema-guardian` flags leftovers).
+- The BLE packet layout is defined in `docs/ble_telemetry_packet_schema.json` (v2); moto-mobile checks a copy of it in its tests. Change both together.
 
 ## Context
 

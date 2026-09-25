@@ -38,12 +38,10 @@ void MockCANModule::update(SystemState& state) {
     float ridePhase = (float)(now % RIDE_CYCLE_MS) / (float)RIDE_CYCLE_MS; // 0..1
     float rpmWave = sinf(ridePhase * 2.0f * PI);           // -1..1
     float throttleWave = sinf(ridePhase * 2.0f * PI + 0.6f);
-    float leanWave = sinf(ridePhase * 4.0f * PI);          // faster oscillation, simulates S-curves
 
     float rpm = 3500.0f + rpmWave * 2500.0f;               // 1000-6000 RPM
     uint8_t speed = (uint8_t)constrain((rpm - 1000.0f) / (6000.0f - 1000.0f) * 140.0f, 0.0f, 255.0f);
     float throttlePos = (throttleWave * 0.5f + 0.5f) * 100.0f; // 0-100%
-    float leanAngle = leanWave * 35.0f;                    // -35..+35 degrees
 
     // Coolant ramps from ambient to operating temperature over the first minute of
     // runtime, then holds with small noise -- mirrors a real cold-start warmup.
@@ -63,13 +61,4 @@ void MockCANModule::update(SystemState& state) {
     state.engine.batteryVoltage = batteryVoltage;
     state.engine.batteryVoltageUpdatedMs = now;
     state.engine.ecuPresent = true;
-
-    state.dynamics.leanAngle = leanAngle;
-    state.dynamics.leanAngleUpdatedMs = now;
-    if (leanAngle > state.dynamics.maxLeanRight) {
-        state.dynamics.maxLeanRight = leanAngle;
-    }
-    if (leanAngle < state.dynamics.maxLeanLeft) {
-        state.dynamics.maxLeanLeft = leanAngle;
-    }
 }

@@ -2,23 +2,28 @@
 #define WIFI_SERVER_MODULE_H
 
 #include "IModule.h"
+#include "TelemetryJson.h"
 #include <WiFi.h>
 #include <WebServer.h>
 
 /**
- * @brief Wi-Fi Access Point and HTTP REST/JSON Telemetry Backend Server module.
- * Creates a wireless Access Point ("Honda-CL250-AP") and serves live telemetry JSON
- * endpoints for smartphone mobile apps and Web browser dashboards.
+ * @brief Wi-Fi Access Point and HTTP JSON telemetry endpoint.
+ * Creates a wireless Access Point ("Honda-CL250-AP") and serves live telemetry JSON for
+ * the phone app's Wi-Fi fallback.
+ *
+ * Rewritten per D-023: responses are built in a static buffer with snprintf
+ * (TelemetryJson.*) instead of Arduino String concatenation, so serving a request does
+ * not allocate on the heap in this module.
  */
 class WiFiServerModule : public IConsumerModule {
 private:
     WebServer _server;
     bool _initialized = false;
     const SystemState* _pSystemState = nullptr;
+    char _jsonBuf[TELEMETRY_JSON_MAX_LEN];
 
     // G4.1: AP is off by default and only enabled on-demand (BOOT button at
-    // startup, or BLE fallback timeout) to avoid broadcasting an open wireless
-    // access point continuously.
+    // startup, or BLE fallback timeout) to avoid broadcasting an access point continuously.
     bool _apEnabled = false;
     bool _bootButtonHeld = false;
     unsigned long _bootTimeMs = 0;

@@ -3,8 +3,10 @@
 
 #include <Arduino.h>
 
+#include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+
 // G0.3 -- Data staleness tracking.
-// Each CAN/IMU signal carries the millis() timestamp of its last producer write,
+// Each CAN signal carries the millis() timestamp of its last producer write,
 // so consumers (Nextion, BLE, WiFi, logger) can tell a frozen last-good-value
 // apart from a currently-live one instead of silently displaying stale data.
 constexpr uint32_t STALE_THRESHOLD_MS = 500; // e.g. RPM must refresh at least every 500ms
@@ -12,6 +14,14 @@ constexpr uint32_t STALE_THRESHOLD_MS = 500; // e.g. RPM must refresh at least e
 inline bool isStale(uint32_t lastUpdateMs, uint32_t thresholdMs = STALE_THRESHOLD_MS) {
     // lastUpdateMs == 0 means "never written since boot" -- always stale.
     return lastUpdateMs == 0 || (millis() - lastUpdateMs) > thresholdMs;
+}
+
+// Staleness threshold for a polled DID: twice its poll period from the generated table,
+// never below STALE_THRESHOLD_MS. The legacy code used 500 ms for every value, so the
+// 800 ms DIDs flickered to "stale" between two polls (docs/legacy-telemetry-notes.md).
+inline uint32_t didStaleThresholdMs(uint8_t didIndex) {
+    uint32_t twice = 2u * (uint32_t)vehicle_cl250_dids[didIndex].poll_period_ms;
+    return twice > STALE_THRESHOLD_MS ? twice : STALE_THRESHOLD_MS;
 }
 
 /**
@@ -36,16 +46,6 @@ struct EngineData {
 };
 
 /**
- * @brief Vehicle riding dynamics calculated via IMU sensor.
- */
-struct DynamicsData {
-    float leanAngle = 0.0f;
-    uint32_t leanAngleUpdatedMs = 0;
-    float maxLeanRight = 0.0f;
-    float maxLeanLeft = 0.0f;
-};
-
-/**
  * @brief Smartphone / BLE telematics data (Music & Navigation).
  */
 struct TelematicsData {
@@ -61,7 +61,8 @@ struct TelematicsData {
  */
 struct SystemState {
     EngineData engine;
-    DynamicsData dynamics;
+    // No lean angle here: the legacy complementary filter was dropped (D-023). Lean comes
+    // from the rt-core EKF (platform.dbc LeanEstimate) once this node reads the platform bus.
     TelematicsData telematics;
 };
 

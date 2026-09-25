@@ -3,10 +3,19 @@
 
 #include "IModule.h"
 #include "hal/ICanBus.h"
+#include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
 
 /**
- * @brief Module handling CAN bus communications with Honda ECU via a generic ICanBus.
- * Supports 29-bit Extended Honda UDS and 11-bit Standard OBD2 fallback queries.
+ * @brief UDS tester for the Honda CL250 engine ECU over a generic ICanBus.
+ * Sends every request on the 29-bit primary ID and the 11-bit fallback ID.
+ *
+ * This node is the TEMPORARY sole vehicle-bus tester (D-023). Once moto-rt-core polls
+ * the ECU, this poller must be disabled: two testers are never allowed (D-021).
+ *
+ * All IDs, DIDs, formulas and timings come from the generated table
+ * (moto-vehicle-defs uds/vehicle_cl250.yaml). Every frame goes through
+ * vehicle_cl250_frame_allowed() before it is sent, so only the D-020 service allow-list
+ * can ever reach the vehicle bus.
  *
  * G3.2 -- depends only on ICanBus, never on driver/twai.h: main.cpp injects a
  * TwaiCanBus on real hardware and test/test_can_protocol injects a MockCanBus, so
@@ -16,45 +25,35 @@
  */
 class HondaCANModule : public IProducerModule {
 public:
-    // Exposed so tests can construct realistic fake ECU responses without
-    // duplicating these as separately-maintained magic numbers.
-    static const uint32_t UDS_RESP_29BIT = 0x18DAF110;
-    static const uint32_t UDS_RESP_11BIT = 0x7E8;
-
     explicit HondaCANModule(ICanBus& bus);
     bool begin() override;
     void update(SystemState& state) override;
     bool isHealthy() const override { return _initialized; }
 
+    // Frames refused by the D-020 guard since boot. Must stay 0; exposed for tests/logs.
+    uint32_t blockedFrameCount() const { return _blockedFrames; }
+
 private:
     ICanBus& _bus;
     bool _initialized = false;
     unsigned long _lastKeepAlive = 0;
+    uint32_t _blockedFrames = 0;
 
     // G1.3 -- Bus-off recovery state. Recovery attempts back off exponentially
-    // (1s, 2s, 4s ... capped at 30s) instead of hammering twai_initiate_recovery()
-    // every single loop pass while the bus stays off.
+    // (VEHICLE_CL250_BUS_OFF_BACKOFF_MIN_MS doubling up to _MAX_MS) instead of
+    // hammering initiateRecovery() every loop pass while the bus stays off.
     bool _busOff = false;
     unsigned long _lastRecoveryAttempt = 0;
-    unsigned long _recoveryBackoffMs = 1000;
+    unsigned long _recoveryBackoffMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MIN_MS;
     uint32_t _busOffEventCount = 0;
-    static const unsigned long RECOVERY_BACKOFF_MAX_MS = 30000;
 
     // G2.1 -- Negative response (NRC, 0x7F) bookkeeping.
     uint32_t _nrcCount = 0;
 
-    /**
-     * @brief Human-readable name for a UDS Negative Response Code (ISO 14229-1 Annex A).
-     */
-    static const char* nrcName(uint8_t nrc);
-
     // ------------------------------------------------------------------
     // G2.2 -- Single-request-in-flight UDS state machine.
-    // UDS is a strict request/response protocol; the old code fired the RPM
-    // request every 50ms and a rotating slow-DID request every 200ms
-    // completely independently, so two requests could be in flight and their
-    // responses could not be told apart. Now only one DID is ever awaited at
-    // a time: IDLE -> REQUEST_SENT -> WAITING -> COMPLETE/TIMEOUT -> IDLE.
+    // UDS is a strict request/response protocol: only one DID is ever awaited at a
+    // time: IDLE -> REQUEST_SENT -> WAITING -> COMPLETE/TIMEOUT -> IDLE.
     // ------------------------------------------------------------------
     enum class UdsRequestState : uint8_t { IDLE, REQUEST_SENT, WAITING, COMPLETE, TIMEOUT };
 
@@ -64,21 +63,12 @@ private:
         unsigned long lastRequestMs;
         uint8_t consecutiveTimeouts;
         unsigned long skipUntilMs;    // temporarily skipped after repeated timeouts
-
-        DidSlot(uint16_t d, unsigned long cadence)
-            : did(d), cadenceMs(cadence), lastRequestMs(0), consecutiveTimeouts(0), skipUntilMs(0) {}
     };
 
-    // Ordered by priority: RPM (50ms/20Hz) is checked first every cycle so a slow
-    // DID's wait can never starve it for more than one UDS_RESPONSE_TIMEOUT_MS.
-    static const uint8_t DID_SLOT_COUNT = 5;
-    DidSlot _dids[DID_SLOT_COUNT] = {
-        {0xF40C, 50},   // Engine RPM
-        {0xF40D, 800},  // Vehicle Speed
-        {0xF411, 800},  // Throttle Position
-        {0xF405, 800},  // Coolant Temperature
-        {0xF442, 800},  // Control Module Battery Voltage
-    };
+    // Same order as the generated table, which is priority ordered: engine speed (50 ms)
+    // is checked first every cycle, so a slow DID's wait can never starve it for more
+    // than one response timeout.
+    DidSlot _dids[VEHICLE_CL250_DID_COUNT];
 
     UdsRequestState _udsState = UdsRequestState::IDLE;
     int8_t _pendingDidIndex = -1;
@@ -86,42 +76,31 @@ private:
     unsigned long _requestSentMs = 0;
     unsigned long _responseTimeoutMs = 0;
 
-    static const unsigned long UDS_BASE_TIMEOUT_MS = 100;
-    static const unsigned long UDS_MAX_TIMEOUT_MS = 2000;   // ceiling after repeated 0x78 extensions
-    static const uint8_t UDS_MAX_CONSECUTIVE_TIMEOUTS = 5;
-    static const unsigned long UDS_DID_SKIP_COOLDOWN_MS = 5000;
-
     // ------------------------------------------------------------------
     // G2.3 -- Diagnostic session management + ECU-presence detection.
-    // begin() fires the extended session request once but never confirmed it; if the
-    // ECU is absent or rejects it, the module just kept requesting DIDs into the void.
-    // Now the request is retried until a positive 0x50 response is seen, and any
-    // positive UDS response (0x50 or 0x62) marks the ECU "present" for
-    // ECU_ABSENT_TIMEOUT_MS, exposed via state.engine.ecuPresent for consumers
-    // (Nextion) to show an explicit "ECU not found" state instead of frozen numbers.
+    // The extended session request is retried until a positive 0x50 response is seen,
+    // and any UDS response (0x50, 0x62 or a 0x7F NRC) marks the ECU "present" for
+    // VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS, exposed via state.engine.ecuPresent.
     // ------------------------------------------------------------------
     bool _sessionConfirmed = false;
     unsigned long _lastSessionAttemptMs = 0;
-    static const unsigned long SESSION_RETRY_INTERVAL_MS = 2000;
 
     unsigned long _lastGoodResponseMs = 0;
     bool _ecuPresent = false; // mirrors state.engine.ecuPresent; logged only on change
-    static const unsigned long ECU_ABSENT_TIMEOUT_MS = 3000;
 
     /**
-     * @brief Transmits a 29-bit Extended CAN frame for Honda UDS queries ($18DA10F1).
+     * @brief Sends one UDS request (SID first) as an ISO-TP single frame on the primary
+     * and the fallback request ID. Frames the D-020 guard refuses are never sent.
      */
-    void sendFrame29(uint8_t d0, uint8_t d1, uint8_t d2 = 0xAA, uint8_t d3 = 0xAA);
-
-    /**
-     * @brief Transmits an 11-bit Standard CAN frame for OBD-II queries ($7DF).
-     */
-    void sendFrame11(uint8_t d0, uint8_t d1, uint8_t d2 = 0x55, uint8_t d3 = 0x55);
+    void sendRequest(const uint8_t* request, uint8_t len);
+    bool sendFrame(uint32_t id, bool extended, const uint8_t* request, uint8_t len);
 
     /**
      * @brief Transmits a ReadDataByIdentifier ($22) request for a specific DID.
      */
     void requestDID(uint16_t did);
+
+    void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
 };
 
 #endif // HONDA_CAN_MODULE_H

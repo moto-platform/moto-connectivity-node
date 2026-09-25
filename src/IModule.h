@@ -29,7 +29,7 @@ public:
      * @brief G3.4 -- Declares how often main.cpp should call update(), centralizing
      * scheduling policy instead of each module doing its own internal millis() gate.
      * Default 0 means "every loop pass, no throttling" -- correct for any module whose
-     * own work must not be delayed (CAN/UDS timeouts, IMU sample rate, HTTP
+     * own work must not be delayed (CAN/UDS timeouts, HTTP
      * responsiveness, BLE queue draining): those modules simply don't override this.
      * Only override with a period for modules that (a) may safely be throttled below
      * loop rate and (b) have no other, finer-grained internal cadence that would be
@@ -40,8 +40,8 @@ public:
 };
 
 /**
- * @brief G3.1 -- A module that writes into SystemState: HondaCANModule (engine),
- * IMUModule (dynamics), BLEServerModule (telematics, from phone-sourced BLE writes).
+ * @brief G3.1 -- A module that writes into SystemState: HondaCANModule or MockCANModule
+ * (engine), BLEServerModule (telematics, from phone-sourced BLE writes).
  * Producers run first each loop pass so every consumer sees that pass's freshest data.
  */
 class IProducerModule : public IModule {

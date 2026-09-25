@@ -1,0 +1,51 @@
+{
+  "$schemaDescription": "Single source of truth for the BLE telemetry notification packet sent by moto-connectivity-node to moto-mobile. Implementations: src/BLETelemetryPacket.h (firmware) and moto-mobile lib/models/telemetry_data.dart (decoder, with a copy of this file under test/fixtures/ checked by a test). Ported from HondaCl250_Telemetry@legacy-final (version 1) per D-023.",
+  "packetName": "BLETelemetryPacket",
+  "version": 2,
+  "endianness": "little",
+  "packed": true,
+  "totalBytes": 16,
+  "versioning": {
+    "rule": "Receivers MUST read `version` first and drop the packet if it does not match the version they were built against. Any change to field order, size or meaning requires incrementing `version` here and in both implementations together.",
+    "currentVersion": 2,
+    "history": {
+      "1": "Legacy layout (15 bytes). Lean fields came from the dropped complementary filter.",
+      "2": "Lean fields keep their offsets but carry `notAvailable` until the rt-core EKF lean estimate reaches this node (D-023); byte 15 `flags` added so receivers can show stale values as unavailable."
+    }
+  },
+  "sequenceNumber": {
+    "field": "seq",
+    "rule": "Rolls over 0-255. Receivers track the last seen seq and compute (currentSeq - lastSeq - 1) mod 256 as the number of packets lost since the previous one."
+  },
+  "notAvailable": {
+    "int16": -32768,
+    "rule": "A lean field equal to -32768 (0x8000) means no value is available; receivers must not display it as a number."
+  },
+  "flags": {
+    "field": "flags",
+    "rule": "A value whose bit is 0 is stale or was never received; receivers show it as unavailable instead of the number.",
+    "bits": [
+      { "bit": 0, "name": "rpmValid" },
+      { "bit": 1, "name": "speedValid" },
+      { "bit": 2, "name": "coolantTempValid" },
+      { "bit": 3, "name": "throttlePosValid" },
+      { "bit": 4, "name": "batteryVoltValid" },
+      { "bit": 5, "name": "leanValid" },
+      { "bit": 6, "name": "ecuPresent" },
+      { "bit": 7, "name": "reserved", "description": "Always 0." }
+    ]
+  },
+  "fields": [
+    { "name": "version",      "offset": 0,  "size": 1, "type": "uint8",  "description": "Packet format version, must equal `version` above." },
+    { "name": "seq",          "offset": 1,  "size": 1, "type": "uint8",  "description": "Rolling 0-255 counter incremented once per packet sent." },
+    { "name": "rpm",          "offset": 2,  "size": 2, "type": "uint16", "description": "Engine speed in rpm (integer part), range 0-16383." },
+    { "name": "speed",        "offset": 4,  "size": 1, "type": "uint8",  "description": "Vehicle speed in km/h, range 0-255." },
+    { "name": "coolantTemp",  "offset": 5,  "size": 1, "type": "int8",   "description": "Coolant temperature in degrees Celsius, range -40 to 127 (higher values are clamped to 127)." },
+    { "name": "throttlePos",  "offset": 6,  "size": 1, "type": "uint8",  "description": "Throttle position in percent, range 0-100." },
+    { "name": "batteryVolt",  "offset": 7,  "size": 2, "type": "uint16", "description": "Battery voltage in millivolts, e.g. 12400 = 12.4 V." },
+    { "name": "leanAngle",    "offset": 9,  "size": 2, "type": "int16",  "description": "Lean (roll) angle in tenths of a degree, positive = right side down; -32768 = not available." },
+    { "name": "maxLeanRight", "offset": 11, "size": 2, "type": "int16",  "description": "Peak right lean angle in tenths of a degree; -32768 = not available." },
+    { "name": "maxLeanLeft",  "offset": 13, "size": 2, "type": "int16",  "description": "Peak left lean angle in tenths of a degree; -32768 = not available." },
+    { "name": "flags",        "offset": 15, "size": 1, "type": "uint8",  "description": "Validity bits, see `flags`." }
+  ]
+}

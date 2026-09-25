@@ -2,7 +2,7 @@
 #define NATIVE_TEST_ARDUINO_STUB_H
 
 // G5.1/G5.2 -- Minimal Arduino.h stand-in so header-only, hardware-independent files
-// (SystemState.h, BLETelemetryPacket.h) can be compiled and unit-tested on the host
+// (SystemState.h, BLETelemetryPacket.h, TelemetryJson.*) can be compiled and unit-tested on the host
 // (platform = native) with no ESP32 toolchain or device attached. Only on the native
 // build's include path (see platformio.ini's [env:native] build_flags) -- the real
 // ESP32 environments never see this file, so this cannot affect on-device behavior.
@@ -41,6 +41,11 @@ inline void delay(unsigned long) {}
 // Arduino's min()/max() are used by HondaCANModule for backoff/timeout capping.
 using std::min;
 using std::max;
+
+// Arduino-ESP32's constrain() is a macro; BLETelemetryPacket.h clamps with it.
+#ifndef constrain
+#define constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
+#endif
 
 // Minimal Serial stand-in -- HondaCANModule logs status/warnings through this.
 // Tests don't assert on log output, so this just forwards to stdout; it exists

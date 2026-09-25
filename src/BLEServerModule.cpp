@@ -40,7 +40,7 @@ bool BLEServerModule::begin() {
     // is to stop opportunistic/unpaired writes from strangers in BLE range, not to defend
     // against an active attacker during the one-time pairing handshake.
     //
-    // UX note: because bonding is now mandatory, the phone app (mobile_app/) will see an
+    // UX note: because bonding is now mandatory, the phone app (moto-mobile) will see an
     // OS-level "Pair with Honda-CL250-Telemetry?" prompt on first connection. No mobile
     // code change is required -- the OS Bluetooth stack triggers this pairing dialog
     // automatically in response to the peripheral's security requirements.
@@ -207,17 +207,8 @@ void BLEServerModule::update(SystemState& state) {
     if (_deviceConnected && (now - _lastNotify >= 100)) {
         _lastNotify = now;
 
-        BLETelemetryPacket packet;
-        packet.version      = BLE_PACKET_VERSION;
-        packet.seq          = _txSeq++; // wraps 0-255 by design; receivers detect loss from gaps
-        packet.rpm          = (uint16_t)state.engine.rpm;
-        packet.speed        = state.engine.speed;
-        packet.coolantTemp  = (int8_t)state.engine.coolantTemp;
-        packet.throttlePos  = (uint8_t)state.engine.throttlePos;
-        packet.batteryVolt  = (uint16_t)(state.engine.batteryVoltage * 1000.0f);
-        packet.leanAngle    = (int16_t)(state.dynamics.leanAngle * 10.0f);
-        packet.maxLeanRight = (int16_t)(state.dynamics.maxLeanRight * 10.0f);
-        packet.maxLeanLeft  = (int16_t)(state.dynamics.maxLeanLeft * 10.0f);
+        // wraps 0-255 by design; receivers detect loss from gaps
+        BLETelemetryPacket packet = buildTelemetryPacket(state, _txSeq++);
 
         _pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(BLETelemetryPacket));
         _pTxCharacteristic->notify();

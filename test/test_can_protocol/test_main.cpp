@@ -8,6 +8,7 @@
 // is completely unmodified for this to work; it only depends on ICanBus + the two
 // stubbed Arduino symbols (Serial, millis/delay) already provided for test_native.
 #include "../../src/HondaCANModule.cpp"
+#include "../../external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.c"
 
 // G5.1 -- Native tests for HondaCANModule's actual UDS protocol logic (request state
 // machine, NRC handling, ISO-TP frame checking, bus-off recovery, ECU-presence
@@ -22,7 +23,7 @@ void tearDown(void) {}
 // would send it: [PCI][0x62][DID_hi][DID_lo][payload...].
 static CanFrame makePositiveResponse(uint16_t did, uint8_t d4, uint8_t d5 = 0, uint8_t dlc = 6) {
     CanFrame f;
-    f.id = HondaCANModule::UDS_RESP_29BIT;
+    f.id = VEHICLE_CL250_RESPONSE_ID;
     f.extended = true;
     f.dlc = dlc;
     f.data[0] = dlc - 1; // PCI: single frame, low nibble = payload length (not checked by value)
@@ -36,7 +37,7 @@ static CanFrame makePositiveResponse(uint16_t did, uint8_t d4, uint8_t d5 = 0, u
 
 static CanFrame makeNegativeResponse(uint8_t echoedSid, uint8_t nrc) {
     CanFrame f;
-    f.id = HondaCANModule::UDS_RESP_29BIT;
+    f.id = VEHICLE_CL250_RESPONSE_ID;
     f.extended = true;
     f.dlc = 4;
     f.data[0] = 0x03;
@@ -48,7 +49,7 @@ static CanFrame makeNegativeResponse(uint8_t echoedSid, uint8_t nrc) {
 
 static CanFrame makeSessionConfirm() {
     CanFrame f;
-    f.id = HondaCANModule::UDS_RESP_29BIT;
+    f.id = VEHICLE_CL250_RESPONSE_ID;
     f.extended = true;
     f.dlc = 2;
     f.data[0] = 0x02;
@@ -60,7 +61,7 @@ static CanFrame makeMultiFrameFirstFrame() {
     // ISO-TP First Frame: PCI high nibble 0x1. data[1] is intentionally NOT 0x62/0x7F/
     // 0x50 -- it's part of the multi-frame length field, and must never be parsed as a SID.
     CanFrame f;
-    f.id = HondaCANModule::UDS_RESP_29BIT;
+    f.id = VEHICLE_CL250_RESPONSE_ID;
     f.extended = true;
     f.dlc = 8;
     f.data[0] = 0x10; // First Frame, length high nibble
@@ -246,6 +247,106 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
     TEST_ASSERT_TRUE(bus.countDidRequests(0xF40C) > rpmReqsAtSkipStart);
 }
 
+// ---------------------------------------------------------------------------
+// D-023 port: generated table, D-020 guard, fallback addressing
+// ---------------------------------------------------------------------------
+
+void test_every_transmitted_frame_passes_the_d020_guard(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    module.begin();
+
+    // Run long enough to cover session retries, tester present, every DID and timeouts.
+    for (unsigned long t = 0; t < 30000; t += 25) {
+        test_setMillis(t);
+        module.update(state);
+    }
+    TEST_ASSERT_TRUE(bus.txLog.size() > 100);
+    for (const CanFrame& f : bus.txLog) {
+        TEST_ASSERT_TRUE(vehicle_cl250_frame_allowed(f.id, f.extended, f.data, f.dlc));
+    }
+    TEST_ASSERT_EQUAL_UINT32(0, module.blockedFrameCount());
+}
+
+void test_requests_go_to_primary_and_fallback_ids(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    module.begin(); // session request on both IDs
+
+    TEST_ASSERT_EQUAL(2, bus.txLog.size());
+    TEST_ASSERT_EQUAL_HEX32(VEHICLE_CL250_REQUEST_ID, bus.txLog[0].id);
+    TEST_ASSERT_TRUE(bus.txLog[0].extended);
+    TEST_ASSERT_EQUAL_HEX32(VEHICLE_CL250_FALLBACK_REQUEST_ID, bus.txLog[1].id);
+    TEST_ASSERT_FALSE(bus.txLog[1].extended);
+    const uint8_t expected[8] = {0x02, 0x10, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, bus.txLog[0].data, 8);
+}
+
+void test_fallback_response_is_decoded(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    module.begin();
+
+    test_setMillis(100);
+    module.update(state); // RPM request
+    CanFrame f = makePositiveResponse(0xF40C, 0x1F, 0x40); // 8000 / 4 = 2000 rpm
+    f.id = VEHICLE_CL250_FALLBACK_RESPONSE_ID;
+    f.extended = false;
+    bus.injectRxFrame(f);
+    test_setMillis(110);
+    module.update(state);
+    TEST_ASSERT_EQUAL_FLOAT(2000.0f, state.engine.rpm);
+}
+
+void test_all_dids_decode_with_generated_formulas(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    module.begin();
+    test_setMillis(100);
+
+    bus.injectRxFrame(makePositiveResponse(0xF40D, 88, 0, 5));     // 88 km/h
+    bus.injectRxFrame(makePositiveResponse(0xF405, 130, 0, 5));    // 130 - 40 = 90 degC
+    bus.injectRxFrame(makePositiveResponse(0xF411, 255, 0, 5));    // 100 %
+    bus.injectRxFrame(makePositiveResponse(0xF442, 0x30, 0x70));   // 12400 mV
+    module.update(state);
+
+    TEST_ASSERT_EQUAL_UINT8(88, state.engine.speed);
+    TEST_ASSERT_EQUAL_INT16(90, state.engine.coolantTemp);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 100.0f, state.engine.throttlePos);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 12.4f, state.engine.batteryVoltage);
+}
+
+void test_short_battery_response_is_dropped(void) {
+    // The legacy A/10 fallback for short 0xF442 responses was not carried over
+    // (docs/legacy-telemetry-notes.md in moto-vehicle-defs): a one-byte answer is dropped.
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    module.begin();
+    test_setMillis(100);
+    bus.injectRxFrame(makePositiveResponse(0xF442, 124, 0, 5)); // PCI 4: SID + DID + 1 byte
+    module.update(state);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, state.engine.batteryVoltage);
+    TEST_ASSERT_EQUAL_UINT32(0, state.engine.batteryVoltageUpdatedMs);
+}
+
+void test_frames_from_other_ids_are_ignored(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    module.begin();
+    test_setMillis(100);
+    CanFrame f = makePositiveResponse(0xF40C, 0x46, 0x50);
+    f.id = 0x18DAF111; // another ECU
+    bus.injectRxFrame(f);
+    module.update(state);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, state.engine.rpm);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -255,5 +356,11 @@ int main(int, char**) {
     RUN_TEST(test_bus_off_triggers_recovery_with_backoff);
     RUN_TEST(test_bus_recovery_complete_restarts_driver);
     RUN_TEST(test_did_skipped_after_max_consecutive_timeouts_then_resumes);
+    RUN_TEST(test_every_transmitted_frame_passes_the_d020_guard);
+    RUN_TEST(test_requests_go_to_primary_and_fallback_ids);
+    RUN_TEST(test_fallback_response_is_decoded);
+    RUN_TEST(test_all_dids_decode_with_generated_formulas);
+    RUN_TEST(test_short_battery_response_is_dropped);
+    RUN_TEST(test_frames_from_other_ids_are_ignored);
     return UNITY_END();
 }

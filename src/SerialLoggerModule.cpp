@@ -16,15 +16,13 @@ void SerialLoggerModule::update(const SystemState& state) {
     // Other per-signal *UpdatedMs timestamps in SystemState are available the same way.
     bool rpmStale = isStale(state.engine.rpmUpdatedMs);
 
-    Serial.printf("[TELEMETRY] RPM: %6.1f%s | SPEED: %3d km/h | TPS: %5.1f%% | ECT: %3d°C | BATT: %4.1fV | LEAN: %5.1f° (L:%.1f°/R:%.1f°) | BLE: %s\n",
+    Serial.printf("[TELEMETRY] RPM: %6.1f%s | SPEED: %3d km/h | TPS: %5.1f%% | ECT: %3d°C | BATT: %4.1fV | ECU: %s | BLE: %s\n",
                   state.engine.rpm,
                   rpmStale ? " [STALE]" : "",
                   state.engine.speed,
                   state.engine.throttlePos,
                   state.engine.coolantTemp,
                   state.engine.batteryVoltage,
-                  state.dynamics.leanAngle,
-                  state.dynamics.maxLeanLeft,
-                  state.dynamics.maxLeanRight,
+                  state.engine.ecuPresent ? "PRESENT" : "ABSENT",
                   state.telematics.phoneConnected ? "CONNECTED" : "DISCONNECTED");
 }

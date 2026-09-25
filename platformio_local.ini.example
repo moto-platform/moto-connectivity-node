@@ -1,4 +1,4 @@
-; Copy this file to platformio_local.ini and set your own AP password.
-; platformio_local.ini is gitignored and must never be committed.
-[env:esp32-s3-devkitc-1]
+; Copy this file to platformio_local.ini and set your own AP password (8-63 characters,
+; WPA2). platformio_local.ini is gitignored and must never be committed.
+[local]
 build_flags = -D AP_PASSWORD=\"ChangeThisPassword123\"
