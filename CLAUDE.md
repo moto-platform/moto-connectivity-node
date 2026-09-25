@@ -1,5 +1,7 @@
 # CLAUDE.md — moto-connectivity-node
 
+@.claude/PLATFORM-RULES.md
+
 ## What this repo is
 
 Firmware running on **ESP32-S3**. Its role is narrow and clear: Wi-Fi/BLE connectivity (phone, server sync) and voice commands (ESP-SR, TinyML). This is where the currently working telemetry code **temporarily** lives — as the project progresses, the heavy work (telemetry/logging/UDS) will move to `moto-rt-core` (STM32H7), leaving only connectivity+voice here.
