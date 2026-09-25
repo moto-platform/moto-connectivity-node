@@ -82,7 +82,7 @@ void test_rpm_decode_updates_state_and_ecu_presence(void) {
     module.update(state); // IDLE -> sends RPM request (highest priority, cadence 50ms) -> WAITING
 
     // 4500 RPM encoded as raw*4 per HondaCANModule's decode (raw/4.0f == 4500 -> raw=18000=0x4650)
-    bus.injectRxFrame(makePositiveResponse(0xF40C, 0x46, 0x50));
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
 
     test_setMillis(110);
     module.update(state); // drains the response -> state.engine.rpm updated, WAITING -> COMPLETE -> IDLE
@@ -141,10 +141,10 @@ void test_nrc_other_than_pending_resolves_request_without_corrupting_state(void)
 
     TEST_ASSERT_EQUAL_FLOAT(0.0f, state.engine.rpm); // untouched, no positive response ever arrived
 
-    int rpmReqsBefore = bus.countDidRequests(0xF40C);
+    int rpmReqsBefore = bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED);
     test_setMillis(120); // 60ms later, well past RPM's 50ms cadence -> should retry promptly, not stay stuck
     module.update(state);
-    TEST_ASSERT_TRUE(bus.countDidRequests(0xF40C) > rpmReqsBefore);
+    TEST_ASSERT_TRUE(bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > rpmReqsBefore);
 }
 
 void test_multiframe_response_is_dropped_not_misparsed(void) {
@@ -225,8 +225,8 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
         module.update(state); // WAITING -> TIMEOUT -> IDLE, consecutiveTimeouts++
         t += 1;
     }
-    // The 5th timeout should have just triggered a 5s skip for DID 0xF40C.
-    int rpmReqsAtSkipStart = bus.countDidRequests(0xF40C);
+    // The 5th timeout should have just triggered a 5s skip for DID VEHICLE_CL250_DID_ENGINE_SPEED.
+    int rpmReqsAtSkipStart = bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED);
 
     // Stay well inside the 5s cooldown and confirm RPM is never re-requested, even
     // though other DID slots keep cycling through their own request/timeout dance.
@@ -236,7 +236,7 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
         module.update(state);
     }
     TEST_ASSERT_TRUE(t < 5809 + 50); // sanity check we're still inside the cooldown window
-    TEST_ASSERT_EQUAL(rpmReqsAtSkipStart, bus.countDidRequests(0xF40C));
+    TEST_ASSERT_EQUAL(rpmReqsAtSkipStart, bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED));
 
     // Advance well past the cooldown and confirm RPM gets requested again.
     for (int i = 0; i < 15; i++) {
@@ -244,7 +244,7 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
         test_setMillis(t);
         module.update(state);
     }
-    TEST_ASSERT_TRUE(bus.countDidRequests(0xF40C) > rpmReqsAtSkipStart);
+    TEST_ASSERT_TRUE(bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > rpmReqsAtSkipStart);
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ void test_fallback_response_is_decoded(void) {
 
     test_setMillis(100);
     module.update(state); // RPM request
-    CanFrame f = makePositiveResponse(0xF40C, 0x1F, 0x40); // 8000 / 4 = 2000 rpm
+    CanFrame f = makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x1F, 0x40); // 8000 / 4 = 2000 rpm
     f.id = VEHICLE_CL250_FALLBACK_RESPONSE_ID;
     f.extended = false;
     bus.injectRxFrame(f);
@@ -308,10 +308,10 @@ void test_all_dids_decode_with_generated_formulas(void) {
     module.begin();
     test_setMillis(100);
 
-    bus.injectRxFrame(makePositiveResponse(0xF40D, 88, 0, 5));     // 88 km/h
-    bus.injectRxFrame(makePositiveResponse(0xF405, 130, 0, 5));    // 130 - 40 = 90 degC
-    bus.injectRxFrame(makePositiveResponse(0xF411, 255, 0, 5));    // 100 %
-    bus.injectRxFrame(makePositiveResponse(0xF442, 0x30, 0x70));   // 12400 mV
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_VEHICLE_SPEED, 88, 0, 5));     // 88 km/h
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_COOLANT_TEMPERATURE, 130, 0, 5));    // 130 - 40 = 90 degC
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_THROTTLE_POSITION, 255, 0, 5));    // 100 %
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_BATTERY_VOLTAGE, 0x30, 0x70));   // 12400 mV
     module.update(state);
 
     TEST_ASSERT_EQUAL_UINT8(88, state.engine.speed);
@@ -321,14 +321,14 @@ void test_all_dids_decode_with_generated_formulas(void) {
 }
 
 void test_short_battery_response_is_dropped(void) {
-    // The legacy A/10 fallback for short 0xF442 responses was not carried over
+    // The legacy A/10 fallback for short VEHICLE_CL250_DID_BATTERY_VOLTAGE responses was not carried over
     // (docs/legacy-telemetry-notes.md in moto-vehicle-defs): a one-byte answer is dropped.
     MockCanBus bus;
     HondaCANModule module(bus);
     SystemState state;
     module.begin();
     test_setMillis(100);
-    bus.injectRxFrame(makePositiveResponse(0xF442, 124, 0, 5)); // PCI 4: SID + DID + 1 byte
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_BATTERY_VOLTAGE, 124, 0, 5)); // PCI 4: SID + DID + 1 byte
     module.update(state);
     TEST_ASSERT_EQUAL_FLOAT(0.0f, state.engine.batteryVoltage);
     TEST_ASSERT_EQUAL_UINT32(0, state.engine.batteryVoltageUpdatedMs);
@@ -340,7 +340,7 @@ void test_frames_from_other_ids_are_ignored(void) {
     SystemState state;
     module.begin();
     test_setMillis(100);
-    CanFrame f = makePositiveResponse(0xF40C, 0x46, 0x50);
+    CanFrame f = makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50);
     f.id = 0x18DAF111; // another ECU
     bus.injectRxFrame(f);
     module.update(state);
