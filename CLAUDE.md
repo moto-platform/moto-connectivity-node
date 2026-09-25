@@ -29,7 +29,13 @@ Reads signal definitions from `moto-vehicle-defs` (submodule: `external/moto-veh
 
 ## Build
 
-ESP-IDF. `idf.py build flash monitor`. Target chip: `esp32s3`.
+PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espidf`, D-023). Target chip: `esp32s3`. Native unit tests with `pio test -e native`.
+
+## Legacy telemetry port (D-023)
+
+The code comes from the read-only reference repo `moto-platform/HondaCl250_Telemetry` (archived). Ported as-is: CAN/UDS module, `ICanBus`/`TwaiCanBus`, mock CAN, BLE server + packet schema, Nextion, serial logger, native tests. Rewritten: WiFi server (no Arduino `String`). Dropped: web PWA and the complementary-filter lean angle.
+- This node is the **temporary sole tester** on the vehicle bus until rt-core takes over. Then its poller must be disabled; two testers are never allowed (D-021). Only the D-020 service allow-list may be sent.
+- Hand-written DIDs/IDs are temporary. Replace them with `external/moto-vehicle-defs/gen/c/conn/` once codegen exists (`vss-schema-guardian` flags leftovers).
 
 ## Context
 

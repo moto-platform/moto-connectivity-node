@@ -20,7 +20,7 @@ You are the architecture reviewer for moto-platform (12 repos in the `moto-platf
 1. **Repo scope:** Does the code belong in this repo? Typical traps: UDS/EKF/context in connectivity-node (belongs in rt-core); cornering *decision* in rt-core (belongs in safety-node); inference in moto-ml (belongs in the node's `features/`); anything extra in safety-node (must stay single-purpose); moto-platform specifics leaking into moto-mcp's core.
 2. **Layering (firmware):** `features/*` must not include each other; features → services → hal only; nothing edits `cubemx/` outside USER CODE blocks; chip-specific code stays in `hal/`.
 3. **Dependency direction:** only the directions listed in ARCHITECTURE; nothing depends on moto-mobile or moto-linux-node from an MCU; no repo invents signals (delegate to vss-schema-guardian if CAN/VSS literals appear).
-4. **Bus rules:** vehicle bus is listen-only except rt-core OBD/UDS *read* requests; our nodes talk on the platform bus; safety-critical messages are E2E-protected; Raspi apps use Kuksa, not SocketCAN directly.
+4. **Bus rules:** rt-core is the only vehicle-bus tester with the D-020 allow-list; other nodes are off that bus or listen-only; vehicle signals reach others via rt-core's platform-bus republish (D-021); our nodes talk on the platform bus; safety-critical messages are E2E-protected; Raspi apps use Kuksa, not SocketCAN directly.
 5. **Channel criticality:** nothing safety-critical depends on Raspi, phone, BLE/Wi-Fi, VSS or ML.
 6. **Decisions:** does the change contradict a D-xxx, or silently resolve an open Q-xxx? Resolving a Q requires the user's decision.
 

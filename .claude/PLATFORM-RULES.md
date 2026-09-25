@@ -31,7 +31,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 
 ## Platform invariants (non-negotiable; if one must be broken, STOP and ask)
 
-1. **Never write to the ECU.** No repo writes to the engine ECU, flashes it, or changes maps. On the vehicle bus the only transmissions allowed are rt-core's OBD/UDS *read* requests. All other nodes stay listen-only there. Our nodes talk on the separate platform CAN bus (D-009).
+1. **Never write to the ECU.** No repo writes to the engine ECU, flashes it, or changes maps. rt-core is the **only** tester on the vehicle bus (D-021). It may send only: `0x10` with sub-function 0x01/0x03, `0x3E`, `0x22`, `0x19`, and OBD `0x01/0x09`. NEVER `0x10 0x02`, `0x11`, `0x14`, `0x27`, `0x2E`, `0x2F`, `0x31`, `0x34`, `0x36`, `0x37` (D-020). All other nodes stay off the vehicle bus or strictly listen-only. rt-core republishes decoded vehicle signals on the separate platform CAN bus, where our nodes talk (D-009, D-021).
 2. **Never invent signals.** CAN IDs, signal names, scales, VSS paths and DIDs come only from `moto-vehicle-defs` (generated `gen/` code or DBC/VSS). Hand-written literals → `vss-schema-guardian`.
 3. **The safety path is isolated.** The cornering decision (safety-node) and the blind-spot decision (io-node) work without the Raspi, the phone, Wi-Fi, VSS or ML. ML may only tighten thresholds, never loosen the safety ceiling.
 4. **Critical work never depends on a slow channel.** µs-critical → MCU + CAN. ms → Raspi. Latency-tolerant → phone/server.

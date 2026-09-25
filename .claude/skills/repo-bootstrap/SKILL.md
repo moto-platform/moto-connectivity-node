@@ -53,7 +53,7 @@ external/moto-vehicle-defs/ # submodule; include gen/c/<node>/ only
 ## Type: moto-vehicle-defs
 
 ```
-dbc/cl250.dbc  dbc/platform.dbc  vss/overlay.vspec  uds/dids.yaml
+uds/vehicle_cl250.yaml  dbc/cl250.dbc (skeleton)  dbc/platform.dbc  vss/overlay.vspec  uds/dids.yaml
 tools/codegen/ (uv package: cantools generate_c_source wrapper with per-node filtering, E2E protect/check generator, DID table generator, vss-tools export)
 gen/c/<node>/  gen/python/  gen/vss/
 Makefile (gen, check)   CHANGELOG.md   docs/
@@ -62,7 +62,7 @@ CI: parse DBCs strictly, run `make gen` and fail if `git diff --exit-code gen/` 
 
 ## Type: Flutter (moto-mobile)
 
-Only after Q-007 is decided. `flutter create --org io.github.motoplatform`.
+Flutter (D-022). Port the legacy `HondaCl250_Telemetry/mobile_app/flutter_app` per D-023 instead of `flutter create` from scratch.
 
 ## Finish
 
