@@ -80,18 +80,18 @@ size_t buildTelemetryJson(const SystemState& state, char* buf, size_t cap) {
 
     JsonWriter w{buf, cap, 0, false};
     w.append("{");
-    w.number("rpm", !isStale(e.rpmUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_ENGINE_SPEED)),
+    w.number("rpm", !isStale(e.rpmUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_ENGINE_SPEED)),
              "%.1f", e.rpm);
-    w.number("speed", !isStale(e.speedUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_VEHICLE_SPEED)),
+    w.number("speed", !isStale(e.speedUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_VEHICLE_SPEED)),
              "%.0f", (double)e.speed);
     w.number("coolantTemp",
-             !isStale(e.coolantTempUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_COOLANT_TEMPERATURE)),
+             !isStale(e.coolantTempUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_COOLANT_TEMP)),
              "%.0f", (double)e.coolantTemp);
     w.number("throttlePos",
-             !isStale(e.throttlePosUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_THROTTLE_POSITION)),
+             !isStale(e.throttlePosUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_THROTTLE_POS)),
              "%.1f", e.throttlePos);
     w.number("batteryVoltage",
-             !isStale(e.batteryVoltageUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_BATTERY_VOLTAGE)),
+             !isStale(e.batteryVoltageUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_BATTERY_VOLTAGE)),
              "%.2f", e.batteryVoltage);
     w.append("\"leanAngle\":null,\"maxLeanLeft\":null,\"maxLeanRight\":null,");
     w.append("\"ecuPresent\":%s,", e.ecuPresent ? "true" : "false");

@@ -6,22 +6,23 @@
 #include "SystemState.h"
 #include "IModule.h"
 // D-021/D-023: while no moto-rt-core exists, this node is the TEMPORARY sole tester on
-// the vehicle bus (its TWAI is wired to the CL250 DLC). When rt-core starts polling, this
-// poller must be switched off -- two testers are never allowed -- and the TWAI moves to
-// the platform bus to read rt-core's republished values (platform.dbc VehiclePowertrain /
-// VehicleSpeed). That receive path does not exist yet, so building without the tester
-// role fails loudly instead of silently producing a node with no data source.
+// the vehicle bus (its TWAI is wired to the CL250 DLC). CONN_VEHICLE_TESTER selects it:
+//   1 = poll the ECU (only while rt-core does not poll; two testers are never allowed)
+//   0 = poller off: the TWAI driver is never installed, so this node transmits nothing
+//       on any CAN bus. Use it as soon as rt-core polls the ECU. Receiving rt-core's
+//       republished values (platform.dbc VehicleSpeed 0x021 / VehicleEngine 0x110) is not
+//       implemented yet, so the engine values then stay "stale" on BLE/Wi-Fi/Nextion.
 #ifndef CONN_VEHICLE_TESTER
-#error "CONN_VEHICLE_TESTER must be defined (1 = temporary vehicle-bus tester, D-023)."
-#elif !CONN_VEHICLE_TESTER
-#error "Platform-bus receive of rt-core's republished signals is not implemented yet."
+#error "CONN_VEHICLE_TESTER must be defined: 1 = temporary vehicle-bus tester (D-023), 0 = poller off (D-021)."
 #endif
 
-#ifdef MOCK_CAN_DATA
+#if defined(MOCK_CAN_DATA)
 #include "MockCANModule.h"
-#else
+#elif CONN_VEHICLE_TESTER
 #include "HondaCANModule.h"
 #include "hal/TwaiCanBus.h"
+#else
+#warning "CONN_VEHICLE_TESTER=0: vehicle poller disabled, no CAN transmission, no engine data source."
 #endif
 #include "NextionModule.h"
 #include "BLEServerModule.h"
@@ -66,9 +67,9 @@ SystemState globalState;
 // TWAI-backed ICanBus implementation). Its UDS/protocol logic never calls driver/twai.h
 // directly, so the exact same HondaCANModule.cpp also runs unit-tested against a
 // MockCanBus in test/test_can_protocol, with no ESP32 device attached.
-#ifdef MOCK_CAN_DATA
+#if defined(MOCK_CAN_DATA)
 MockCANModule      canModule;
-#else
+#elif CONN_VEHICLE_TESTER
 TwaiCanBus         canBus(CAN_TX_PIN, CAN_RX_PIN);
 HondaCANModule     canModule(canBus);
 #endif
@@ -85,7 +86,9 @@ SerialLoggerModule loggerModule(1000); // Prints serial log every 1000ms
 // change, it removes a pre-existing one-loop staleness gap for BLE-writen telematics
 // reaching Nextion, since BLE used to run after Nextion in the old single array).
 IProducerModule* producers[] = {
+#if defined(MOCK_CAN_DATA) || CONN_VEHICLE_TESTER
     &canModule,
+#endif
     &bleModule,
 };
 IConsumerModule* consumers[] = {
@@ -96,7 +99,11 @@ IConsumerModule* consumers[] = {
 
 const uint8_t PRODUCER_COUNT = sizeof(producers) / sizeof(producers[0]);
 const uint8_t CONSUMER_COUNT = sizeof(consumers) / sizeof(consumers[0]);
-const char* PRODUCER_NAMES[PRODUCER_COUNT] = {"CAN", "BLE"};
+const char* PRODUCER_NAMES[PRODUCER_COUNT] = {
+#if defined(MOCK_CAN_DATA) || CONN_VEHICLE_TESTER
+    "CAN",
+#endif
+    "BLE"};
 const char* CONSUMER_NAMES[CONSUMER_COUNT] = {"Nextion", "WiFi", "Logger"};
 
 // ============================================================================

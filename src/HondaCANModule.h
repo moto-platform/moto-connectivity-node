@@ -40,11 +40,11 @@ private:
     uint32_t _blockedFrames = 0;
 
     // G1.3 -- Bus-off recovery state. Recovery attempts back off exponentially
-    // (VEHICLE_CL250_BUS_OFF_BACKOFF_MIN_MS doubling up to _MAX_MS) instead of
+    // (VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS doubling up to _MAX_MS) instead of
     // hammering initiateRecovery() every loop pass while the bus stays off.
     bool _busOff = false;
     unsigned long _lastRecoveryAttempt = 0;
-    unsigned long _recoveryBackoffMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MIN_MS;
+    unsigned long _recoveryBackoffMs = VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS;
     uint32_t _busOffEventCount = 0;
 
     // G2.1 -- Negative response (NRC, 0x7F) bookkeeping.
@@ -93,7 +93,7 @@ private:
      * and the fallback request ID. Frames the D-020 guard refuses are never sent.
      */
     void sendRequest(const uint8_t* request, uint8_t len);
-    bool sendFrame(uint32_t id, bool extended, const uint8_t* request, uint8_t len);
+    bool sendFrame(uint32_t id, const uint8_t* request, uint8_t len);
 
     /**
      * @brief Transmits a ReadDataByIdentifier ($22) request for a specific DID.

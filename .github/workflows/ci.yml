@@ -9,13 +9,29 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      # external/moto-vehicle-defs is a private sibling repo: the default GITHUB_TOKEN
-      # cannot read it. DEFS_READ_TOKEN = fine-grained token with contents:read on
-      # moto-connectivity-node and moto-vehicle-defs (repository secret).
+      # This repo is checked out with the default GITHUB_TOKEN. The private submodule
+      # external/moto-vehicle-defs needs the org secret MOTO_DEFS_TOKEN (fine-grained,
+      # Contents: read on moto-vehicle-defs only), so it is fetched in a separate step:
+      # passing that token to actions/checkout would also use it for THIS repo, which it
+      # cannot read. Never vendor the defs into this repo to make CI pass.
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-          token: ${{ secrets.DEFS_READ_TOKEN || github.token }}
+          submodules: false
+
+      - name: Fetch moto-vehicle-defs submodule (MOTO_DEFS_TOKEN)
+        env:
+          MOTO_DEFS_TOKEN: ${{ secrets.MOTO_DEFS_TOKEN }}
+        run: |
+          if [ -z "$MOTO_DEFS_TOKEN" ]; then
+            echo "::error::Org secret MOTO_DEFS_TOKEN (Contents: read on moto-vehicle-defs) is not available to this repository."
+            exit 1
+          fi
+          git config --global \
+            url."https://x-access-token:${MOTO_DEFS_TOKEN}@github.com/moto-platform/moto-vehicle-defs".insteadOf \
+            "https://github.com/moto-platform/moto-vehicle-defs"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          git -C external/moto-vehicle-defs describe --tags --always
 
       - uses: actions/setup-python@v5
         with:
@@ -40,8 +56,11 @@ jobs:
           echo '[local]' > platformio_local.ini
           echo 'build_flags = -D AP_PASSWORD=\"CIBuildOnlyPlaceholder123\"' >> platformio_local.ini
 
-      - name: Build firmware (real CAN/UDS)
+      - name: Build firmware (real CAN/UDS, temporary vehicle-bus tester)
         run: pio run -e esp32-s3-devkitc-1
 
       - name: Build firmware (mock telemetry)
         run: pio run -e esp32-s3-devkitc-1-mock
+
+      - name: Build firmware (poller off, D-021)
+        run: pio run -e esp32-s3-devkitc-1-no-tester

@@ -83,19 +83,19 @@ inline BLETelemetryPacket buildTelemetryPacket(const SystemState& state, uint8_t
     p.maxLeanLeft = BLE_LEAN_NOT_AVAILABLE;
 
     uint8_t flags = 0;
-    if (!isStale(e.rpmUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_ENGINE_SPEED))) {
+    if (!isStale(e.rpmUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_ENGINE_SPEED))) {
         flags |= BLE_FLAG_RPM_VALID;
     }
-    if (!isStale(e.speedUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_VEHICLE_SPEED))) {
+    if (!isStale(e.speedUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_VEHICLE_SPEED))) {
         flags |= BLE_FLAG_SPEED_VALID;
     }
-    if (!isStale(e.coolantTempUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_COOLANT_TEMPERATURE))) {
+    if (!isStale(e.coolantTempUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_COOLANT_TEMP))) {
         flags |= BLE_FLAG_COOLANT_VALID;
     }
-    if (!isStale(e.throttlePosUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_THROTTLE_POSITION))) {
+    if (!isStale(e.throttlePosUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_THROTTLE_POS))) {
         flags |= BLE_FLAG_THROTTLE_VALID;
     }
-    if (!isStale(e.batteryVoltageUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_BATTERY_VOLTAGE))) {
+    if (!isStale(e.batteryVoltageUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_BATTERY_VOLTAGE))) {
         flags |= BLE_FLAG_BATTERY_VALID;
     }
     if (e.ecuPresent) {

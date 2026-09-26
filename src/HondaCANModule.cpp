@@ -1,26 +1,23 @@
 #include "HondaCANModule.h"
+#include "uds_iso14229.h"
 
 namespace {
 // Typed copies of the generated timing macros, so min()/comparisons see one type.
 const unsigned long kTesterPresentPeriodMs = VEHICLE_CL250_TESTER_PRESENT_PERIOD_MS;
-const unsigned long kSessionRetryMs = VEHICLE_CL250_SESSION_RETRY_MS;
-const unsigned long kResponseTimeoutMs = VEHICLE_CL250_RESPONSE_TIMEOUT_MS;
-const unsigned long kResponsePendingMaxMs = VEHICLE_CL250_RESPONSE_PENDING_MAX_MS;
+const unsigned long kSessionRetryMs = VEHICLE_CL250_SESSION_RETRY_INTERVAL_MS;
+const unsigned long kResponseTimeoutMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS;
+const unsigned long kResponsePendingMaxMs = VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS;
 const uint8_t kMaxConsecutiveTimeouts = VEHICLE_CL250_MAX_CONSECUTIVE_TIMEOUTS;
 const unsigned long kDidSkipCooldownMs = VEHICLE_CL250_DID_SKIP_COOLDOWN_MS;
 const unsigned long kEcuAbsentTimeoutMs = VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS;
-const unsigned long kBackoffMinMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MIN_MS;
+const unsigned long kBackoffMinMs = VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS;
 const unsigned long kBackoffMaxMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MAX_MS;
 
-const uint8_t kSidReadDidResponse = VEHICLE_CL250_SID_READ_DID + VEHICLE_CL250_POSITIVE_RESPONSE_OFFSET;
-const uint8_t kSidSessionResponse = VEHICLE_CL250_SID_SESSION_CONTROL + VEHICLE_CL250_POSITIVE_RESPONSE_OFFSET;
+const uint8_t kSidSessionResponse = VEHICLE_CL250_SESSION_POSITIVE_SID;
 
-const uint8_t kSessionRequest[] = {VEHICLE_CL250_SID_SESSION_CONTROL, VEHICLE_CL250_SESSION_SUBFUNCTION};
-const uint8_t kTesterPresentRequest[] = {VEHICLE_CL250_SID_TESTER_PRESENT,
+const uint8_t kSessionRequest[] = {VEHICLE_CL250_SESSION_SID, VEHICLE_CL250_SESSION_SUBFUNCTION};
+const uint8_t kTesterPresentRequest[] = {VEHICLE_CL250_TESTER_PRESENT_SID,
                                          VEHICLE_CL250_TESTER_PRESENT_SUBFUNCTION};
-
-// ISO-TP single frame: [PCI = length][SID][DID hi][DID lo][data...]
-const uint8_t kDidResponseHeaderLen = 3; // SID + 2-byte DID inside the single-frame payload
 } // namespace
 
 HondaCANModule::HondaCANModule(ICanBus& bus)
@@ -52,18 +49,21 @@ bool HondaCANModule::begin() {
     return false;
 }
 
-bool HondaCANModule::sendFrame(uint32_t id, bool extended, const uint8_t* request, uint8_t len) {
+bool HondaCANModule::sendFrame(uint32_t id, const uint8_t* request, uint8_t len) {
     CanFrame frame;
-    frame.extended = extended;
+    frame.extended = uds::isExtendedId(id);
     frame.id = id;
-    frame.dlc = 8;
+    frame.dlc = VEHICLE_CL250_FRAME_DLC;
     frame.data[0] = len; // ISO-TP single-frame PCI
-    for (uint8_t i = 1; i < 8; i++) {
-        frame.data[i] = (i - 1 < len) ? request[i - 1] : VEHICLE_CL250_FRAME_PADDING;
+    for (uint8_t i = 1; i < VEHICLE_CL250_FRAME_DLC; i++) {
+        frame.data[i] = (i - 1 < len) ? request[i - 1] : VEHICLE_CL250_PADDING_BYTE;
     }
 
-    // D-020/D-021: the generated guard is the last word on what may reach the vehicle bus.
-    if (!vehicle_cl250_frame_allowed(frame.id, frame.extended, frame.data, frame.dlc)) {
+    // D-021: only the ECU's own request IDs; D-020: only allow-listed services, Single
+    // Frames only. The generated guard is the last word on what may reach the vehicle bus.
+    bool idAllowed = (id == VEHICLE_CL250_REQUEST_ID) || (id == VEHICLE_CL250_FALLBACK_REQUEST_ID);
+    if (!idAllowed || len == 0 || len > uds::kIsoTpSingleFrameMaxLen ||
+        !vehicle_cl250_frame_allowed(frame.data, frame.dlc)) {
         _blockedFrames++;
         Serial.printf("[UDS BLOCKED] Frame 0x%08lX [%02X %02X %02X] refused by the D-020 guard (total=%lu).\n",
             (unsigned long)frame.id, frame.data[0], frame.data[1], frame.data[2], (unsigned long)_blockedFrames);
@@ -73,34 +73,34 @@ bool HondaCANModule::sendFrame(uint32_t id, bool extended, const uint8_t* reques
 }
 
 void HondaCANModule::sendRequest(const uint8_t* request, uint8_t len) {
-    sendFrame(VEHICLE_CL250_REQUEST_ID, VEHICLE_CL250_ID_IS_EXTENDED != 0u, request, len);
-    sendFrame(VEHICLE_CL250_FALLBACK_REQUEST_ID, VEHICLE_CL250_FALLBACK_ID_IS_EXTENDED != 0u, request, len);
+    sendFrame(VEHICLE_CL250_REQUEST_ID, request, len);
+    sendFrame(VEHICLE_CL250_FALLBACK_REQUEST_ID, request, len);
 }
 
 void HondaCANModule::requestDID(uint16_t did) {
-    const uint8_t request[] = {VEHICLE_CL250_SID_READ_DID, (uint8_t)((did >> 8) & 0xFF), (uint8_t)(did & 0xFF)};
+    const uint8_t request[] = {uds::kSidReadDataByIdentifier, (uint8_t)((did >> 8) & 0xFF), (uint8_t)(did & 0xFF)};
     sendRequest(request, sizeof(request));
 }
 
 void HondaCANModule::storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now) {
     switch (didIndex) {
-        case VEHICLE_CL250_DID_INDEX_ENGINE_SPEED:
+        case VEHICLE_CL250_IDX_ENGINE_SPEED:
             state.engine.rpm = value;
             state.engine.rpmUpdatedMs = now;
             break;
-        case VEHICLE_CL250_DID_INDEX_VEHICLE_SPEED:
+        case VEHICLE_CL250_IDX_VEHICLE_SPEED:
             state.engine.speed = (uint8_t)value;
             state.engine.speedUpdatedMs = now;
             break;
-        case VEHICLE_CL250_DID_INDEX_COOLANT_TEMPERATURE:
+        case VEHICLE_CL250_IDX_COOLANT_TEMP:
             state.engine.coolantTemp = (int16_t)value;
             state.engine.coolantTempUpdatedMs = now;
             break;
-        case VEHICLE_CL250_DID_INDEX_THROTTLE_POSITION:
+        case VEHICLE_CL250_IDX_THROTTLE_POS:
             state.engine.throttlePos = value;
             state.engine.throttlePosUpdatedMs = now;
             break;
-        case VEHICLE_CL250_DID_INDEX_BATTERY_VOLTAGE:
+        case VEHICLE_CL250_IDX_BATTERY_VOLTAGE:
             state.engine.batteryVoltage = value;
             state.engine.batteryVoltageUpdatedMs = now;
             break;
@@ -218,9 +218,9 @@ void HondaCANModule::update(SystemState& state) {
     CanFrame rxMsg;
     while (_bus.receive(rxMsg)) {
         bool isUDSResponse =
-            (rxMsg.id == VEHICLE_CL250_RESPONSE_ID && rxMsg.extended == (VEHICLE_CL250_ID_IS_EXTENDED != 0u)) ||
+            (rxMsg.id == VEHICLE_CL250_RESPONSE_ID && rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) ||
             (rxMsg.id == VEHICLE_CL250_FALLBACK_RESPONSE_ID &&
-             rxMsg.extended == (VEHICLE_CL250_FALLBACK_ID_IS_EXTENDED != 0u));
+             rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_RESPONSE_ID));
         if (!isUDSResponse || rxMsg.dlc < 2) {
             continue;
         }
@@ -237,25 +237,16 @@ void HondaCANModule::update(SystemState& state) {
                 isoTpFrameType, rxMsg.data[0]);
             continue;
         }
-        uint8_t payloadLen = rxMsg.data[0] & 0x0F;
-        if (payloadLen > rxMsg.dlc - 1) {
-            payloadLen = rxMsg.dlc - 1;
-        }
-
-        if (rxMsg.data[1] == kSidReadDidResponse && payloadLen >= kDidResponseHeaderLen) {
-            uint16_t did = (rxMsg.data[2] << 8) | rxMsg.data[3];
-            const vehicle_cl250_did_t* entry = vehicle_cl250_find_did(did);
-            float value = 0.0f;
-            if (entry != nullptr &&
-                vehicle_cl250_decode(entry, &rxMsg.data[4], payloadLen - kDidResponseHeaderLen, &value)) {
-                storeValue(state, (uint8_t)(entry - vehicle_cl250_dids), value, now);
-            } else {
-                Serial.printf("[UDS WARNING] Dropped response for DID 0x%04X (unknown DID or too short: %u bytes).\n",
-                    did, payloadLen);
-            }
+        // A ReadDataByIdentifier answer: the generated parser checks the Single Frame
+        // PCI, the positive SID, the DID echo, the length and the physical range.
+        uint16_t echoedDid = (uint16_t)((rxMsg.data[2] << 8) | rxMsg.data[3]);
+        const vehicle_cl250_did_t* entry = vehicle_cl250_find(echoedDid);
+        float value = 0.0f;
+        if (entry != nullptr && vehicle_cl250_parse_response(echoedDid, rxMsg.data, rxMsg.dlc, &value)) {
+            storeValue(state, (uint8_t)(entry - vehicle_cl250_dids), value, now);
 
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
-            if (_udsState == UdsRequestState::WAITING && did == _pendingDid) {
+            if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
                 _udsState = UdsRequestState::COMPLETE;
             }
             _lastGoodResponseMs = now; // G2.3: any DID response proves the ECU is present
@@ -266,14 +257,14 @@ void HondaCANModule::update(SystemState& state) {
                 Serial.println("[UDS SUCCESS] Extended diagnostic session (0x10 0x03) confirmed by ECU.");
             }
             _lastGoodResponseMs = now;
-        } else if (rxMsg.data[1] == VEHICLE_CL250_SID_NEGATIVE_RESPONSE && rxMsg.dlc >= 4) {
+        } else if (rxMsg.data[1] == uds::kSidNegativeResponse && rxMsg.dlc >= 4) {
             // G2.1 -- Negative response: [PCI][0x7F][echoed SID][NRC].
             uint8_t echoedSid = rxMsg.data[2];
             uint8_t nrc = rxMsg.data[3];
             _nrcCount++;
             _lastGoodResponseMs = now; // G2.3: a NRC still proves the ECU is alive and answering
 
-            if (nrc == VEHICLE_CL250_NRC_RESPONSE_PENDING) {
+            if (nrc == uds::kNrcResponsePending) {
                 // responsePending: the ECU is still working on the DID we're WAITING on.
                 // Reset and double the timeout (capped) instead of declaring a timeout.
                 if (_udsState == UdsRequestState::WAITING) {
@@ -284,7 +275,7 @@ void HondaCANModule::update(SystemState& state) {
                     echoedSid, _responseTimeoutMs);
             } else {
                 Serial.printf("[UDS WARNING] Negative response: SID=0x%02X NRC=0x%02X (%s) [total NRCs=%lu]\n",
-                    echoedSid, nrc, vehicle_cl250_nrc_name(nrc), (unsigned long)_nrcCount);
+                    echoedSid, nrc, uds::nrcName(nrc), (unsigned long)_nrcCount);
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
                 if (_udsState == UdsRequestState::WAITING) {

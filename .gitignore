@@ -10,3 +10,4 @@ sdkconfig.*
 !sdkconfig.defaults
 managed_components/
 dependencies.lock
+*.apk

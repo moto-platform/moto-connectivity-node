@@ -60,12 +60,13 @@ void test_isStale_respects_custom_threshold(void) {
     TEST_ASSERT_TRUE(isStale(lastUpdate, 500));   // over a 500ms threshold
 }
 
-void test_did_stale_threshold_is_twice_poll_period_with_floor(void) {
-    // Engine speed polls every 50 ms -> 100 ms, below the 500 ms floor.
-    TEST_ASSERT_EQUAL_UINT32(STALE_THRESHOLD_MS, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_ENGINE_SPEED));
-    // Slow DIDs poll every 800 ms -> 1600 ms, so they no longer flicker between polls.
-    TEST_ASSERT_EQUAL_UINT32(2u * vehicle_cl250_dids[VEHICLE_CL250_DID_INDEX_VEHICLE_SPEED].poll_period_ms,
-                             didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_VEHICLE_SPEED));
+void test_did_stale_threshold_comes_from_generated_table(void) {
+    // Every DID uses its generated stale_after_ms, which is longer than its poll period,
+    // so a value never flickers to "stale" between two regular polls.
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_EQUAL_UINT32(vehicle_cl250_dids[i].stale_after_ms, didStaleThresholdMs(i));
+        TEST_ASSERT_TRUE(didStaleThresholdMs(i) > vehicle_cl250_dids[i].poll_period_ms);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +134,11 @@ void test_build_packet_from_fresh_state(void) {
 
 void test_build_packet_flags_follow_staleness(void) {
     SystemState state = freshState(10000);
-    // 600 ms later: engine speed (500 ms threshold) is stale, the 800 ms DIDs are not.
-    test_setMillis(10600);
+    // Just past engine speed's generated stale_after_ms: RPM is stale, vehicle speed
+    // (longer stale_after_ms) is still valid.
+    uint32_t rpmStale = vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].stale_after_ms;
+    TEST_ASSERT_TRUE(rpmStale < vehicle_cl250_dids[VEHICLE_CL250_IDX_VEHICLE_SPEED].stale_after_ms);
+    test_setMillis(10000 + rpmStale + 1);
     BLETelemetryPacket p = buildTelemetryPacket(state, 0);
     TEST_ASSERT_EQUAL_HEX8(0, p.flags & BLE_FLAG_RPM_VALID);
     TEST_ASSERT_EQUAL_HEX8(BLE_FLAG_SPEED_VALID, p.flags & BLE_FLAG_SPEED_VALID);
@@ -229,7 +233,7 @@ int main(int, char**) {
     RUN_TEST(test_isStale_fresh_value_is_not_stale);
     RUN_TEST(test_isStale_old_value_is_stale);
     RUN_TEST(test_isStale_respects_custom_threshold);
-    RUN_TEST(test_did_stale_threshold_is_twice_poll_period_with_floor);
+    RUN_TEST(test_did_stale_threshold_comes_from_generated_table);
     RUN_TEST(test_ble_packet_size_and_offsets);
     RUN_TEST(test_build_packet_from_fresh_state);
     RUN_TEST(test_build_packet_flags_follow_staleness);

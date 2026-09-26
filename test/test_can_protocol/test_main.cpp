@@ -264,7 +264,9 @@ void test_every_transmitted_frame_passes_the_d020_guard(void) {
     }
     TEST_ASSERT_TRUE(bus.txLog.size() > 100);
     for (const CanFrame& f : bus.txLog) {
-        TEST_ASSERT_TRUE(vehicle_cl250_frame_allowed(f.id, f.extended, f.data, f.dlc));
+        TEST_ASSERT_TRUE(f.id == VEHICLE_CL250_REQUEST_ID || f.id == VEHICLE_CL250_FALLBACK_REQUEST_ID);
+        TEST_ASSERT_TRUE(f.extended == (f.id == VEHICLE_CL250_REQUEST_ID)); // 29-bit primary, 11-bit fallback
+        TEST_ASSERT_TRUE(vehicle_cl250_frame_allowed(f.data, f.dlc));
     }
     TEST_ASSERT_EQUAL_UINT32(0, module.blockedFrameCount());
 }
@@ -309,8 +311,8 @@ void test_all_dids_decode_with_generated_formulas(void) {
     test_setMillis(100);
 
     bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_VEHICLE_SPEED, 88, 0, 5));     // 88 km/h
-    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_COOLANT_TEMPERATURE, 130, 0, 5));    // 130 - 40 = 90 degC
-    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_THROTTLE_POSITION, 255, 0, 5));    // 100 %
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_COOLANT_TEMP, 130, 0, 5));    // 130 - 40 = 90 degC
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_THROTTLE_POS, 255, 0, 5));    // 100 %
     bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_BATTERY_VOLTAGE, 0x30, 0x70));   // 12400 mV
     module.update(state);
 

@@ -16,12 +16,11 @@ inline bool isStale(uint32_t lastUpdateMs, uint32_t thresholdMs = STALE_THRESHOL
     return lastUpdateMs == 0 || (millis() - lastUpdateMs) > thresholdMs;
 }
 
-// Staleness threshold for a polled DID: twice its poll period from the generated table,
-// never below STALE_THRESHOLD_MS. The legacy code used 500 ms for every value, so the
-// 800 ms DIDs flickered to "stale" between two polls (docs/legacy-telemetry-notes.md).
+// Staleness threshold for a polled DID: the generated stale_after_ms of that DID
+// (moto-vehicle-defs, 3 x poll period, D-025/D-029). The legacy code used one 500 ms
+// value for everything (docs/legacy-telemetry-notes.md).
 inline uint32_t didStaleThresholdMs(uint8_t didIndex) {
-    uint32_t twice = 2u * (uint32_t)vehicle_cl250_dids[didIndex].poll_period_ms;
-    return twice > STALE_THRESHOLD_MS ? twice : STALE_THRESHOLD_MS;
+    return vehicle_cl250_dids[didIndex].stale_after_ms;
 }
 
 /**

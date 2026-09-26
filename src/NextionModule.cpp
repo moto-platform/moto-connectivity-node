@@ -55,15 +55,15 @@ void NextionModule::update(const SystemState& state) {
     // repo): configure each numeric component (or an overlay text component) to
     // render -999 as "--" instead of the literal number.
     const EngineData& e = state.engine;
-    setVal("n_rpm",   isStale(e.rpmUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_ENGINE_SPEED))
+    setVal("n_rpm",   isStale(e.rpmUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_ENGINE_SPEED))
                           ? NEXTION_STALE_SENTINEL : (int32_t)e.rpm);
-    setVal("n_speed", isStale(e.speedUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_VEHICLE_SPEED))
+    setVal("n_speed", isStale(e.speedUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_VEHICLE_SPEED))
                           ? NEXTION_STALE_SENTINEL : (int32_t)e.speed);
-    setVal("n_temp",  isStale(e.coolantTempUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_COOLANT_TEMPERATURE))
+    setVal("n_temp",  isStale(e.coolantTempUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_COOLANT_TEMP))
                           ? NEXTION_STALE_SENTINEL : (int32_t)e.coolantTemp);
-    setVal("n_tps",   isStale(e.throttlePosUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_THROTTLE_POSITION))
+    setVal("n_tps",   isStale(e.throttlePosUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_THROTTLE_POS))
                           ? NEXTION_STALE_SENTINEL : (int32_t)e.throttlePos);
-    setVal("n_volt",  isStale(e.batteryVoltageUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_DID_INDEX_BATTERY_VOLTAGE))
+    setVal("n_volt",  isStale(e.batteryVoltageUpdatedMs, didStaleThresholdMs(VEHICLE_CL250_IDX_BATTERY_VOLTAGE))
                           ? NEXTION_STALE_SENTINEL : (int32_t)(e.batteryVoltage * 10.0f)); // e.g. 12.4V -> 124
 
     // No lean source on this node any more (complementary filter dropped, D-023): the
