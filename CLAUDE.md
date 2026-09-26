@@ -30,14 +30,14 @@ Reads signal definitions from `moto-vehicle-defs` (submodule: `external/moto-veh
 ## Build
 
 PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espidf`, D-023). Target chip: `esp32s3`.
-- `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`)
-- `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock`; needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
+- `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`, pinned to `v0.1.0`); CI needs the `MOTO_DEFS_TOKEN` secret for this private submodule
+- `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock` / `-e esp32-s3-devkitc-1-no-tester` (poller off); needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
 - `pio test -e native`, or `scripts/native_tests.sh` (g++ + Unity, no PlatformIO registry needed)
 
 ## Legacy telemetry port (D-023)
 
 The code comes from the read-only reference repo `moto-platform/HondaCl250_Telemetry` (archived). Ported as-is: CAN/UDS module, `ICanBus`/`TwaiCanBus`, mock CAN, BLE server + packet schema, Nextion, serial logger, native tests. Rewritten: WiFi server (no Arduino `String`). Dropped: web PWA and the complementary-filter lean angle.
-- This node is the **temporary sole tester** on the vehicle bus until rt-core takes over. Then its poller must be disabled; two testers are never allowed (D-021). Only the D-020 service allow-list may be sent.
+- This node is the **temporary sole tester** on the vehicle bus until rt-core takes over. Then its poller must be disabled (`CONN_VEHICLE_TESTER=0`, env `esp32-s3-devkitc-1-no-tester`: no TWAI driver at all); two testers are never allowed (D-021). At runtime the poller also latches off when it sees another tester or repeated bus-off. Only the D-020 service allow-list may be sent.
 - Vehicle IDs, DIDs, formulas and UDS timing come from `external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.h`; every frame passes `vehicle_cl250_frame_allowed()` (D-020). Never hand-write them again (`vss-schema-guardian` flags leftovers).
 - The BLE packet layout is defined in `docs/ble_telemetry_packet_schema.json` (v2); moto-mobile checks a copy of it in its tests. Change both together.
 
