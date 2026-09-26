@@ -1,6 +1,7 @@
 #include <unity.h>
 #include "../../src/HondaCANModule.h"
 #include "../mocks/MockCanBus.h"
+#include "../../src/uds_iso14229.h"
 
 // [env:native] sets test_build_src = no (most of src/ needs ESP32-only libraries
 // that don't exist on the host), so this suite pulls in the one real implementation
@@ -48,12 +49,14 @@ static CanFrame makeNegativeResponse(uint8_t echoedSid, uint8_t nrc) {
 }
 
 static CanFrame makeSessionConfirm() {
+    // Positive DiagnosticSessionControl response: [PCI=6][0x50][sub=0x03][P2 hi/lo][P2* hi/lo]
     CanFrame f;
     f.id = VEHICLE_CL250_RESPONSE_ID;
     f.extended = true;
-    f.dlc = 2;
-    f.data[0] = 0x02;
-    f.data[1] = 0x50;
+    f.dlc = 8;
+    const uint8_t d[8] = {0x06, VEHICLE_CL250_SESSION_POSITIVE_SID, VEHICLE_CL250_SESSION_SUBFUNCTION,
+                          0x00, 0x32, 0x01, 0xF4, VEHICLE_CL250_PADDING_BYTE};
+    for (int i = 0; i < 8; i++) f.data[i] = d[i];
     return f;
 }
 
@@ -349,6 +352,197 @@ void test_frames_from_other_ids_are_ignored(void) {
     TEST_ASSERT_EQUAL_FLOAT(0.0f, state.engine.rpm);
 }
 
+// ---------------------------------------------------------------------------
+// Safety-review additions (D-020 / D-021 / D-023)
+// ---------------------------------------------------------------------------
+
+// Every frame this node may ever send, as [PCI + payload] (padding checked separately).
+static bool isAllowedEmittedFrame(const CanFrame& f) {
+    if (f.dlc != VEHICLE_CL250_FRAME_DLC) return false;
+    uint8_t len = f.data[0];
+    if (len < 2 || len > 7) return false;
+    for (uint8_t i = len + 1; i < 8; i++) {
+        if (f.data[i] != VEHICLE_CL250_PADDING_BYTE) return false;
+    }
+    if (len == 2 && f.data[1] == VEHICLE_CL250_SESSION_SID && f.data[2] == VEHICLE_CL250_SESSION_SUBFUNCTION) return true;
+    if (len == 2 && f.data[1] == VEHICLE_CL250_TESTER_PRESENT_SID &&
+        f.data[2] == VEHICLE_CL250_TESTER_PRESENT_SUBFUNCTION) return true;
+    if (len == 3 && f.data[1] == uds::kSidReadDataByIdentifier) {
+        uint16_t did = (uint16_t)((f.data[2] << 8) | f.data[3]);
+        return vehicle_cl250_find(did) != nullptr;
+    }
+    return false;
+}
+
+static void assertOnlyAllowedFrames(const MockCanBus& bus) {
+    for (const CanFrame& f : bus.txLog) {
+        TEST_ASSERT_TRUE(f.id == VEHICLE_CL250_REQUEST_ID || f.id == VEHICLE_CL250_FALLBACK_REQUEST_ID);
+        TEST_ASSERT_TRUE(isAllowedEmittedFrame(f));
+    }
+}
+
+void test_emitted_set_is_exact_across_ecu_behaviours(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    for (unsigned long t = 0; t < 20000; t += 10) {
+        test_setMillis(t);
+        uint8_t phase = (uint8_t)((t / 2000) % 4);
+        if (phase == 0 && t % 40 == 0) bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x1A, 0xF8));
+        if (phase == 1 && t % 30 == 0) bus.injectRxFrame(makeNegativeResponse(uds::kSidReadDataByIdentifier, 0x31));
+        if (phase == 2 && t % 20 == 0) bus.injectRxFrame(makeNegativeResponse(uds::kSidReadDataByIdentifier, uds::kNrcResponsePending));
+        if (phase == 3 && t == 6500) bus.setState(CanBusState::BUS_OFF);
+        if (phase == 3 && t == 6600) bus.setState(CanBusState::STOPPED);
+        if (phase == 3 && t == 6700) bus.setState(CanBusState::RUNNING);
+        if (t == 1000) bus.injectRxFrame(makeSessionConfirm());
+        module.update(state);
+    }
+    TEST_ASSERT_TRUE(bus.txLog.size() > 100);
+    assertOnlyAllowedFrames(bus);
+    TEST_ASSERT_EQUAL_UINT32(0, module.blockedFrameCount());
+}
+
+void test_forbidden_requests_are_refused_and_never_transmitted(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    const uint8_t forbidden[][2] = {
+        {0x10, 0x02}, {0x10, 0x82}, {0x11, 0x01}, {0x14, 0xFF}, {0x27, 0x01}, {0x2E, 0xF1},
+        {0x2F, 0xF1}, {0x31, 0x01}, {0x34, 0x00}, {0x35, 0x00}, {0x36, 0x01}, {0x37, 0x00},
+        {0x28, 0x03}, {0x85, 0x02}, {0x3E, 0x01},
+    };
+    uint32_t expectedBlocked = 0;
+    for (const auto& req : forbidden) {
+        TEST_ASSERT_FALSE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, req, 2));
+        expectedBlocked++;
+    }
+    const uint8_t ok[] = {VEHICLE_CL250_SESSION_SID, VEHICLE_CL250_SESSION_SUBFUNCTION};
+    TEST_ASSERT_FALSE(module.testSendFrame(0x7DF, ok, 2));      // functional broadcast ID
+    TEST_ASSERT_FALSE(module.testSendFrame(0x18DA11F1, ok, 2)); // another ECU
+    TEST_ASSERT_FALSE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, ok, 0));
+    const uint8_t eight[8] = {0x22, 0xF4, 0x0C, 0, 0, 0, 0, 0};
+    TEST_ASSERT_FALSE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, eight, 8)); // not a Single Frame
+    expectedBlocked += 4;
+    TEST_ASSERT_EQUAL_UINT32(0, bus.txLog.size());
+    TEST_ASSERT_EQUAL_UINT32(expectedBlocked, module.blockedFrameCount());
+    TEST_ASSERT_TRUE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, ok, 2));
+    TEST_ASSERT_EQUAL_UINT32(1, bus.txLog.size());
+}
+
+void test_response_pending_storm_still_times_out(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    bus.clearTxLog();
+    test_setMillis(100);
+    module.update(state); // engine speed request goes out
+    TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED)); // primary + fallback
+    // The ECU answers 0x78 forever; the request must still end within the generated maximum.
+    unsigned long t = 100;
+    for (; t < 100 + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 400; t += 20) {
+        test_setMillis(t);
+        bus.injectRxFrame(makeNegativeResponse(uds::kSidReadDataByIdentifier, uds::kNrcResponsePending));
+        module.update(state);
+        if ((uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 2) break;
+    }
+    TEST_ASSERT_TRUE((uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 2);
+    TEST_ASSERT_TRUE(t <= 100 + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 100);
+}
+
+void test_nrc_for_other_service_does_not_resolve_pending_read(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    bus.clearTxLog();
+    test_setMillis(100);
+    module.update(state); // engine speed request pending
+    TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED));
+    size_t before = bus.txLog.size();
+    // NRC for TesterPresent must not end the pending ReadDataByIdentifier early. Without
+    // the fix the request completes and the next DID is requested at once.
+    test_setMillis(110);
+    bus.injectRxFrame(makeNegativeResponse(VEHICLE_CL250_TESTER_PRESENT_SID, 0x12));
+    module.update(state);
+    test_setMillis(120);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(before, bus.txLog.size()); // still waiting, nothing new sent
+}
+
+void test_foreign_tester_latches_poller_off(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    test_setMillis(10);
+    module.update(state);
+    CanFrame foreign;
+    foreign.id = VEHICLE_CL250_REQUEST_ID;
+    foreign.extended = true;
+    foreign.dlc = 8;
+    const uint8_t d[8] = {0x03, uds::kSidReadDataByIdentifier, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
+    for (int i = 0; i < 8; i++) foreign.data[i] = d[i];
+    bus.injectRxFrame(foreign);
+    test_setMillis(20);
+    module.update(state);
+    TEST_ASSERT_TRUE(module.foreignTesterDetected());
+    TEST_ASSERT_TRUE(module.latchedOff());
+    TEST_ASSERT_EQUAL_INT(1, bus.stopCallCount);
+    size_t sent = bus.txLog.size();
+    for (unsigned long t = 30; t < 10000; t += 25) {
+        test_setMillis(t);
+        module.update(state);
+    }
+    TEST_ASSERT_EQUAL_UINT32(sent, bus.txLog.size()); // nothing transmitted after the latch
+    TEST_ASSERT_FALSE(state.engine.ecuPresent);
+}
+
+void test_repeated_bus_off_latches_off(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    unsigned long t = 10;
+    for (int event = 0; event < 6 && !module.latchedOff(); event++) {
+        bus.setState(CanBusState::BUS_OFF);
+        test_setMillis(t += 10);
+        module.update(state);
+        bus.setState(CanBusState::RUNNING);
+        test_setMillis(t += 10);
+        module.update(state);
+    }
+    TEST_ASSERT_TRUE(module.latchedOff());
+    TEST_ASSERT_FALSE(module.foreignTesterDetected());
+    TEST_ASSERT_EQUAL_INT(1, bus.stopCallCount);
+}
+
+void test_session_confirm_requires_extended_subfunction(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    CanFrame defaultSession = makeSessionConfirm();
+    defaultSession.data[2] = 0x01; // 50 01 = default session, not what we asked for
+    bus.injectRxFrame(defaultSession);
+    test_setMillis(10);
+    module.update(state);
+    bus.clearTxLog();
+    test_setMillis(10 + VEHICLE_CL250_SESSION_RETRY_INTERVAL_MS + 1);
+    module.update(state);
+    bool retried = false;
+    for (const CanFrame& f : bus.txLog) {
+        if (f.data[1] == VEHICLE_CL250_SESSION_SID) retried = true;
+    }
+    TEST_ASSERT_TRUE(retried); // still unconfirmed -> session request repeated
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -364,5 +558,12 @@ int main(int, char**) {
     RUN_TEST(test_all_dids_decode_with_generated_formulas);
     RUN_TEST(test_short_battery_response_is_dropped);
     RUN_TEST(test_frames_from_other_ids_are_ignored);
+    RUN_TEST(test_emitted_set_is_exact_across_ecu_behaviours);
+    RUN_TEST(test_forbidden_requests_are_refused_and_never_transmitted);
+    RUN_TEST(test_response_pending_storm_still_times_out);
+    RUN_TEST(test_nrc_for_other_service_does_not_resolve_pending_read);
+    RUN_TEST(test_foreign_tester_latches_poller_off);
+    RUN_TEST(test_repeated_bus_off_latches_off);
+    RUN_TEST(test_session_confirm_requires_extended_subfunction);
     return UNITY_END();
 }

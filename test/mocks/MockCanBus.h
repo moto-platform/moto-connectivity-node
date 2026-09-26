@@ -14,6 +14,7 @@
 class MockCanBus : public ICanBus {
 public:
     std::vector<CanFrame> txLog;
+    int stopCallCount = 0;
     int initiateRecoveryCallCount = 0;
     int startCallCount = 0;
 
@@ -52,6 +53,10 @@ public:
     bool start() override {
         startCallCount++;
         return true;
+    }
+
+    void stop() override {
+        stopCallCount++;
     }
 
     // --- Test-only control surface (not part of ICanBus) ---

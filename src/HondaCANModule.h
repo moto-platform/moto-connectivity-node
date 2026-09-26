@@ -32,12 +32,22 @@ public:
 
     // Frames refused by the D-020 guard since boot. Must stay 0; exposed for tests/logs.
     uint32_t blockedFrameCount() const { return _blockedFrames; }
+    // True once the poller stopped for good (foreign tester or repeated bus-off).
+    bool latchedOff() const { return _latchedOff; }
+    bool foreignTesterDetected() const { return _foreignTesterDetected; }
+
+#ifdef CONN_NATIVE_TEST
+    // Test hook: drives the real TX gate with an arbitrary request (never built on target).
+    bool testSendFrame(uint32_t id, const uint8_t* request, uint8_t len) { return sendFrame(id, request, len); }
+#endif
 
 private:
     ICanBus& _bus;
     bool _initialized = false;
     unsigned long _lastKeepAlive = 0;
     uint32_t _blockedFrames = 0;
+    bool _latchedOff = false;
+    bool _foreignTesterDetected = false;
 
     // G1.3 -- Bus-off recovery state. Recovery attempts back off exponentially
     // (VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS doubling up to _MAX_MS) instead of
@@ -74,6 +84,7 @@ private:
     int8_t _pendingDidIndex = -1;
     uint16_t _pendingDid = 0;
     unsigned long _requestSentMs = 0;
+    unsigned long _requestFirstSentMs = 0; // first send of the pending request (0x78 cap)
     unsigned long _responseTimeoutMs = 0;
 
     // ------------------------------------------------------------------
@@ -101,6 +112,9 @@ private:
     void requestDID(uint16_t did);
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
+
+    // Stops the CAN driver and all polling until reboot.
+    void latchOff(const char* reason);
 };
 
 #endif // HONDA_CAN_MODULE_H

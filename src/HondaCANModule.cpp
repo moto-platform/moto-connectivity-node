@@ -13,6 +13,16 @@ const unsigned long kEcuAbsentTimeoutMs = VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS;
 const unsigned long kBackoffMinMs = VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS;
 const unsigned long kBackoffMaxMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MAX_MS;
 
+// Local policy of this TEMPORARY tester, not a vehicle definition: after this many
+// bus-off events the driver is stopped for good (until reboot) instead of rejoining the
+// OEM bus forever and putting error frames on it. Candidate for moto-vehicle-defs.
+const uint32_t kMaxBusOffEvents = 5;
+
+// millis()-wrap-safe "deadline not reached yet" (deadline 0 = none).
+inline bool beforeDeadline(unsigned long now, unsigned long deadline) {
+    return deadline != 0 && (long)(deadline - now) > 0;
+}
+
 const uint8_t kSidSessionResponse = VEHICLE_CL250_SESSION_POSITIVE_SID;
 
 const uint8_t kSessionRequest[] = {VEHICLE_CL250_SESSION_SID, VEHICLE_CL250_SESSION_SUBFUNCTION};
@@ -112,6 +122,13 @@ void HondaCANModule::storeValue(SystemState& state, uint8_t didIndex, float valu
 void HondaCANModule::update(SystemState& state) {
     unsigned long now = millis();
 
+    // Latched off (foreign tester seen or too many bus-offs): transmit nothing ever
+    // again until reboot, and stop feeding SystemState so consumers show "stale".
+    if (_latchedOff) {
+        state.engine.ecuPresent = false;
+        return;
+    }
+
     // 1. Bus-Off Auto Recovery Check (G1.3 -- exponential backoff, event logging)
     CanBusState busState = _bus.getState();
     if (busState == CanBusState::BUS_OFF) {
@@ -119,6 +136,11 @@ void HondaCANModule::update(SystemState& state) {
             // Just entered bus-off: log once, reset backoff, attempt immediately.
             _busOff = true;
             _busOffEventCount++;
+            if (_busOffEventCount >= kMaxBusOffEvents) {
+                latchOff("too many bus-off events");
+                state.engine.ecuPresent = false;
+                return;
+            }
             _recoveryBackoffMs = kBackoffMinMs;
             _lastRecoveryAttempt = 0;
             uint16_t txErr = 0, rxErr = 0;
@@ -165,6 +187,9 @@ void HondaCANModule::update(SystemState& state) {
     // for consumers to show an explicit "ECU not found" state.
     bool ecuPresentNow = (_lastGoodResponseMs != 0) && (now - _lastGoodResponseMs < kEcuAbsentTimeoutMs);
     if (ecuPresentNow != _ecuPresent) {
+        if (!ecuPresentNow) {
+            _sessionConfirmed = false; // ECU lost (e.g. reset): request the session again
+        }
         _ecuPresent = ecuPresentNow;
         Serial.printf("[UDS] ECU is now %s.\n", _ecuPresent ? "PRESENT" : "NOT DETECTED");
     }
@@ -174,7 +199,7 @@ void HondaCANModule::update(SystemState& state) {
     if (_udsState == UdsRequestState::IDLE) {
         for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
             DidSlot& slot = _dids[i];
-            if (now < slot.skipUntilMs) {
+            if (beforeDeadline(now, slot.skipUntilMs)) {
                 continue; // temporarily skipped after repeated timeouts
             }
             if (now - slot.lastRequestMs >= slot.cadenceMs) {
@@ -189,6 +214,7 @@ void HondaCANModule::update(SystemState& state) {
                 // outstanding -- move straight into WAITING for its response.
                 _udsState = UdsRequestState::WAITING;
                 _requestSentMs = now;
+                _requestFirstSentMs = now;
                 _responseTimeoutMs = kResponseTimeoutMs;
                 break; // exactly one request in flight at a time
             }
@@ -217,6 +243,17 @@ void HondaCANModule::update(SystemState& state) {
     // 4. Read incoming CAN frames from the ECU
     CanFrame rxMsg;
     while (_bus.receive(rxMsg)) {
+        // TWAI does not receive its own frames, so a frame on the ECU's REQUEST IDs means
+        // another tester is on the bus (e.g. rt-core already polls). Two testers are never
+        // allowed (D-021): latch this poller off until reboot.
+        if ((rxMsg.id == VEHICLE_CL250_REQUEST_ID && rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_REQUEST_ID)) ||
+            (rxMsg.id == VEHICLE_CL250_FALLBACK_REQUEST_ID &&
+             rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_REQUEST_ID))) {
+            _foreignTesterDetected = true;
+            latchOff("another tester is on the vehicle bus (D-021)");
+            state.engine.ecuPresent = false;
+            return;
+        }
         bool isUDSResponse =
             (rxMsg.id == VEHICLE_CL250_RESPONSE_ID && rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) ||
             (rxMsg.id == VEHICLE_CL250_FALLBACK_RESPONSE_ID &&
@@ -250,7 +287,9 @@ void HondaCANModule::update(SystemState& state) {
                 _udsState = UdsRequestState::COMPLETE;
             }
             _lastGoodResponseMs = now; // G2.3: any DID response proves the ECU is present
-        } else if (rxMsg.data[1] == kSidSessionResponse) {
+        } else if ((rxMsg.data[0] & 0xF0) == 0 && (rxMsg.data[0] & 0x0F) >= 2 && rxMsg.dlc >= 3 &&
+                   rxMsg.data[1] == kSidSessionResponse &&
+                   (rxMsg.data[2] & 0x7F) == VEHICLE_CL250_SESSION_SUBFUNCTION) {
             // G2.3 -- Positive response to DiagnosticSessionControl (0x10).
             if (!_sessionConfirmed) {
                 _sessionConfirmed = true;
@@ -263,13 +302,21 @@ void HondaCANModule::update(SystemState& state) {
             uint8_t nrc = rxMsg.data[3];
             _nrcCount++;
             _lastGoodResponseMs = now; // G2.3: a NRC still proves the ECU is alive and answering
+            // Only an NRC for ReadDataByIdentifier can resolve or extend the pending DID
+            // request; NRCs for 0x10/0x3E are logged and otherwise ignored.
+            bool forPendingRead = (_udsState == UdsRequestState::WAITING) &&
+                                  (echoedSid == uds::kSidReadDataByIdentifier);
 
             if (nrc == uds::kNrcResponsePending) {
                 // responsePending: the ECU is still working on the DID we're WAITING on.
-                // Reset and double the timeout (capped) instead of declaring a timeout.
-                if (_udsState == UdsRequestState::WAITING) {
+                // Reset and double the timeout, but never beyond the generated maximum
+                // total wait since the request was sent, so a 0x78 storm still times out.
+                unsigned long waited = now - _requestFirstSentMs;
+                if (forPendingRead && waited < kResponsePendingMaxMs) {
+                    unsigned long left = kResponsePendingMaxMs - waited;
+                    unsigned long doubled = min(_responseTimeoutMs * 2, kResponsePendingMaxMs);
                     _requestSentMs = now;
-                    _responseTimeoutMs = min(_responseTimeoutMs * 2, kResponsePendingMaxMs);
+                    _responseTimeoutMs = min(doubled, left);
                 }
                 Serial.printf("[UDS] NRC 0x78 responsePending for SID 0x%02X -- extending wait to %lu ms.\n",
                     echoedSid, _responseTimeoutMs);
@@ -278,7 +325,7 @@ void HondaCANModule::update(SystemState& state) {
                     echoedSid, nrc, uds::nrcName(nrc), (unsigned long)_nrcCount);
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
-                if (_udsState == UdsRequestState::WAITING) {
+                if (forPendingRead) {
                     _udsState = UdsRequestState::COMPLETE;
                 }
             }
@@ -289,4 +336,13 @@ void HondaCANModule::update(SystemState& state) {
         _dids[_pendingDidIndex].consecutiveTimeouts = 0;
         _udsState = UdsRequestState::IDLE;
     }
+}
+
+void HondaCANModule::latchOff(const char* reason) {
+    if (_latchedOff) {
+        return;
+    }
+    _latchedOff = true;
+    _bus.stop(); // no more transmission, no ACKs, no error frames from this node
+    Serial.printf("[UDS STOP] Vehicle-bus poller latched off until reboot: %s.\n", reason);
 }

@@ -25,7 +25,7 @@ mkdir -p "$OUT"
 status=0
 for suite in test_native test_can_protocol; do
     exe="$OUT/$suite"
-    g++ -std=c++11 -Wall -Wextra \
+    g++ -std=c++11 -Wall -Wextra -D CONN_NATIVE_TEST \
         -I "$ROOT/test/native_stubs" -I "$GEN" -I "$UNITY/src" \
         "$ROOT/test/$suite/test_main.cpp" "$UNITY/src/unity.c" -o "$exe"
     echo "== $suite"

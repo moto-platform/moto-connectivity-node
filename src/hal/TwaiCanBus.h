@@ -25,6 +25,7 @@ public:
     void getErrorCounters(uint16_t& txErrorCount, uint16_t& rxErrorCount) override;
     bool initiateRecovery() override;
     bool start() override;
+    void stop() override;
 };
 
 #endif // TWAI_CAN_BUS_H

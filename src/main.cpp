@@ -225,6 +225,12 @@ const char* resetReasonName(esp_reset_reason_t reason) {
 // SETUP & MAIN LOOP
 // ============================================================================
 void setup() {
+#if defined(MOCK_CAN_DATA) || !CONN_VEHICLE_TESTER
+    // No TWAI driver in this build: hold the transceiver's TXD recessive (high) so an
+    // undriven pin can never pull the vehicle bus dominant.
+    pinMode(CAN_TX_PIN, OUTPUT);
+    digitalWrite(CAN_TX_PIN, HIGH);
+#endif
     // Initialize USB Serial Debug Console
     Serial.begin(115200);
     delay(500);

@@ -44,6 +44,9 @@ bool BLEServerModule::begin() {
     // OS-level "Pair with Honda-CL250-Telemetry?" prompt on first connection. No mobile
     // code change is required -- the OS Bluetooth stack triggers this pairing dialog
     // automatically in response to the peripheral's security requirements.
+    // Heap use (PLATFORM-RULES 5 "avoided elsewhere"): the Arduino-ESP32 BLE API only
+    // accepts heap-allocated BLESecurity/BLE2902 objects. They are created once in
+    // begin(), never freed or re-allocated, and this is not a safety path.
     BLESecurity* pSecurity = new BLESecurity();
     pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
     pSecurity->setCapability(ESP_IO_CAP_NONE);
@@ -82,7 +85,7 @@ bool BLEServerModule::begin() {
         CHARACTERISTIC_UUID_TX,
         BLECharacteristic::PROPERTY_NOTIFY
     );
-    _pTxCharacteristic->addDescriptor(new BLE2902());
+    _pTxCharacteristic->addDescriptor(new BLE2902()); // one-time, see begin() note on heap use
 
     // Create Telematics RX (Write) Characteristic
     _pRxCharacteristic = pService->createCharacteristic(

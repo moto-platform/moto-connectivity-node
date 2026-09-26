@@ -72,3 +72,8 @@ bool TwaiCanBus::initiateRecovery() {
 bool TwaiCanBus::start() {
     return twai_start() == ESP_OK;
 }
+
+void TwaiCanBus::stop() {
+    twai_stop();
+    twai_driver_uninstall();
+}

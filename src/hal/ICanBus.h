@@ -77,6 +77,12 @@ public:
      * @return true on success.
      */
     virtual bool start() = 0;
+
+    /**
+     * @brief Stops the driver for good: no transmission, no ACK, no error frames
+     * (equivalent to twai_stop() + twai_driver_uninstall()).
+     */
+    virtual void stop() = 0;
 };
 
 #endif // I_CAN_BUS_H
