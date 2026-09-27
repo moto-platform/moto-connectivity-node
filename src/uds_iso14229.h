@@ -16,6 +16,13 @@ const uint8_t kNrcResponsePending = 0x78;       // ECU busy: keep waiting, do no
 
 const uint32_t kCanMaxStandardId = 0x7FF;       // above this an identifier is 29-bit
 
+// ISO 15765-2 normal fixed addressing (29-bit 0x18DA<TA><SA>): the low byte is the
+// source address. Any SA sending to our ECU's target address is a tester.
+const uint32_t kNormalFixedSourceAddressMask = 0xFFu;
+// ISO 15765-4 functional (broadcast) request IDs used by generic OBD testers.
+const uint32_t kFunctionalRequestId11 = 0x7DF;
+const uint32_t kFunctionalRequestId29Prefix = 0x18DB3300u; // 0x18DB33<SA>
+
 // ISO-TP (ISO 15765-2) single frame: PCI high nibble 0, low nibble = payload length 1..7.
 const uint8_t kIsoTpSingleFrameMaxLen = 7;
 

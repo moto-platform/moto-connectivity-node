@@ -37,10 +37,19 @@ public:
     virtual ~ICanBus() {}
 
     /**
-     * @brief Installs and starts the underlying CAN peripheral/driver.
+     * @brief Installs and starts the peripheral in LISTEN-ONLY mode: it receives, but
+     * never transmits, acknowledges or sends error frames (Q-018 observation window).
+     * There is deliberately no way to start straight in normal mode.
      * @return true on success.
      */
-    virtual bool begin() = 0;
+    virtual bool beginListenOnly() = 0;
+
+    /**
+     * @brief Leaves listen-only mode: stops the driver and restarts it in normal
+     * (transmitting, acknowledging) mode.
+     * @return true on success.
+     */
+    virtual bool enterNormalMode() = 0;
 
     /**
      * @brief Transmits a single CAN frame. Non-blocking (or a very short internal
@@ -59,6 +68,13 @@ public:
      * @brief Current bus state (bus-off, stopped, running, error-warning).
      */
     virtual CanBusState getState() = 0;
+
+    /**
+     * @brief Frames lost since install because the RX queue or FIFO was full
+     * (TWAI rx_missed_count + rx_overrun_count). Q-018: a listen-only window with lost
+     * frames proves nothing, so it restarts.
+     */
+    virtual uint32_t rxLostCount() = 0;
 
     /**
      * @brief Current TWAI error counters, for bus-off diagnostics/logging.
@@ -80,7 +96,8 @@ public:
 
     /**
      * @brief Stops the driver for good: no transmission, no ACK, no error frames
-     * (equivalent to twai_stop() + twai_driver_uninstall()).
+     * (equivalent to twai_stop() + twai_driver_uninstall()), and holds TX recessive.
+     * Also safe to call when the driver was never installed.
      */
     virtual void stop() = 0;
 };

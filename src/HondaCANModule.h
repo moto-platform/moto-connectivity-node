@@ -3,6 +3,7 @@
 
 #include "IModule.h"
 #include "hal/ICanBus.h"
+#include "TesterLatch.h"
 #include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
 
 /**
@@ -22,19 +23,37 @@
  * this exact protocol logic (request state machine, NRC handling, ISO-TP frame
  * checking, bus-off recovery) runs identically either way and is unit-testable
  * with no ESP32 device attached.
+ *
+ * Q-018 hardening of the D-030 safeguards:
+ *  - The latch (foreign tester / repeated bus-off) and the bus-off count are saved to an
+ *    ITesterLatchStore and restored by begin(), so a watchdog/panic/brownout reset cannot
+ *    re-enable the poller or reset the bus-off budget. An invalid record after a
+ *    non-power-on reset counts as latched. A restored latch means the CAN driver is
+ *    never installed.
+ *  - begin() starts the bus listen-only. Nothing is sent until kListenOnlyWindowMs of
+ *    complete reception (no lost frames, queue drained) passed with no diagnostic
+ *    request on the bus and no ECU answer (we asked nothing yet, so an answer means
+ *    someone else did).
+ *  - Every pass drains the RX queue first, before any transmission and before the
+ *    response-timeout check, so a slow pass cannot count a queued answer as a timeout.
+ *    If the bounded drain cannot empty the queue, the pass transmits nothing.
  */
 class HondaCANModule : public IProducerModule {
 public:
-    explicit HondaCANModule(ICanBus& bus);
+    HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore);
     bool begin() override;
     void update(SystemState& state) override;
     bool isHealthy() const override { return _initialized; }
 
     // Frames refused by the D-020 guard since boot. Must stay 0; exposed for tests/logs.
     uint32_t blockedFrameCount() const { return _blockedFrames; }
-    // True once the poller stopped for good (foreign tester or repeated bus-off).
+    // True once the poller stopped for good (foreign tester or repeated bus-off), in
+    // this boot or restored from before the last reset.
     bool latchedOff() const { return _latchedOff; }
-    bool foreignTesterDetected() const { return _foreignTesterDetected; }
+    // True during the listen-only observation window after begin().
+    bool listening() const { return _listening; }
+    TesterLatchReason latchReason() const { return _latchReason; }
+    bool foreignTesterDetected() const { return _latchReason == TesterLatchReason::FOREIGN_TESTER; }
     // DID requests that timed out with no response at all since boot (BLE v3 health).
     uint32_t unansweredDidCount() const { return _unansweredDidCount; }
 
@@ -45,11 +64,18 @@ public:
 
 private:
     ICanBus& _bus;
+    ITesterLatchStore& _latchStore;
     bool _initialized = false;
+    bool _listening = false;
+    bool _listenStarted = false;       // the window starts at the first update(), see listenStep()
+    unsigned long _listenStartMs = 0;
+    uint32_t _rxLostBaseline = 0;      // driver counts lost frames from install, i.e. from 0
+    uint32_t _listenRestarts = 0;
+    bool _sessionStartPending = false; // normal mode entered; session goes out after a drain
     unsigned long _lastKeepAlive = 0;
     uint32_t _blockedFrames = 0;
     bool _latchedOff = false;
-    bool _foreignTesterDetected = false;
+    TesterLatchReason _latchReason = TesterLatchReason::NONE;
 
     // G1.3 -- Bus-off recovery state. Recovery attempts back off exponentially
     // (VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS doubling up to _MAX_MS) instead of
@@ -114,15 +140,25 @@ private:
      */
     void requestDID(uint16_t did);
 
-    // The UDS poller itself (unchanged request/response logic).
+    // The UDS poller itself.
     void poll(SystemState& state);
+    // Listen-only window: watch for a foreign tester, then switch to normal mode and
+    // start the session. Returns without transmitting while the window is open.
+    void listenStep(SystemState& state, unsigned long now);
+    enum class DrainResult : uint8_t { DRAINED, BACKLOG, LATCHED };
+    // Drains the RX queue, at most kMaxRxFramesPerPass frames. BACKLOG = frames may still
+    // be queued; LATCHED = a foreign tester latched the poller off.
+    DrainResult drainRx(SystemState& state, unsigned long now);
+    // A diagnostic request that this node did not send (TWAI never receives its own).
+    static bool isForeignTesterFrame(const CanFrame& frame);
     // Copies bus/tester counters into state.can; read-only, never transmits.
     void publishHealth(SystemState& state);
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
 
-    // Stops the CAN driver and all polling until reboot.
-    void latchOff(const char* reason);
+    // Saves the latch, then stops the CAN driver and all polling (survives resets
+    // other than power-on, see ITesterLatchStore).
+    void latchOff(TesterLatchReason reason, const char* why);
 };
 
 #endif // HONDA_CAN_MODULE_H

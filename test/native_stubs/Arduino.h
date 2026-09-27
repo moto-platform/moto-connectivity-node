@@ -33,7 +33,6 @@ inline void test_setMillis(unsigned long ms) {
     native_millis_ref() = ms;
 }
 
-// HondaCANModule::begin() calls delay(200)/delay(50) between session-start frames.
 // No real hardware timing to respect on the host -- a no-op keeps tests fast and
 // deterministic (they never actually need to wait).
 inline void delay(unsigned long) {}

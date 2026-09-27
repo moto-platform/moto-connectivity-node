@@ -13,16 +13,42 @@
  */
 class MockCanBus : public ICanBus {
 public:
+    enum class Mode { NOT_INSTALLED, LISTEN_ONLY, NORMAL };
+
     std::vector<CanFrame> txLog;
+    Mode mode = Mode::NOT_INSTALLED;
+    int beginListenOnlyCallCount = 0;
+    int enterNormalModeCallCount = 0;
+    int txOutsideNormalMode = 0; // transmit() attempts a real TWAI would refuse
+    bool failBeginListenOnly = false;
+    bool failEnterNormalMode = false;
     int stopCallCount = 0;
+    uint32_t rxLost = 0; // what rxLostCount() reports (queue overflow simulation)
     int initiateRecoveryCallCount = 0;
     int startCallCount = 0;
 
-    bool begin() override {
+    bool beginListenOnly() override {
+        beginListenOnlyCallCount++;
+        if (failBeginListenOnly) return false;
+        mode = Mode::LISTEN_ONLY;
+        return true;
+    }
+
+    bool enterNormalMode() override {
+        enterNormalModeCallCount++;
+        if (failEnterNormalMode) {
+            mode = Mode::NOT_INSTALLED;
+            return false;
+        }
+        mode = Mode::NORMAL;
         return true;
     }
 
     bool transmit(const CanFrame& frame) override {
+        if (mode != Mode::NORMAL) {
+            txOutsideNormalMode++; // never reaches txLog: nothing was put on the bus
+            return false;
+        }
         txLog.push_back(frame);
         return true;
     }
@@ -38,6 +64,10 @@ public:
 
     CanBusState getState() override {
         return _state;
+    }
+
+    uint32_t rxLostCount() override {
+        return rxLost;
     }
 
     void getErrorCounters(uint16_t& txErrorCount, uint16_t& rxErrorCount) override {
@@ -57,6 +87,7 @@ public:
 
     void stop() override {
         stopCallCount++;
+        mode = Mode::NOT_INSTALLED;
     }
 
     // --- Test-only control surface (not part of ICanBus) ---
@@ -85,6 +116,10 @@ public:
             }
         }
         return count;
+    }
+
+    size_t rxPending() const {
+        return _rxQueue.size();
     }
 
     void clearTxLog() {

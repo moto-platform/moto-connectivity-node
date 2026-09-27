@@ -18,6 +18,35 @@ const unsigned long kBackoffMaxMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MAX_MS;
 // OEM bus forever and putting error frames on it. Candidate for moto-vehicle-defs.
 const uint32_t kMaxBusOffEvents = 5;
 
+// Local policy of this TEMPORARY tester (Q-018): listen-only for this long after begin()
+// before the first request, so a tester that is already polling the ECU is seen before
+// this node ever transmits (D-021). Candidate for moto-vehicle-defs, like the one above.
+const unsigned long kListenOnlyWindowMs = 2000;
+
+// Bounded RX drain: at most this many frames per pass. Twice the TWAI RX queue depth,
+// so one pass empties the queue, while a flooded bus still cannot stall the loop.
+const uint8_t kMaxRxFramesPerPass = 64;
+// At most this many per-frame log lines per pass (Serial output is slow; see TWDT).
+const uint8_t kMaxRxLogLinesPerPass = 4;
+
+// Per-pass log budget: true (and one slot used) while the budget lasts.
+inline bool takeLogSlot(uint8_t& budget) {
+    if (budget == 0) {
+        return false;
+    }
+    budget--;
+    return true;
+}
+
+const char* latchReasonText(TesterLatchReason reason) {
+    switch (reason) {
+        case TesterLatchReason::FOREIGN_TESTER: return "another tester on the bus";
+        case TesterLatchReason::BUS_OFF: return "too many bus-off events";
+        case TesterLatchReason::UNKNOWN: return "latch record invalid after a reset";
+        default: return "not latched";
+    }
+}
+
 // millis()-wrap-safe "deadline not reached yet" (deadline 0 = none).
 inline bool beforeDeadline(unsigned long now, unsigned long deadline) {
     return deadline != 0 && (long)(deadline - now) > 0;
@@ -30,8 +59,8 @@ const uint8_t kTesterPresentRequest[] = {VEHICLE_CL250_TESTER_PRESENT_SID,
                                          VEHICLE_CL250_TESTER_PRESENT_SUBFUNCTION};
 } // namespace
 
-HondaCANModule::HondaCANModule(ICanBus& bus)
-    : _bus(bus) {
+HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
+    : _bus(bus), _latchStore(latchStore) {
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         _dids[i].did = vehicle_cl250_dids[i].did;
         _dids[i].cadenceMs = vehicle_cl250_dids[i].poll_period_ms;
@@ -42,18 +71,34 @@ HondaCANModule::HondaCANModule(ICanBus& bus)
 }
 
 bool HondaCANModule::begin() {
-    if (_bus.begin()) {
-        Serial.println("[CAN SUCCESS] CAN Bus Active (500 kbps). Listening for Honda ECU...");
-        delay(200);
+    // Q-018: a latch from before the last reset stays in force (an invalid record after a
+    // non-power-on reset counts as one), and so does the bus-off budget. A latched node
+    // never installs the driver: it neither transmits nor acknowledges on the vehicle bus.
+    TesterLatchStatus restored = _latchStore.load();
+    _busOffEventCount = restored.busOffCount;
+    if (restored.reason == TesterLatchReason::NONE && _busOffEventCount >= kMaxBusOffEvents) {
+        restored.reason = TesterLatchReason::BUS_OFF; // defensive: the budget is already spent
+        _latchStore.save(restored.reason, _busOffEventCount);
+    }
+    if (restored.reason != TesterLatchReason::NONE) {
+        _latchedOff = true;
+        _latchReason = restored.reason;
+        _bus.stop();
+        Serial.printf("[UDS STOP] Vehicle-bus poller stays latched off from before the last reset (%s). Power-cycle the node to re-enable it.\n",
+            latchReasonText(_latchReason));
+        _initialized = true; // healthy: update() keeps publishing the latch in CAN health
+        return true;
+    }
 
-        // Start the extended diagnostic session. G2.3: this is not assumed to succeed --
-        // update() retries it until a positive 0x50 response confirms it.
-        sendRequest(kSessionRequest, sizeof(kSessionRequest));
-        _lastSessionAttemptMs = millis();
-        delay(50);
+    if (_bus.beginListenOnly()) {
+        // Nothing is sent yet: the window starts at the first update() (listenStep()).
+        _listening = true;
+        Serial.printf("[CAN SUCCESS] CAN Bus Active (500 kbps), listen-only for %lu ms before the first request (bus-off events so far: %lu)...\n",
+            kListenOnlyWindowMs, (unsigned long)_busOffEventCount);
         _initialized = true;
         return true;
     }
+    _bus.stop();
     Serial.println("[CAN ERROR] Failed to initialize CAN bus driver! Check TX/RX pins.");
     _initialized = false;
     return false;
@@ -130,8 +175,11 @@ void HondaCANModule::update(SystemState& state) {
 void HondaCANModule::publishHealth(SystemState& state) {
     CanHealth& h = state.can;
     h.flags = CAN_HEALTH_FLAG_POLLER_ENABLED;
-    if (_latchedOff) {
-        h.flags |= _foreignTesterDetected ? CAN_HEALTH_FLAG_LATCHED_FOREIGN_TESTER : CAN_HEALTH_FLAG_LATCHED_BUS_OFF;
+    if (_latchReason == TesterLatchReason::FOREIGN_TESTER || _latchReason == TesterLatchReason::UNKNOWN) {
+        h.flags |= CAN_HEALTH_FLAG_LATCHED_FOREIGN_TESTER;
+    }
+    if (_latchReason == TesterLatchReason::BUS_OFF || _latchReason == TesterLatchReason::UNKNOWN) {
+        h.flags |= CAN_HEALTH_FLAG_LATCHED_BUS_OFF; // both bits = latched, cause unknown
     }
     h.busOffCount = _busOffEventCount;
     h.unansweredDidCount = _unansweredDidCount;
@@ -159,9 +207,41 @@ void HondaCANModule::poll(SystemState& state) {
     unsigned long now = millis();
 
     // Latched off (foreign tester seen or too many bus-offs): transmit nothing ever
-    // again until reboot, and stop feeding SystemState so consumers show "stale".
+    // again until power-on, and stop feeding SystemState so consumers show "stale".
     if (_latchedOff) {
         state.engine.ecuPresent = false;
+        return;
+    }
+
+    if (_listening) {
+        listenStep(state, now);
+        return;
+    }
+
+    // Q-018: drain RX first -- before anything below transmits (a foreign tester in the
+    // queue latches us off first) and before the response-timeout check (a response that
+    // is already queued resolves its request instead of counting as a timeout).
+    DrainResult rx = drainRx(state, now);
+    if (rx == DrainResult::LATCHED) {
+        return;
+    }
+    if (rx == DrainResult::BACKLOG) {
+        // More queued than one pass handles: a foreign request may still be in there, so
+        // transmit nothing this pass (and count no timeout).
+        return;
+    }
+
+    if (_sessionStartPending) {
+        // First pass in normal mode, after its drain: start the extended diagnostic
+        // session. G2.3: not assumed to succeed -- retried below until 0x50 confirms it.
+        _sessionStartPending = false;
+        Serial.println("[CAN] Starting the diagnostic session.");
+        sendRequest(kSessionRequest, sizeof(kSessionRequest));
+        _lastSessionAttemptMs = now;
+        _lastKeepAlive = now;
+        for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+            _dids[i].lastRequestMs = now; // the DID schedule starts together with the session
+        }
         return;
     }
 
@@ -173,10 +253,12 @@ void HondaCANModule::poll(SystemState& state) {
             _busOff = true;
             _busOffEventCount++;
             if (_busOffEventCount >= kMaxBusOffEvents) {
-                latchOff("too many bus-off events");
+                latchOff(TesterLatchReason::BUS_OFF, "too many bus-off events");
                 state.engine.ecuPresent = false;
                 return;
             }
+            // Q-018: the budget counts from power-on, not from the last reset.
+            _latchStore.save(TesterLatchReason::NONE, _busOffEventCount);
             _recoveryBackoffMs = kBackoffMinMs;
             _lastRecoveryAttempt = 0;
             uint16_t txErr = 0, rxErr = 0;
@@ -277,19 +359,84 @@ void HondaCANModule::poll(SystemState& state) {
         _udsState = UdsRequestState::IDLE;
     }
 
-    // 4. Read incoming CAN frames from the ECU
+    if (_udsState == UdsRequestState::COMPLETE) {
+        _dids[_pendingDidIndex].consecutiveTimeouts = 0;
+        _udsState = UdsRequestState::IDLE;
+    }
+}
+
+void HondaCANModule::listenStep(SystemState& state, unsigned long now) {
+    state.engine.ecuPresent = false;
+    if (!_listenStarted) {
+        // The window starts here, not in begin(): setup() still runs the other modules'
+        // begin() in between, and the queue may overflow meanwhile (caught below).
+        _listenStarted = true;
+        _listenStartMs = now;
+    }
+    DrainResult rx = drainRx(state, now);
+    if (rx == DrainResult::LATCHED) {
+        return; // latched off before this node ever transmitted
+    }
+    uint32_t lost = _bus.rxLostCount();
+    if (rx == DrainResult::BACKLOG || lost != _rxLostBaseline) {
+        // Frames went unseen (queue full) or are still queued: this window proves nothing.
+        _rxLostBaseline = lost;
+        _listenStartMs = now;
+        if (_listenRestarts++ == 0) {
+            Serial.println("[CAN] Listen-only window restarted: frames were lost or still queued.");
+        }
+        return;
+    }
+    if (now - _listenStartMs < kListenOnlyWindowMs) {
+        return;
+    }
+    _listening = false;
+    if (!_bus.enterNormalMode()) {
+        Serial.println("[CAN ERROR] Could not switch the CAN driver to normal mode -- poller disabled.");
+        _bus.stop();
+        _initialized = false;
+        return;
+    }
+    Serial.printf("[CAN] No other tester seen for %lu ms (window restarts: %lu). Normal mode.\n",
+        kListenOnlyWindowMs, (unsigned long)_listenRestarts);
+    // The session request goes out on the next pass, after its RX drain, so frames that
+    // arrived while the driver was reinstalled are checked first.
+    _sessionStartPending = true;
+}
+
+bool HondaCANModule::isForeignTesterFrame(const CanFrame& f) {
+    // Our ECU's physical request ID from any source address (29-bit normal fixed
+    // addressing 0x18DA<TA><SA>), or exactly the ID when it is an 11-bit one.
+    const bool primaryExtended = uds::isExtendedId(VEHICLE_CL250_REQUEST_ID);
+    const uint32_t primaryMask = primaryExtended ? ~uds::kNormalFixedSourceAddressMask : 0xFFFFFFFFu;
+    if (f.extended == primaryExtended && (f.id & primaryMask) == (VEHICLE_CL250_REQUEST_ID & primaryMask)) {
+        return true;
+    }
+    if (f.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_REQUEST_ID) && f.id == VEHICLE_CL250_FALLBACK_REQUEST_ID) {
+        return true;
+    }
+    // ISO 15765-4 functional (broadcast) requests from a generic OBD tester.
+    if (!f.extended && f.id == uds::kFunctionalRequestId11) {
+        return true;
+    }
+    return f.extended && (f.id & ~uds::kNormalFixedSourceAddressMask) == uds::kFunctionalRequestId29Prefix;
+}
+
+// Reads incoming CAN frames. Bounded: at most kMaxRxFramesPerPass per call.
+HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned long now) {
+    uint8_t logBudget = kMaxRxLogLinesPerPass;
     CanFrame rxMsg;
-    while (_bus.receive(rxMsg)) {
-        // TWAI does not receive its own frames, so a frame on the ECU's REQUEST IDs means
-        // another tester is on the bus (e.g. rt-core already polls). Two testers are never
-        // allowed (D-021): latch this poller off until reboot.
-        if ((rxMsg.id == VEHICLE_CL250_REQUEST_ID && rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_REQUEST_ID)) ||
-            (rxMsg.id == VEHICLE_CL250_FALLBACK_REQUEST_ID &&
-             rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_REQUEST_ID))) {
-            _foreignTesterDetected = true;
-            latchOff("another tester is on the vehicle bus (D-021)");
+    for (uint8_t n = 0; n < kMaxRxFramesPerPass; n++) {
+        if (!_bus.receive(rxMsg)) {
+            return DrainResult::DRAINED;
+        }
+        // TWAI does not receive its own frames, so a diagnostic request on the bus is
+        // another tester (e.g. rt-core already polls). Two testers are never allowed
+        // (D-021): latch this poller off, across resets until power-on (Q-018).
+        if (isForeignTesterFrame(rxMsg)) {
+            latchOff(TesterLatchReason::FOREIGN_TESTER, "another tester is on the vehicle bus (D-021)");
             state.engine.ecuPresent = false;
-            return;
+            return DrainResult::LATCHED;
         }
         bool isUDSResponse =
             (rxMsg.id == VEHICLE_CL250_RESPONSE_ID && rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) ||
@@ -297,6 +444,16 @@ void HondaCANModule::poll(SystemState& state) {
              rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_RESPONSE_ID));
         if (!isUDSResponse || rxMsg.dlc < 2) {
             continue;
+        }
+        if (_listening) {
+            // Nothing has been sent yet, so an ECU answer means someone else asked (their
+            // request may have been lost or sent before the window began). Known false
+            // positive, on the safe side: after a non-power-on reset the ECU may still
+            // answer (or 0x78) a request this node sent before the reset; a power cycle
+            // clears that latch.
+            latchOff(TesterLatchReason::FOREIGN_TESTER, "the ECU answered a request this node did not send (D-021)");
+            state.engine.ecuPresent = false;
+            return DrainResult::LATCHED;
         }
 
         // G2.4 -- ISO-TP (ISO 15765-2) PCI byte check. data[0] high nibble is the frame
@@ -307,8 +464,10 @@ void HondaCANModule::poll(SystemState& state) {
         // it, D-023); every DID used today fits in a Single Frame.
         uint8_t isoTpFrameType = (rxMsg.data[0] >> 4) & 0x0F;
         if (isoTpFrameType != 0x0) {
-            Serial.printf("[UDS WARNING] Unsupported ISO-TP frame type 0x%X (PCI=0x%02X) -- multi-frame responses are not handled, dropping frame.\n",
-                isoTpFrameType, rxMsg.data[0]);
+            if (takeLogSlot(logBudget)) {
+                Serial.printf("[UDS WARNING] Unsupported ISO-TP frame type 0x%X (PCI=0x%02X) -- multi-frame responses are not handled, dropping frame.\n",
+                    isoTpFrameType, rxMsg.data[0]);
+            }
             continue;
         }
         // A ReadDataByIdentifier answer: the generated parser checks the Single Frame
@@ -355,11 +514,15 @@ void HondaCANModule::poll(SystemState& state) {
                     _requestSentMs = now;
                     _responseTimeoutMs = min(doubled, left);
                 }
-                Serial.printf("[UDS] NRC 0x78 responsePending for SID 0x%02X -- extending wait to %lu ms.\n",
-                    echoedSid, _responseTimeoutMs);
+                if (takeLogSlot(logBudget)) {
+                    Serial.printf("[UDS] NRC 0x78 responsePending for SID 0x%02X -- extending wait to %lu ms.\n",
+                        echoedSid, _responseTimeoutMs);
+                }
             } else {
-                Serial.printf("[UDS WARNING] Negative response: SID=0x%02X NRC=0x%02X (%s) [total NRCs=%lu]\n",
-                    echoedSid, nrc, uds::nrcName(nrc), (unsigned long)_nrcCount);
+                if (takeLogSlot(logBudget)) {
+                    Serial.printf("[UDS WARNING] Negative response: SID=0x%02X NRC=0x%02X (%s) [total NRCs=%lu]\n",
+                        echoedSid, nrc, uds::nrcName(nrc), (unsigned long)_nrcCount);
+                }
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
                 if (forPendingRead) {
@@ -368,18 +531,16 @@ void HondaCANModule::poll(SystemState& state) {
             }
         }
     }
-
-    if (_udsState == UdsRequestState::COMPLETE) {
-        _dids[_pendingDidIndex].consecutiveTimeouts = 0;
-        _udsState = UdsRequestState::IDLE;
-    }
+    return DrainResult::BACKLOG;
 }
 
-void HondaCANModule::latchOff(const char* reason) {
+void HondaCANModule::latchOff(TesterLatchReason reason, const char* why) {
     if (_latchedOff) {
         return;
     }
     _latchedOff = true;
+    _latchReason = reason;
+    _latchStore.save(reason, _busOffEventCount); // Q-018: first, so it holds even if a reset follows
     _bus.stop(); // no more transmission, no ACKs, no error frames from this node
-    Serial.printf("[UDS STOP] Vehicle-bus poller latched off until reboot: %s.\n", reason);
+    Serial.printf("[UDS STOP] Vehicle-bus poller latched off until power-on: %s.\n", why);
 }
