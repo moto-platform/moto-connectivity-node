@@ -55,11 +55,52 @@ struct TelematicsData {
     bool phoneConnected = false;
 };
 
+// Vehicle-bus CAN/tester health, written by the CAN producer (HondaCANModule) and sent
+// in BLE telemetry v3 (docs/ble_telemetry_packet_schema.json `canHealth`). The numeric
+// values of CanHealthState and the CAN_HEALTH_FLAG_* bits are part of that schema.
+enum class CanHealthState : uint8_t {
+    NOT_INSTALLED = 0, // no TWAI driver (poller-off build) or synthetic data (mock build)
+    RUNNING = 1,
+    ERROR_WARNING = 2, // TEC or REC at or above CAN_ERROR_WARNING_LIMIT
+    BUS_OFF = 3,
+    STOPPED = 4,       // recovering from bus-off, or latched off (see flags)
+};
+
+// ISO 11898-1 error-warning limit for TEC/REC.
+constexpr uint16_t CAN_ERROR_WARNING_LIMIT = 96;
+
+constexpr uint8_t CAN_HEALTH_FLAG_POLLER_ENABLED          = 1u << 0;
+constexpr uint8_t CAN_HEALTH_FLAG_LATCHED_FOREIGN_TESTER  = 1u << 1;
+constexpr uint8_t CAN_HEALTH_FLAG_LATCHED_BUS_OFF         = 1u << 2;
+constexpr uint8_t CAN_HEALTH_FLAG_SYNTHETIC_DATA          = 1u << 3;
+
+struct CanHealth {
+    CanHealthState busState = CanHealthState::NOT_INSTALLED;
+    uint16_t txErrorCount = 0;
+    uint16_t rxErrorCount = 0;
+    uint32_t busOffCount = 0;
+    uint32_t unansweredDidCount = 0; // DID requests that timed out with no response at all
+    uint8_t flags = 0;               // CAN_HEALTH_FLAG_* bits
+};
+
+/**
+ * @brief State of the on-board IMU sampler (ImuModule), mirrored here by its update()
+ * so consumers can see it without touching the sampler task's data.
+ */
+struct ImuStatus {
+    bool active = false;         // sampler running and its last read succeeded
+    uint32_t samplesTaken = 0;
+    uint32_t samplesDropped = 0; // ring buffer full, sample discarded
+    uint32_t readErrors = 0;
+};
+
 /**
  * @brief Global System State container shared across all modules.
  */
 struct SystemState {
     EngineData engine;
+    CanHealth can;
+    ImuStatus imu;
     // No lean angle here: the legacy complementary filter was dropped (D-023). Lean comes
     // from the rt-core EKF (platform.dbc LeanEstimate) once this node reads the platform bus.
     TelematicsData telematics;

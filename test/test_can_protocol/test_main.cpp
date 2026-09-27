@@ -543,6 +543,112 @@ void test_session_confirm_requires_extended_subfunction(void) {
     TEST_ASSERT_TRUE(retried); // still unconfirmed -> session request repeated
 }
 
+// ---------------------------------------------------------------------------
+// D-032: CAN/tester health for BLE telemetry v3 (read-only, never transmits)
+// ---------------------------------------------------------------------------
+
+void test_health_reports_bus_state_and_error_counters(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    bus.setErrorCounters(12, 3);
+    test_setMillis(10);
+    module.update(state);
+    TEST_ASSERT_EQUAL((int)CanHealthState::RUNNING, (int)state.can.busState);
+    TEST_ASSERT_EQUAL_UINT16(12, state.can.txErrorCount);
+    TEST_ASSERT_EQUAL_UINT16(3, state.can.rxErrorCount);
+    TEST_ASSERT_EQUAL_HEX8(CAN_HEALTH_FLAG_POLLER_ENABLED, state.can.flags);
+
+    bus.setErrorCounters(CAN_ERROR_WARNING_LIMIT, 0); // running, but at the warning limit
+    test_setMillis(20);
+    module.update(state);
+    TEST_ASSERT_EQUAL((int)CanHealthState::ERROR_WARNING, (int)state.can.busState);
+
+    bus.setState(CanBusState::BUS_OFF);
+    bus.setErrorCounters(256, 0);
+    test_setMillis(30);
+    module.update(state);
+    TEST_ASSERT_EQUAL((int)CanHealthState::BUS_OFF, (int)state.can.busState);
+    TEST_ASSERT_EQUAL_UINT32(1, state.can.busOffCount);
+    TEST_ASSERT_EQUAL_UINT16(256, state.can.txErrorCount);
+}
+
+void test_health_counts_unanswered_did_requests(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    unsigned long t = 50;
+    for (int cycle = 0; cycle < 3; cycle++) {
+        test_setMillis(t);
+        module.update(state); // send
+        t += 151;
+        test_setMillis(t);
+        module.update(state); // timeout
+        t += 1;
+    }
+    TEST_ASSERT_EQUAL_UINT32(3, module.unansweredDidCount());
+    TEST_ASSERT_EQUAL_UINT32(3, state.can.unansweredDidCount);
+
+    // An answered request does not count.
+    test_setMillis(t);
+    module.update(state);
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x1F, 0x40));
+    test_setMillis(t + 5);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(3, state.can.unansweredDidCount);
+}
+
+void test_health_marks_foreign_tester_latch_and_freezes(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    CanFrame foreign;
+    foreign.id = VEHICLE_CL250_REQUEST_ID;
+    foreign.extended = true;
+    foreign.dlc = 8;
+    const uint8_t d[8] = {0x03, uds::kSidReadDataByIdentifier, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
+    for (int i = 0; i < 8; i++) foreign.data[i] = d[i];
+    bus.injectRxFrame(foreign);
+    test_setMillis(10);
+    module.update(state);
+    TEST_ASSERT_TRUE(module.latchedOff());
+    TEST_ASSERT_EQUAL((int)CanHealthState::STOPPED, (int)state.can.busState);
+    TEST_ASSERT_EQUAL_HEX8(CAN_HEALTH_FLAG_POLLER_ENABLED | CAN_HEALTH_FLAG_LATCHED_FOREIGN_TESTER, state.can.flags);
+    size_t sent = bus.txLog.size();
+    bus.setErrorCounters(99, 99); // driver gone: counters are no longer read
+    test_setMillis(500);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(0, state.can.txErrorCount);
+    TEST_ASSERT_EQUAL_UINT32(sent, bus.txLog.size());
+}
+
+void test_health_marks_bus_off_latch(void) {
+    MockCanBus bus;
+    HondaCANModule module(bus);
+    SystemState state;
+    test_setMillis(0);
+    module.begin();
+    unsigned long t = 10;
+    for (int event = 0; event < 6 && !module.latchedOff(); event++) {
+        bus.setState(CanBusState::BUS_OFF);
+        test_setMillis(t += 10);
+        module.update(state);
+        bus.setState(CanBusState::RUNNING);
+        test_setMillis(t += 10);
+        module.update(state);
+    }
+    TEST_ASSERT_TRUE(module.latchedOff());
+    TEST_ASSERT_EQUAL((int)CanHealthState::STOPPED, (int)state.can.busState);
+    TEST_ASSERT_EQUAL_HEX8(CAN_HEALTH_FLAG_POLLER_ENABLED | CAN_HEALTH_FLAG_LATCHED_BUS_OFF, state.can.flags);
+    TEST_ASSERT_EQUAL_UINT32(kMaxBusOffEvents, state.can.busOffCount); // D-030 latch threshold
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -565,5 +671,9 @@ int main(int, char**) {
     RUN_TEST(test_foreign_tester_latches_poller_off);
     RUN_TEST(test_repeated_bus_off_latches_off);
     RUN_TEST(test_session_confirm_requires_extended_subfunction);
+    RUN_TEST(test_health_reports_bus_state_and_error_counters);
+    RUN_TEST(test_health_counts_unanswered_did_requests);
+    RUN_TEST(test_health_marks_foreign_tester_latch_and_freezes);
+    RUN_TEST(test_health_marks_bus_off_latch);
     return UNITY_END();
 }

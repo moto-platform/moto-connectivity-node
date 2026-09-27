@@ -1,51 +1,200 @@
 {
-  "$schemaDescription": "Single source of truth for the BLE telemetry notification packet sent by moto-connectivity-node to moto-mobile. Implementations: src/BLETelemetryPacket.h (firmware) and moto-mobile lib/models/telemetry_data.dart (decoder, with a copy of this file under test/fixtures/ checked by a test). Ported from HondaCl250_Telemetry@legacy-final (version 1) per D-023.",
+  "$schemaDescription": "Single source of truth for the BLE notifications sent by moto-connectivity-node to moto-mobile: the telemetry packet (current version 3, top level), its low-MTU fallback (the version 2 layout) and the IMU sample block. Implementations: src/BLETelemetryPacket.h and src/ImuBlockPacket.h (firmware), moto-mobile lib/models/telemetry_data.dart and lib/models/imu_block.dart (decoders, with a copy of this file under test/fixtures/ checked by a test), and moto-server (decodes raw_hex/imu raw bytes driven by this file). Ported from HondaCl250_Telemetry@legacy-final (version 1) per D-023; version 3 and the IMU block per D-032.",
+  "gatt": {
+    "serviceUuid": "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+    "characteristics": {
+      "telemetry": { "uuid": "beb5483e-36e1-4688-b7f5-ea07361b26a8", "properties": ["notify"], "carries": "BLETelemetryPacket (version 3, or version 2 at low MTU)" },
+      "imu": { "uuid": "f62bc083-e25d-46b3-aa0b-2e9e6bc8f1e5", "properties": ["notify"], "carries": "ImuBlock" },
+      "telematicsRx": { "uuid": "828919fe-e41c-40ee-b4c6-2c974c2d3345", "properties": ["write", "writeWithoutResponse"], "carries": "Phone telematics text (not part of this schema)" }
+    },
+    "mtu": {
+      "requested": 185,
+      "rule": "The central requests an ATT MTU of at least `requested` right after connecting (Android: requestMtu; iOS negotiates on its own). The firmware reads the negotiated MTU and never sends a notification larger than MTU - 3 bytes: it falls back to the version 2 telemetry layout (`lowMtuFallback`) and shrinks or suspends IMU blocks (`imuBlock.mtuRule`). It never truncates a packet."
+    }
+  },
   "packetName": "BLETelemetryPacket",
-  "version": 2,
+  "version": 3,
   "endianness": "little",
   "packed": true,
-  "totalBytes": 16,
+  "totalBytes": 37,
+  "notifyPeriodMs": 100,
+  "signalMapping": "A field with `defsSignal` carries that moto-vehicle-defs signal (gen/python vehicle_cl250.DIDS key); physical value in the defs unit = raw * `scale`. A field with `ageOf` is the age of that signal.",
   "versioning": {
-    "rule": "Receivers MUST read `version` first and drop the packet if it does not match the version they were built against. Any change to field order, size or meaning requires incrementing `version` here and in both implementations together.",
-    "currentVersion": 2,
+    "rule": "Receivers MUST read `version` first and decode with the matching layout: version 3 (`fields`) or version 2 (`lowMtuFallback.fields`). Any other version is dropped. Any change to field order, size or meaning requires incrementing `version` here and in every implementation together.",
+    "currentVersion": 3,
+    "acceptedVersions": [2, 3],
     "history": {
       "1": "Legacy layout (15 bytes). Lean fields came from the dropped complementary filter.",
-      "2": "Lean fields keep their offsets but carry `notAvailable` until the rt-core EKF lean estimate reaches this node (D-023); byte 15 `flags` added so receivers can show stale values as unavailable."
+      "2": "Lean fields keep their offsets but carry `notAvailable` until the rt-core EKF lean estimate reaches this node (D-023); byte 15 `flags` added so receivers can show stale values as unavailable.",
+      "3": "D-032: adds `deviceTimeMs` (node clock shared with the IMU block), per-signal ages and CAN/tester health; flags bit 7 = imuActive; lean fields deprecated. Version 2 remains the low-MTU fallback."
     }
   },
   "sequenceNumber": {
     "field": "seq",
-    "rule": "Rolls over 0-255. Receivers track the last seen seq and compute (currentSeq - lastSeq - 1) mod 256 as the number of packets lost since the previous one."
+    "rule": "Rolls over 0-255 and is shared by version 2 and version 3 packets. Receivers track the last seen seq and compute (currentSeq - lastSeq - 1) mod 256 as the number of packets lost since the previous one."
+  },
+  "deviceTime": {
+    "field": "deviceTimeMs",
+    "unit": "ms",
+    "rule": "The node's millis() clock when the packet was built (uint32, wraps after about 49.7 days). The IMU block uses the same clock, so telemetry and IMU samples can be aligned without the phone's receive time."
   },
   "notAvailable": {
     "int16": -32768,
     "rule": "A lean field equal to -32768 (0x8000) means no value is available; receivers must not display it as a number."
   },
+  "age": {
+    "unit": "ms",
+    "field": "ageOf",
+    "neverReceived": 65535,
+    "max": 65534,
+    "rule": "Milliseconds since the signal was last written, at the time the packet was built, saturating at `max`; `neverReceived` = no value since boot. The matching valid bit is set only while the age is within the signal's generated stale_after_ms (moto-vehicle-defs, D-029)."
+  },
   "flags": {
     "field": "flags",
-    "rule": "A value whose bit is 0 is stale or was never received; receivers show it as unavailable instead of the number.",
+    "rule": "A value whose valid bit is 0 is stale or was never received; receivers show it as unavailable instead of the number.",
     "bits": [
       { "bit": 0, "name": "rpmValid" },
       { "bit": 1, "name": "speedValid" },
       { "bit": 2, "name": "coolantTempValid" },
       { "bit": 3, "name": "throttlePosValid" },
       { "bit": 4, "name": "batteryVoltValid" },
-      { "bit": 5, "name": "leanValid" },
+      { "bit": 5, "name": "leanValid", "description": "Always 0 (deprecated lean fields)." },
       { "bit": 6, "name": "ecuPresent" },
-      { "bit": 7, "name": "reserved", "description": "Always 0." }
+      { "bit": 7, "name": "imuActive", "description": "The IMU sampler is running and its last read succeeded. Version 2 packets always send 0 here." }
     ]
   },
+  "canHealth": {
+    "busState": {
+      "field": "canBusState",
+      "values": [
+        { "value": 0, "name": "notInstalled", "description": "No TWAI driver in this build (poller off, D-021) or synthetic data (mock build)." },
+        { "value": 1, "name": "running" },
+        { "value": 2, "name": "errorWarning", "description": "TEC or REC at or above the error-warning limit (96)." },
+        { "value": 3, "name": "busOff" },
+        { "value": 4, "name": "stopped", "description": "Driver stopped: recovering from bus-off, or latched off (see canFlags)." }
+      ]
+    },
+    "canFlags": {
+      "field": "canFlags",
+      "bits": [
+        { "bit": 0, "name": "pollerEnabled", "description": "This build is the vehicle-bus tester (CONN_VEHICLE_TESTER=1, D-023)." },
+        { "bit": 1, "name": "latchedForeignTester", "description": "Poller stopped until reboot: another tester was seen (D-021, D-030)." },
+        { "bit": 2, "name": "latchedBusOff", "description": "Poller stopped until reboot: repeated bus-off (D-030)." },
+        { "bit": 3, "name": "syntheticData", "description": "Mock build: engine values are simulated, not from the ECU." },
+        { "bit": 4, "name": "reserved" },
+        { "bit": 5, "name": "reserved" },
+        { "bit": 6, "name": "reserved" },
+        { "bit": 7, "name": "reserved" }
+      ]
+    },
+    "counterRule": "Error counters saturate at 255, busOffCount at 255 and unansweredDidCount at 65535. Counters are cumulative since boot and freeze when the poller latches off."
+  },
+  "deprecated": {
+    "fields": ["leanAngle", "maxLeanRight", "maxLeanLeft"],
+    "rule": "Deprecated -- do not use for analysis (D-023). Always `notAvailable`; kept only so the layout stays close to version 2. Lean comes from the rt-core EKF later."
+  },
   "fields": [
-    { "name": "version",      "offset": 0,  "size": 1, "type": "uint8",  "description": "Packet format version, must equal `version` above." },
-    { "name": "seq",          "offset": 1,  "size": 1, "type": "uint8",  "description": "Rolling 0-255 counter incremented once per packet sent." },
-    { "name": "rpm",          "offset": 2,  "size": 2, "type": "uint16", "description": "Engine speed in rpm (integer part), range 0-16383." },
-    { "name": "speed",        "offset": 4,  "size": 1, "type": "uint8",  "description": "Vehicle speed in km/h, range 0-255." },
-    { "name": "coolantTemp",  "offset": 5,  "size": 1, "type": "int8",   "description": "Coolant temperature in degrees Celsius, range -40 to 127 (higher values are clamped to 127)." },
-    { "name": "throttlePos",  "offset": 6,  "size": 1, "type": "uint8",  "description": "Throttle position in percent, range 0-100." },
-    { "name": "batteryVolt",  "offset": 7,  "size": 2, "type": "uint16", "description": "Battery voltage in millivolts, e.g. 12400 = 12.4 V." },
-    { "name": "leanAngle",    "offset": 9,  "size": 2, "type": "int16",  "description": "Lean (roll) angle in tenths of a degree, positive = right side down; -32768 = not available." },
-    { "name": "maxLeanRight", "offset": 11, "size": 2, "type": "int16",  "description": "Peak right lean angle in tenths of a degree; -32768 = not available." },
-    { "name": "maxLeanLeft",  "offset": 13, "size": 2, "type": "int16",  "description": "Peak left lean angle in tenths of a degree; -32768 = not available." },
-    { "name": "flags",        "offset": 15, "size": 1, "type": "uint8",  "description": "Validity bits, see `flags`." }
-  ]
+    { "name": "version",            "offset": 0,  "size": 1, "type": "uint8",  "description": "Packet format version, 3." },
+    { "name": "seq",                "offset": 1,  "size": 1, "type": "uint8",  "description": "Rolling 0-255 counter incremented once per telemetry packet sent (any version)." },
+    { "name": "deviceTimeMs",       "offset": 2,  "size": 4, "type": "uint32", "description": "Node clock in ms when the packet was built, see `deviceTime`." },
+    { "name": "rpm",                "offset": 6,  "size": 2, "type": "uint16", "defsSignal": "ENGINE_SPEED", "scale": 1, "description": "Engine speed in rpm (integer part), range 0-16383." },
+    { "name": "speed",              "offset": 8,  "size": 1, "type": "uint8", "defsSignal": "VEHICLE_SPEED", "scale": 1,  "description": "Vehicle speed in km/h, range 0-255." },
+    { "name": "coolantTemp",        "offset": 9,  "size": 1, "type": "int8", "defsSignal": "COOLANT_TEMP", "scale": 1,   "description": "Coolant temperature in degrees Celsius, range -40 to 127 (higher values are clamped to 127)." },
+    { "name": "throttlePos",        "offset": 10, "size": 1, "type": "uint8", "defsSignal": "THROTTLE_POS", "scale": 1,  "description": "Throttle position in percent, range 0-100." },
+    { "name": "batteryVolt",        "offset": 11, "size": 2, "type": "uint16", "defsSignal": "BATTERY_VOLTAGE", "scale": 0.001, "description": "Battery voltage in millivolts, e.g. 12400 = 12.4 V." },
+    { "name": "leanAngle",          "offset": 13, "size": 2, "type": "int16",  "deprecated": true, "description": "DEPRECATED, do not use for analysis (D-023). Always -32768." },
+    { "name": "maxLeanRight",       "offset": 15, "size": 2, "type": "int16",  "deprecated": true, "description": "DEPRECATED, do not use for analysis (D-023). Always -32768." },
+    { "name": "maxLeanLeft",        "offset": 17, "size": 2, "type": "int16",  "deprecated": true, "description": "DEPRECATED, do not use for analysis (D-023). Always -32768." },
+    { "name": "flags",              "offset": 19, "size": 1, "type": "uint8",  "description": "Validity bits, see `flags`." },
+    { "name": "rpmAgeMs",           "offset": 20, "size": 2, "type": "uint16", "ageOf": "ENGINE_SPEED", "description": "Age of rpm, see `age`." },
+    { "name": "speedAgeMs",         "offset": 22, "size": 2, "type": "uint16", "ageOf": "VEHICLE_SPEED", "description": "Age of speed, see `age`." },
+    { "name": "coolantTempAgeMs",   "offset": 24, "size": 2, "type": "uint16", "ageOf": "COOLANT_TEMP", "description": "Age of coolantTemp, see `age`." },
+    { "name": "throttlePosAgeMs",   "offset": 26, "size": 2, "type": "uint16", "ageOf": "THROTTLE_POS", "description": "Age of throttlePos, see `age`." },
+    { "name": "batteryVoltAgeMs",   "offset": 28, "size": 2, "type": "uint16", "ageOf": "BATTERY_VOLTAGE", "description": "Age of batteryVolt, see `age`." },
+    { "name": "canBusState",        "offset": 30, "size": 1, "type": "uint8",  "description": "Vehicle-bus TWAI state, see `canHealth.busState`." },
+    { "name": "canTxErrorCount",    "offset": 31, "size": 1, "type": "uint8",  "description": "TWAI transmit error counter (TEC), saturating at 255." },
+    { "name": "canRxErrorCount",    "offset": 32, "size": 1, "type": "uint8",  "description": "TWAI receive error counter (REC), saturating at 255." },
+    { "name": "canBusOffCount",     "offset": 33, "size": 1, "type": "uint8",  "description": "Bus-off events since boot, saturating at 255." },
+    { "name": "unansweredDidCount", "offset": 34, "size": 2, "type": "uint16", "description": "UDS DID requests that timed out without any response since boot, saturating at 65535." },
+    { "name": "canFlags",           "offset": 36, "size": 1, "type": "uint8",  "description": "Tester/poller status bits, see `canHealth.canFlags`." }
+  ],
+  "lowMtuFallback": {
+    "rule": "When the negotiated MTU - 3 is smaller than `totalBytes` (37), the firmware sends this version 2 layout instead (16 bytes, fits the default MTU of 23). Receivers that see version 2 from a version 3 firmware should request a larger MTU; receivers that only ever see version 2 are talking to old firmware and should recommend a firmware update.",
+    "version": 2,
+    "totalBytes": 16,
+    "flagsRule": "Same bits as `flags`, except bit 7 is always 0.",
+    "fields": [
+      { "name": "version",      "offset": 0,  "size": 1, "type": "uint8",  "description": "Packet format version, 2." },
+      { "name": "seq",          "offset": 1,  "size": 1, "type": "uint8",  "description": "Same counter as version 3 `seq`." },
+      { "name": "rpm",          "offset": 2,  "size": 2, "type": "uint16", "defsSignal": "ENGINE_SPEED", "scale": 1, "description": "Engine speed in rpm (integer part), range 0-16383." },
+      { "name": "speed",        "offset": 4,  "size": 1, "type": "uint8", "defsSignal": "VEHICLE_SPEED", "scale": 1,  "description": "Vehicle speed in km/h, range 0-255." },
+      { "name": "coolantTemp",  "offset": 5,  "size": 1, "type": "int8", "defsSignal": "COOLANT_TEMP", "scale": 1,   "description": "Coolant temperature in degrees Celsius, range -40 to 127." },
+      { "name": "throttlePos",  "offset": 6,  "size": 1, "type": "uint8", "defsSignal": "THROTTLE_POS", "scale": 1,  "description": "Throttle position in percent, range 0-100." },
+      { "name": "batteryVolt",  "offset": 7,  "size": 2, "type": "uint16", "defsSignal": "BATTERY_VOLTAGE", "scale": 0.001, "description": "Battery voltage in millivolts." },
+      { "name": "leanAngle",    "offset": 9,  "size": 2, "type": "int16",  "deprecated": true, "description": "DEPRECATED, do not use for analysis (D-023). -32768 = not available." },
+      { "name": "maxLeanRight", "offset": 11, "size": 2, "type": "int16",  "deprecated": true, "description": "DEPRECATED, do not use for analysis (D-023). -32768 = not available." },
+      { "name": "maxLeanLeft",  "offset": 13, "size": 2, "type": "int16",  "deprecated": true, "description": "DEPRECATED, do not use for analysis (D-023). -32768 = not available." },
+      { "name": "flags",        "offset": 15, "size": 1, "type": "uint8",  "description": "Validity bits, see `flags`." }
+    ]
+  },
+  "imuBlock": {
+    "packetName": "ImuBlock",
+    "characteristic": "imu",
+    "version": 1,
+    "endianness": "little",
+    "packed": true,
+    "headerBytes": 12,
+    "sampleBytes": 12,
+    "maxSamples": 10,
+    "samplePeriodMs": 10,
+    "notifyPeriodMs": 100,
+    "totalBytesMax": 132,
+    "sensor": {
+      "part": "MPU-6050 register-compatible 6-axis IMU (D-032, provisional)",
+      "bus": "I2C 400 kHz, address 0x68",
+      "sampling": "100 Hz, driven by a hardware timer on the node; sample n is taken at the n-th timer tick. The node verifies the sensor configuration once per second and configures it again when it was lost (flag sensorReconfigured).",
+      "axes": "Sensor package frame (x, y, z as printed on the part). The mapping to the vehicle frame depends on the mount and must be recorded in the session note until the mount is fixed."
+    },
+    "scale": {
+      "accel": { "lsbPerUnit": 4096, "unit": "g", "fullScale": 8, "rule": "accel_g = raw / 4096" },
+      "gyro":  { "lsbPerUnit": 65.5, "unit": "deg/s", "fullScale": 500, "rule": "gyro_dps = raw / 65.5" }
+    },
+    "sampleIndex": {
+      "field": "firstSampleIndex",
+      "rule": "Running 100 Hz tick counter (uint16, wraps). Samples inside one block are always consecutive ticks. Receivers compute missingSamples = (firstSampleIndex - (prev.firstSampleIndex + prev.sampleCount)) mod 65536 for every block after the first; this counts samples lost on the node (buffer overflow, read error, missed tick) and in BLE together."
+    },
+    "timeRule": "Sample i of a block (0-based) was taken at deviceTimeMs + i * samplePeriodMs on the same clock as the telemetry `deviceTimeMs`.",
+    "mtuRule": "samplesPerBlock = min(maxSamples, floor((MTU - 3 - headerBytes) / sampleBytes)). If that is 0 (e.g. the default MTU of 23), IMU notifications are suspended and the lost samples show up as a firstSampleIndex gap later. At most 3 blocks are sent per notify period, so a small MTU lowers the delivered rate instead of delaying the node.",
+    "flags": {
+      "field": "flags",
+      "bits": [
+        { "bit": 0, "name": "deviceOverflow", "description": "The node's sample ring buffer was full at least once since the previous block; the oldest unsent samples were kept and new ones dropped." },
+        { "bit": 1, "name": "readError", "description": "At least one sensor read failed since the previous block." },
+        { "bit": 2, "name": "sensorReconfigured", "description": "The node found the sensor configuration lost (e.g. a brown-out reset it to its defaults) or reads failing, and configured it again since the previous block. Samples before this block may be in the wrong scale or frozen." },
+        { "bit": 3, "name": "reserved" },
+        { "bit": 4, "name": "reserved" },
+        { "bit": 5, "name": "reserved" },
+        { "bit": 6, "name": "reserved" },
+        { "bit": 7, "name": "reserved" }
+      ]
+    },
+    "headerFields": [
+      { "name": "version",          "offset": 0,  "size": 1, "type": "uint8",  "description": "IMU block format version, 1." },
+      { "name": "seq",              "offset": 1,  "size": 1, "type": "uint8",  "description": "Rolling 0-255 counter incremented once per IMU block sent." },
+      { "name": "deviceTimeMs",     "offset": 2,  "size": 4, "type": "uint32", "description": "Node clock in ms when the first sample of the block was taken." },
+      { "name": "firstSampleIndex", "offset": 6,  "size": 2, "type": "uint16", "description": "Tick index of the first sample, see `sampleIndex`." },
+      { "name": "sampleCount",      "offset": 8,  "size": 1, "type": "uint8",  "description": "Samples in this block, 1..maxSamples." },
+      { "name": "samplePeriodMs",   "offset": 9,  "size": 1, "type": "uint8",  "description": "Time between samples, 10." },
+      { "name": "flags",            "offset": 10, "size": 1, "type": "uint8",  "description": "See `imuBlock.flags`." },
+      { "name": "reserved",         "offset": 11, "size": 1, "type": "uint8",  "description": "Always 0." }
+    ],
+    "sampleFields": [
+      { "name": "ax", "offset": 0,  "size": 2, "type": "int16", "description": "Acceleration x, raw, see `scale.accel`." },
+      { "name": "ay", "offset": 2,  "size": 2, "type": "int16", "description": "Acceleration y, raw, see `scale.accel`." },
+      { "name": "az", "offset": 4,  "size": 2, "type": "int16", "description": "Acceleration z, raw, see `scale.accel`." },
+      { "name": "gx", "offset": 6,  "size": 2, "type": "int16", "description": "Angular rate x, raw, see `scale.gyro`." },
+      { "name": "gy", "offset": 8,  "size": 2, "type": "int16", "description": "Angular rate y, raw, see `scale.gyro`." },
+      { "name": "gz", "offset": 10, "size": 2, "type": "int16", "description": "Angular rate z, raw, see `scale.gyro`." }
+    ]
+  }
 }

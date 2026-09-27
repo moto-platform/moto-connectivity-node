@@ -15,16 +15,39 @@
 #define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID_TX "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID_RX "828919fe-e41c-40ee-b4c6-2c974c2d3345"
+// IMU block notifications (docs/ble_telemetry_packet_schema.json gatt.characteristics.imu).
+#define CHARACTERISTIC_UUID_IMU "f62bc083-e25d-46b3-aa0b-2e9e6bc8f1e5"
 
 // Standard Device Information Service UUID (0x180A)
 #define DEVICE_INFO_SERVICE_UUID "0000180a-0000-1000-8000-00805f9b34fb"
 
-BLEServerModule::BLEServerModule() {}
+std::atomic<uint16_t> BLEServerModule::s_peerMtu{BLE_DEFAULT_MTU};
+
+BLEServerModule::BLEServerModule(ImuRing* imuRing) : _imuRing(imuRing) {}
+
+// BLE stack task context. The central starts the MTU exchange (moto-mobile requests
+// 185); until then, and for every new connection, the ATT default of 23 applies.
+void BLEServerModule::gattsEventHandler(esp_gatts_cb_event_t event, esp_gatt_if_t gattsIf,
+                                        esp_ble_gatts_cb_param_t* param) {
+    (void)gattsIf;
+    switch (event) {
+        case ESP_GATTS_CONNECT_EVT:
+        case ESP_GATTS_DISCONNECT_EVT:
+            s_peerMtu.store(BLE_DEFAULT_MTU, std::memory_order_relaxed);
+            break;
+        case ESP_GATTS_MTU_EVT:
+            s_peerMtu.store(param->mtu.mtu, std::memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+}
 
 bool BLEServerModule::begin() {
     // Initialize BLE Device with maximum MTU (512 bytes)
     BLEDevice::init("Honda-CL250-Telemetry");
     BLEDevice::setMTU(512);
+    BLEDevice::setCustomGattsHandler(&BLEServerModule::gattsEventHandler);
 
     // G4.2 -- BLE access control: the RX (write) characteristic accepts phone-controlled
     // strings (song title/artist, nav data) that end up on the rider's Nextion dashboard.
@@ -86,6 +109,14 @@ bool BLEServerModule::begin() {
         BLECharacteristic::PROPERTY_NOTIFY
     );
     _pTxCharacteristic->addDescriptor(new BLE2902()); // one-time, see begin() note on heap use
+
+    // IMU block (Notify) Characteristic, D-032. Present even without a sensor so the phone
+    // sees a stable GATT table; it just never notifies then.
+    _pImuCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID_IMU,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    _pImuCharacteristic->addDescriptor(new BLE2902()); // one-time, see begin() note on heap use
 
     // Create Telematics RX (Write) Characteristic
     _pRxCharacteristic = pService->createCharacteristic(
@@ -206,25 +237,82 @@ void BLEServerModule::update(SystemState& state) {
         }
     }
 
-    // Stream real-time binary packet at 10Hz (100ms interval) to connected phone
+    // Stream telemetry and IMU blocks at 10 Hz. Notifications are queued to the BLE stack
+    // task and never wait for the phone, so this cannot hold up the CAN poller.
     if (_deviceConnected && (now - _lastNotify >= 100)) {
         _lastNotify = now;
-
-        // wraps 0-255 by design; receivers detect loss from gaps
-        BLETelemetryPacket packet = buildTelemetryPacket(state, _txSeq++);
-
-        _pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(BLETelemetryPacket));
-        _pTxCharacteristic->notify();
+        uint16_t mtu = s_peerMtu.load(std::memory_order_relaxed);
+        if (mtu != _loggedMtu) {
+            _loggedMtu = mtu;
+            Serial.printf("[BLE] Peer MTU %u: telemetry v%u, %u IMU samples per block.\n",
+                mtu, telemetryVersionForMtu(mtu), imuSamplesPerBlock(mtu));
+        }
+        sendTelemetry(state, now, mtu);
+        _imuDue = true;
+    } else if (_deviceConnected && _imuDue) {
+        // IMU blocks go out on the pass after the telemetry notify, so one loop pass never
+        // carries more than IMU_MAX_BLOCKS_PER_NOTIFY notifications (CAN poller timing).
+        _imuDue = false;
+        sendImuBlocks(s_peerMtu.load(std::memory_order_relaxed));
+    } else if (!_deviceConnected && _imuRing) {
+        // Nobody to send to: a new connection starts with fresh samples and no old events.
+        _imuRing->clear();
+        _imuRing->takeEvents();
     }
 
-    // Auto-restart BLE advertising upon disconnection so phone can reconnect
+    // Auto-restart BLE advertising upon disconnection so phone can reconnect. Waits 500 ms
+    // without blocking the loop (the legacy delay(500) stalled the CAN poller).
     if (!_deviceConnected && _oldDeviceConnected) {
-        delay(500); // Reset delay
-        _pServer->startAdvertising();
-        _oldDeviceConnected = _deviceConnected;
+        if (_disconnectedAtMs == 0) {
+            _disconnectedAtMs = now == 0 ? 1 : now;
+        } else if (now - _disconnectedAtMs >= 500) {
+            _pServer->startAdvertising();
+            _oldDeviceConnected = _deviceConnected;
+            _disconnectedAtMs = 0;
+        }
     }
 
     if (_deviceConnected && !_oldDeviceConnected) {
         _oldDeviceConnected = _deviceConnected;
+        _disconnectedAtMs = 0;
+    }
+}
+
+void BLEServerModule::sendTelemetry(const SystemState& state, unsigned long now, uint16_t mtu) {
+    // Never larger than MTU - 3 (the stack would silently truncate it): below the v3 size
+    // the v2 fallback goes out instead. Both share the sequence counter.
+    if (telemetryVersionForMtu(mtu) == BLE_PACKET_VERSION) {
+        BLETelemetryPacketV3 packet = buildTelemetryPacketV3(state, _txSeq++, (uint32_t)now);
+        _pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(packet));
+    } else {
+        BLETelemetryPacketV2 packet = buildTelemetryPacketV2(state, _txSeq++);
+        _pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(packet));
+    }
+    _pTxCharacteristic->notify();
+}
+
+void BLEServerModule::sendImuBlocks(uint16_t mtu) {
+    if (_imuRing == nullptr) {
+        return;
+    }
+    uint8_t samplesPerBlock = imuSamplesPerBlock(mtu);
+    if (samplesPerBlock == 0) {
+        // MTU too small: suspended; the receiver sees the lost samples as an index gap.
+        _imuRing->clear();
+        _imuRing->takeEvents();
+        return;
+    }
+    // Events are taken only when a block will carry them, so none is lost on an empty pass.
+    uint8_t events = _imuRing->size() > 0 ? _imuRing->takeEvents() : 0;
+    for (uint8_t i = 0; i < IMU_MAX_BLOCKS_PER_NOTIFY; i++) {
+        size_t len = packImuBlock(*_imuRing, samplesPerBlock, _imuSeq, events,
+                                  _imuBlock, sizeof(_imuBlock));
+        if (len == 0) {
+            break;
+        }
+        _imuSeq++;
+        events = 0; // reported once, with the first block after the event
+        _pImuCharacteristic->setValue(_imuBlock, len);
+        _pImuCharacteristic->notify();
     }
 }

@@ -35,6 +35,8 @@ public:
     // True once the poller stopped for good (foreign tester or repeated bus-off).
     bool latchedOff() const { return _latchedOff; }
     bool foreignTesterDetected() const { return _foreignTesterDetected; }
+    // DID requests that timed out with no response at all since boot (BLE v3 health).
+    uint32_t unansweredDidCount() const { return _unansweredDidCount; }
 
 #ifdef CONN_NATIVE_TEST
     // Test hook: drives the real TX gate with an arbitrary request (never built on target).
@@ -59,6 +61,7 @@ private:
 
     // G2.1 -- Negative response (NRC, 0x7F) bookkeeping.
     uint32_t _nrcCount = 0;
+    uint32_t _unansweredDidCount = 0;
 
     // ------------------------------------------------------------------
     // G2.2 -- Single-request-in-flight UDS state machine.
@@ -110,6 +113,11 @@ private:
      * @brief Transmits a ReadDataByIdentifier ($22) request for a specific DID.
      */
     void requestDID(uint16_t did);
+
+    // The UDS poller itself (unchanged request/response logic).
+    void poll(SystemState& state);
+    // Copies bus/tester counters into state.can; read-only, never transmits.
+    void publishHealth(SystemState& state);
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
 
