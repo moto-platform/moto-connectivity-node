@@ -1,0 +1,3 @@
+[submodule "external/moto-vehicle-defs"]
+	path = external/moto-vehicle-defs
+	url = ../moto-vehicle-defs.git

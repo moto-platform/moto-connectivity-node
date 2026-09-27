@@ -1,1 +1,13 @@
+.pio/
+.cache/
+.vscode/
 .DS_Store
+*.pem
+*.log
+platformio_local.ini
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+managed_components/
+dependencies.lock
+*.apk
