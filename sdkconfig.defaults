@@ -17,3 +17,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # Arduino BLE library uses the legacy (4.2) advertising API; ESP32-S3 defaults to 5.0-only.
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+
+# ImuModule creates its sampler task with a static stack/TCB (no heap).
+CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y

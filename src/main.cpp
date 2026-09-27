@@ -2,6 +2,7 @@
 #include <esp_timer.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 
 #include "SystemState.h"
 #include "IModule.h"
@@ -26,6 +27,7 @@
 #endif
 #include "NextionModule.h"
 #include "BLEServerModule.h"
+#include "ImuModule.h"
 #include "WiFiServerModule.h"
 #include "SerialLoggerModule.h"
 
@@ -39,7 +41,7 @@
 #define UART2_RX_PIN    GPIO_NUM_18
 
 // Free GPIO used purely for loop-timing observation (oscilloscope / logic analyzer probe).
-// Not wired to any peripheral above (4,5,17,18 are taken; 1/2 were the dropped IMU's I2C).
+// Not wired to any peripheral above (4,5,17,18 are taken; 1/2 are the IMU's I2C, see ImuModule).
 #define DEBUG_LOOP_PIN  GPIO_NUM_8
 
 // G1.4 -- Task Watchdog Timer. If loop() ever stalls (a module hangs) for longer than
@@ -74,7 +76,12 @@ TwaiCanBus         canBus(CAN_TX_PIN, CAN_RX_PIN);
 HondaCANModule     canModule(canBus);
 #endif
 NextionModule      displayModule(NextionSerial, UART2_RX_PIN, UART2_TX_PIN);
-BLEServerModule    bleModule;
+// D-032: raw 100 Hz IMU samples for data collection. The sampler task (core 0) fills this
+// static ring; BLEServerModule drains it in 10-sample blocks. Independent of the CAN
+// poller and present in every build (no vehicle-bus involvement).
+ImuRing            imuRing;
+ImuModule          imuModule(imuRing);
+BLEServerModule    bleModule(&imuRing);
 WiFiServerModule   wifiModule(80);      // SoftAP HTTP JSON Backend Server on port 80
 SerialLoggerModule loggerModule(1000); // Prints serial log every 1000ms
 
@@ -89,6 +96,7 @@ IProducerModule* producers[] = {
 #if defined(MOCK_CAN_DATA) || CONN_VEHICLE_TESTER
     &canModule,
 #endif
+    &imuModule,
     &bleModule,
 };
 IConsumerModule* consumers[] = {
@@ -103,7 +111,7 @@ const char* PRODUCER_NAMES[PRODUCER_COUNT] = {
 #if defined(MOCK_CAN_DATA) || CONN_VEHICLE_TESTER
     "CAN",
 #endif
-    "BLE"};
+    "IMU", "BLE"};
 const char* CONSUMER_NAMES[CONSUMER_COUNT] = {"Nextion", "WiFi", "Logger"};
 
 // ============================================================================
@@ -251,6 +259,14 @@ void setup() {
     for (uint8_t i = 0; i < PRODUCER_COUNT; i++) {
         producerActive[i] = beginAndLog(producers[i], "Producer", i, PRODUCER_NAMES[i]);
     }
+#if !defined(MOCK_CAN_DATA) && CONN_VEHICLE_TESTER
+    if (!producerActive[0]) {
+        // Tester build whose TWAI driver failed to start: report it as stopped so BLE v3
+        // CAN health does not look like the poller-off build (NOT_INSTALLED, no flags).
+        globalState.can.busState = CanHealthState::STOPPED;
+        globalState.can.flags = CAN_HEALTH_FLAG_POLLER_ENABLED;
+    }
+#endif
     for (uint8_t i = 0; i < CONSUMER_COUNT; i++) {
         consumerActive[i] = beginAndLog(consumers[i], "Consumer", i, CONSUMER_NAMES[i]);
     }
@@ -310,6 +326,12 @@ void loop() {
             printTimingRow(CONSUMER_NAMES[i], consumerTiming[i]);
         }
         printTimingRow("LOOP", loopTiming);
+        // One-time-init heap only is the goal; BLE notifications still allocate inside the
+        // framework, so watch the low-water mark and fragmentation during soak tests.
+        Serial.printf("  [HEAP    ] free=%lu  min_free=%lu  largest_block=%lu\n",
+            (unsigned long)esp_get_free_heap_size(),
+            (unsigned long)esp_get_minimum_free_heap_size(),
+            (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         Serial.println("-----------------------------------------------\n");
     }
 }

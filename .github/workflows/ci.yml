@@ -52,6 +52,16 @@ jobs:
       - name: Run native unit tests
         run: pio test -e native
 
+      # D-032: the telemetry v3/v2 structs and the IMU block packer must match
+      # docs/ble_telemetry_packet_schema.json field by field (g++ probe, no device).
+      - name: Check BLE layouts against the schema
+        run: python3 scripts/check_ble_schema.py
+
+      # The Bluedroid build needs the BLE 4.2 feature set (legacy advertising/GATT API used
+      # by BLEServerModule); sdkconfig.defaults must keep it.
+      - name: Check required sdkconfig options
+        run: grep -qx 'CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y' sdkconfig.defaults
+
       # G4.1 requires AP_PASSWORD from a gitignored platformio_local.ini that does
       # not exist in CI. Build-verification-only placeholder, never flashed.
       - name: Provide CI-only build password

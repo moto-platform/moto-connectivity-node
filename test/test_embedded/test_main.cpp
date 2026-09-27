@@ -21,9 +21,10 @@ void test_system_state_initialization(void) {
 }
 
 void test_ble_telemetry_packet_packing(void) {
-    // G3.3 -- layout per docs/ble_telemetry_packet_schema.json (version 2, 16 bytes).
-    BLETelemetryPacket packet;
-    packet.version = BLE_PACKET_VERSION;
+    // G3.3 -- low-MTU fallback layout per docs/ble_telemetry_packet_schema.json
+    // `lowMtuFallback` (version 2, 16 bytes). Version 3 is covered by the native tests.
+    BLETelemetryPacketV2 packet;
+    packet.version = BLE_PACKET_VERSION_LEGACY;
     packet.seq = 7;
     packet.rpm = 4500;
     packet.speed = 65;
@@ -36,8 +37,9 @@ void test_ble_telemetry_packet_packing(void) {
     packet.flags = BLE_FLAG_RPM_VALID;
 
     // Total size of BLE telemetry packet MUST be exactly 16 bytes
-    TEST_ASSERT_EQUAL(16, sizeof(BLETelemetryPacket));
-    TEST_ASSERT_EQUAL_UINT8(BLE_PACKET_VERSION, packet.version);
+    TEST_ASSERT_EQUAL(16, sizeof(BLETelemetryPacketV2));
+    TEST_ASSERT_EQUAL(37, sizeof(BLETelemetryPacketV3));
+    TEST_ASSERT_EQUAL_UINT8(BLE_PACKET_VERSION_LEGACY, packet.version);
     TEST_ASSERT_EQUAL_UINT8(7, packet.seq);
     TEST_ASSERT_EQUAL_UINT16(4500, packet.rpm);
     TEST_ASSERT_EQUAL_UINT8(65, packet.speed);

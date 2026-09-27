@@ -11,6 +11,10 @@ bool MockCANModule::begin() {
 }
 
 void MockCANModule::update(SystemState& state) {
+    // No TWAI driver in this build: say so in the BLE v3 CAN health fields.
+    state.can.busState = CanHealthState::NOT_INSTALLED;
+    state.can.flags = CAN_HEALTH_FLAG_SYNTHETIC_DATA;
+
     unsigned long now = millis();
     if (now - _lastUpdateMs < UPDATE_INTERVAL_MS) {
         return;

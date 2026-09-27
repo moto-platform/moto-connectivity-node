@@ -3,6 +3,9 @@
 
 #include "IModule.h"
 #include "BLETelemetryPacket.h"
+#include "ImuBlockPacket.h"
+
+#include <atomic>
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -51,16 +54,35 @@ private:
     BLECharacteristic* _pTxCharacteristic = nullptr;
     BLECharacteristic* _pRxCharacteristic = nullptr;
 
+    BLECharacteristic* _pImuCharacteristic = nullptr;
+
     bool _initialized = false;
     bool _deviceConnected = false;
     bool _oldDeviceConnected = false;
+    unsigned long _disconnectedAtMs = 0;
     unsigned long _lastNotify = 0;
-    uint8_t _txSeq = 0; // G3.3 -- rolling packet sequence counter, see BLETelemetryPacket.h
+    uint8_t _txSeq = 0;  // G3.3 -- rolling telemetry sequence counter (v2 and v3 share it)
+    uint8_t _imuSeq = 0; // rolling IMU block counter
+    bool _imuDue = false;
+    uint16_t _loggedMtu = 0;
+
+    // IMU samples to stream (D-032), nullptr when the build has no IMU sampler.
+    ImuRing* _imuRing = nullptr;
+    uint8_t _imuBlock[IMU_BLOCK_MAX_BYTES];
+
+    // Negotiated ATT MTU of the current peer, written by the GATT event handler on the BLE
+    // stack task and read by update() on the main loop task.
+    static std::atomic<uint16_t> s_peerMtu;
+    static void gattsEventHandler(esp_gatts_cb_event_t event, esp_gatt_if_t gattsIf,
+                                  esp_ble_gatts_cb_param_t* param);
+
+    void sendTelemetry(const SystemState& state, unsigned long now, uint16_t mtu);
+    void sendImuBlocks(uint16_t mtu);
 
     QueueHandle_t _telematicsQueue = nullptr;
 
 public:
-    BLEServerModule();
+    explicit BLEServerModule(ImuRing* imuRing = nullptr);
     virtual ~BLEServerModule() {}
 
     bool begin() override;

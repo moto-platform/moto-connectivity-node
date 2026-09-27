@@ -120,6 +120,42 @@ void HondaCANModule::storeValue(SystemState& state, uint8_t didIndex, float valu
 }
 
 void HondaCANModule::update(SystemState& state) {
+    poll(state);
+    publishHealth(state);
+}
+
+// Read-only: mirrors bus/tester counters into SystemState for BLE telemetry v3. Never
+// transmits and never changes the poller state; once latched off the driver is gone,
+// so the counters stay frozen at their last values.
+void HondaCANModule::publishHealth(SystemState& state) {
+    CanHealth& h = state.can;
+    h.flags = CAN_HEALTH_FLAG_POLLER_ENABLED;
+    if (_latchedOff) {
+        h.flags |= _foreignTesterDetected ? CAN_HEALTH_FLAG_LATCHED_FOREIGN_TESTER : CAN_HEALTH_FLAG_LATCHED_BUS_OFF;
+    }
+    h.busOffCount = _busOffEventCount;
+    h.unansweredDidCount = _unansweredDidCount;
+    if (_latchedOff) {
+        h.busState = CanHealthState::STOPPED;
+        return;
+    }
+    uint16_t txErr = 0, rxErr = 0;
+    _bus.getErrorCounters(txErr, rxErr);
+    h.txErrorCount = txErr;
+    h.rxErrorCount = rxErr;
+    switch (_bus.getState()) {
+        case CanBusState::BUS_OFF: h.busState = CanHealthState::BUS_OFF; break;
+        case CanBusState::STOPPED: h.busState = CanHealthState::STOPPED; break;
+        case CanBusState::ERROR_WARNING: h.busState = CanHealthState::ERROR_WARNING; break;
+        case CanBusState::RUNNING:
+        default:
+            h.busState = (txErr >= CAN_ERROR_WARNING_LIMIT || rxErr >= CAN_ERROR_WARNING_LIMIT)
+                ? CanHealthState::ERROR_WARNING : CanHealthState::RUNNING;
+            break;
+    }
+}
+
+void HondaCANModule::poll(SystemState& state) {
     unsigned long now = millis();
 
     // Latched off (foreign tester seen or too many bus-offs): transmit nothing ever
@@ -228,6 +264,7 @@ void HondaCANModule::update(SystemState& state) {
     if (_udsState == UdsRequestState::TIMEOUT) {
         DidSlot& slot = _dids[_pendingDidIndex];
         slot.consecutiveTimeouts++;
+        _unansweredDidCount++;
         Serial.printf("[UDS WARNING] Timeout waiting for DID 0x%04X (consecutive=%u/%u)\n",
             _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts);
 
