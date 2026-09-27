@@ -4,7 +4,7 @@
 
 <!-- Source of truth: moto-workspace/PLATFORM-RULES.md. Copies in each repo's .claude/ are written by scripts/sync_claude.py — edit only the source. -->
 
-SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). Senior thesis → GitHub org `moto-platform` (12 repos, private). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
+SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). Senior thesis → GitHub org `moto-platform` (12 repos, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
 
 ## Where things are
 
