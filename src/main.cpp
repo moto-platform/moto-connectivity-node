@@ -3,6 +3,7 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#include <driver/gpio.h>
 
 #include "SystemState.h"
 #include "IModule.h"
@@ -22,6 +23,7 @@
 #elif CONN_VEHICLE_TESTER
 #include "HondaCANModule.h"
 #include "hal/TwaiCanBus.h"
+#include "hal/RtcTesterLatchStore.h"
 #else
 #warning "CONN_VEHICLE_TESTER=0: vehicle poller disabled, no CAN transmission, no engine data source."
 #endif
@@ -73,7 +75,8 @@ SystemState globalState;
 MockCANModule      canModule;
 #elif CONN_VEHICLE_TESTER
 TwaiCanBus         canBus(CAN_TX_PIN, CAN_RX_PIN);
-HondaCANModule     canModule(canBus);
+RtcTesterLatchStore canLatchStore; // Q-018: D-030 latch survives non-power-on resets
+HondaCANModule     canModule(canBus, canLatchStore);
 #endif
 NextionModule      displayModule(NextionSerial, UART2_RX_PIN, UART2_TX_PIN);
 // D-032: raw 100 Hz IMU samples for data collection. The sampler task (core 0) fills this
@@ -233,12 +236,19 @@ const char* resetReasonName(esp_reset_reason_t reason) {
 // SETUP & MAIN LOOP
 // ============================================================================
 void setup() {
-#if defined(MOCK_CAN_DATA) || !CONN_VEHICLE_TESTER
-    // No TWAI driver in this build: hold the transceiver's TXD recessive (high) so an
-    // undriven pin can never pull the vehicle bus dominant.
-    pinMode(CAN_TX_PIN, OUTPUT);
-    digitalWrite(CAN_TX_PIN, HIGH);
-#endif
+    // First thing after every reset, in every build: hold the transceiver's TXD recessive
+    // (high) so an undriven pin can never pull the vehicle bus dominant. The tester build
+    // hands the pin to TWAI only when HondaCANModule installs the driver (listen-only
+    // first, Q-018); a latched or no-tester build never does. The board should also have
+    // a pull-up on TXD for the time before this line runs. ESP-IDF calls, level first:
+    // Arduino's digitalWrite() ignores a pin not yet set up, so pinMode() alone would
+    // drive the reset value (low, dominant) for a moment.
+    gpio_set_level(CAN_TX_PIN, 1);
+    gpio_config_t canTxHigh = {};
+    canTxHigh.pin_bit_mask = 1ULL << CAN_TX_PIN;
+    canTxHigh.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&canTxHigh);
+    gpio_set_level(CAN_TX_PIN, 1);
     // Initialize USB Serial Debug Console
     Serial.begin(115200);
     delay(500);
