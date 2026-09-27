@@ -17,6 +17,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: false
+          # Don't persist GITHUB_TOKEN: git would send it (via an included credentials config)
+          # instead of the MOTO_DEFS_TOKEN URL credentials and the defs clone gets 403.
+          persist-credentials: false
 
       - name: Fetch moto-vehicle-defs submodule (MOTO_DEFS_TOKEN)
         env:
@@ -26,9 +29,6 @@ jobs:
             echo "::error::Secret MOTO_DEFS_TOKEN (fine-grained PAT, Contents: read on moto-vehicle-defs) is not available. On the Free plan add it as a REPOSITORY secret."
             exit 1
           fi
-          # actions/checkout persists this repo's GITHUB_TOKEN as an Authorization extraheader,
-          # which git would send instead of the URL credentials below (-> 403 on the defs repo).
-          git config --local --unset-all "http.https://github.com/.extraheader" || true
           git config --global \
             url."https://x-access-token:${MOTO_DEFS_TOKEN}@github.com/moto-platform/moto-vehicle-defs".insteadOf \
             "https://github.com/moto-platform/moto-vehicle-defs"
