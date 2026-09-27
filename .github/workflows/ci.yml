@@ -23,9 +23,12 @@ jobs:
           MOTO_DEFS_TOKEN: ${{ secrets.MOTO_DEFS_TOKEN }}
         run: |
           if [ -z "$MOTO_DEFS_TOKEN" ]; then
-            echo "::error::Org secret MOTO_DEFS_TOKEN (Contents: read on moto-vehicle-defs) is not available to this repository."
+            echo "::error::Secret MOTO_DEFS_TOKEN (fine-grained PAT, Contents: read on moto-vehicle-defs) is not available. On the Free plan add it as a REPOSITORY secret."
             exit 1
           fi
+          # actions/checkout persists this repo's GITHUB_TOKEN as an Authorization extraheader,
+          # which git would send instead of the URL credentials below (-> 403 on the defs repo).
+          git config --local --unset-all "http.https://github.com/.extraheader" || true
           git config --global \
             url."https://x-access-token:${MOTO_DEFS_TOKEN}@github.com/moto-platform/moto-vehicle-defs".insteadOf \
             "https://github.com/moto-platform/moto-vehicle-defs"
