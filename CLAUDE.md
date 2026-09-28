@@ -30,7 +30,7 @@ Reads signal definitions from `moto-vehicle-defs` (submodule: `external/moto-veh
 ## Build
 
 PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espidf`, D-023). Target chip: `esp32s3`.
-- `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`, pinned to `v0.1.0`); CI needs the `MOTO_DEFS_TOKEN` secret for this private submodule
+- `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`, pinned to `v0.1.0`); the defs repo is public (D-033), so CI needs no secret
 - `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock` / `-e esp32-s3-devkitc-1-no-tester` (poller off); needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
 - `pio test -e native`, or `scripts/native_tests.sh` (g++ + Unity, no PlatformIO registry needed)
 
