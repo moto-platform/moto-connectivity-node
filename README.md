@@ -24,4 +24,4 @@ Toolchain: PlatformIO, `framework = arduino, espidf` (Arduino-ESP32 2.0.x on ESP
 
 ## License
 
-To be decided.
+MIT, see `LICENSE` (D-036).

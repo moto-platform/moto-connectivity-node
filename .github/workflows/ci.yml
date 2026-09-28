@@ -9,32 +9,13 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      # This repo is checked out with the default GITHUB_TOKEN. The private submodule
-      # external/moto-vehicle-defs needs the org secret MOTO_DEFS_TOKEN (fine-grained,
-      # Contents: read on moto-vehicle-defs only), so it is fetched in a separate step:
-      # passing that token to actions/checkout would also use it for THIS repo, which it
-      # cannot read. Never vendor the defs into this repo to make CI pass.
+      # moto-vehicle-defs is public (D-033): the submodule needs no secret.
       - uses: actions/checkout@v4
         with:
-          submodules: false
-          # Don't persist GITHUB_TOKEN: git would send it (via an included credentials config)
-          # instead of the MOTO_DEFS_TOKEN URL credentials and the defs clone gets 403.
-          persist-credentials: false
+          submodules: recursive
 
-      - name: Fetch moto-vehicle-defs submodule (MOTO_DEFS_TOKEN)
-        env:
-          MOTO_DEFS_TOKEN: ${{ secrets.MOTO_DEFS_TOKEN }}
-        run: |
-          if [ -z "$MOTO_DEFS_TOKEN" ]; then
-            echo "::error::Secret MOTO_DEFS_TOKEN (fine-grained PAT, Contents: read on moto-vehicle-defs) is not available. On the Free plan add it as a REPOSITORY secret."
-            exit 1
-          fi
-          git config --global \
-            url."https://x-access-token:${MOTO_DEFS_TOKEN}@github.com/moto-platform/moto-vehicle-defs".insteadOf \
-            "https://github.com/moto-platform/moto-vehicle-defs"
-          git submodule sync --recursive
-          git submodule update --init --recursive
-          git -C external/moto-vehicle-defs describe --tags --always
+      - name: Show the defs pin
+        run: git -C external/moto-vehicle-defs describe --tags --always
 
       - uses: actions/setup-python@v5
         with:
