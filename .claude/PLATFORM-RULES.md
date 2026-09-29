@@ -4,7 +4,7 @@
 
 <!-- Source of truth: moto-workspace/PLATFORM-RULES.md. Copies in each repo's .claude/ are written by scripts/sync_claude.py — edit only the source. -->
 
-SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). Senior thesis → GitHub org `moto-platform` (12 repos, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
+SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
 
 ## Where things are
 
@@ -32,7 +32,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 
 ## Platform invariants (non-negotiable; if one must be broken, STOP and ask)
 
-1. **Never write to the ECU.** No repo writes to the engine ECU, flashes it, or changes maps. rt-core is the **only** tester on the vehicle bus (D-021); until rt-core exists, connectivity-node is the temporary sole tester (D-023), and there are never two. It may send only: `0x10` with sub-function 0x01/0x03, `0x3E`, `0x22`, `0x19`, and OBD `0x01/0x09`. NEVER `0x10 0x02`, `0x11`, `0x14`, `0x27`, `0x2E`, `0x2F`, `0x31`, `0x34`, `0x36`, `0x37` (D-020). All other nodes stay off the vehicle bus or strictly listen-only. rt-core republishes decoded vehicle signals on the separate platform CAN bus, where our nodes talk (D-009, D-021).
+1. **The ECU is read-only.** The CL250 ECU only answers requests (D-019), so the vehicle bus has exactly **one tester, and it only reads** (D-037): rt-core (D-021); until rt-core exists, connectivity-node is the temporary sole tester (D-023), and there are never two. It sends only what `moto-vehicle-defs/uds/vehicle_cl250.yaml` → `tester_policy` allows (D-020: session control 0x01/0x03 only, tester present, read services), through the generated gates. That policy may only be narrowed; codegen's golden copy blocks widening (D-027). Widening either one needs the user's approval, a versioned defs change and `safety-reviewer`. Nothing that writes, clears, resets, unlocks, controls or reprograms the ECU, and never a map change. All other nodes stay off the vehicle bus or strictly listen-only. rt-core republishes decoded vehicle signals on the separate platform CAN bus, where our nodes talk (D-009, D-021).
 2. **Never invent signals.** CAN IDs, signal names, scales, VSS paths and DIDs come only from `moto-vehicle-defs` (generated `gen/` code or DBC/VSS). Hand-written literals → `vss-schema-guardian`.
 3. **The safety path is isolated.** The cornering decision (safety-node) and the blind-spot decision (io-node) work without the Raspi, the phone, Wi-Fi, VSS or ML. ML may only tighten thresholds, never loosen the safety ceiling.
 4. **Critical work never depends on a slow channel.** µs-critical → MCU + CAN. ms → Raspi. Latency-tolerant → phone/server.
@@ -45,5 +45,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 
 - Conventional Commits (`feat(uds): ...`). Commit or push only when the user asks.
 - `moto-vehicle-defs` uses semver. Consumers pin the `external/moto-vehicle-defs` submodule (relative URL) to a **tag**. The known-good combination is recorded in `moto-workspace/manifest.yaml`.
+- Releases (D-036): bump the build-file version (CMake `project(VERSION)`, `pyproject.toml`, `pubspec.yaml`) in a PR → merge after green CI → `gh release create vX.Y.Z -R moto-platform/<repo> --target main --title vX.Y.Z --generate-notes` → pin the tag in `manifest.yaml` (workspace PR). moto-vehicle-defs also adds a `CHANGELOG.md` entry; docs-only changes need no tag.
+- `docs/archive/` (Turkish originals, advisor documents) is not read by Claude (D-038).
 - Skills: `/repo-bootstrap` (repo skeleton), `/signal-change` (signals), `/feature-module` (firmware feature), `/handoff` (end of session, workspace only).
 - Token budget is limited: delegate bulk mechanical work to `sonnet`/`haiku` subagents, use `Explore` for broad searches, one task per session.

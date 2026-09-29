@@ -13,7 +13,7 @@ argument-hint: <repo> <feature-name>
 - Confirm the feature belongs in this repo: check its `CLAUDE.md`. If unsure, run `architecture-guard` on the plan.
 - Write down inputs (which generated signals/HAL services), outputs (signals published, actuators), period/deadline, task priority, and failure behaviour (what the module does on missing/invalid input).
 - Signals it needs that do not exist yet → `/signal-change` first.
-- For standards-based modules (ISO-TP ISO 15765-2, UDS ISO 14229, XCP), list the services/parameters in scope and cite the clause. Keep them minimal, matching the thesis scope (Ç2/Ç3 in `tr/bitirme-projesi-kapsam.md`).
+- For standards-based modules (ISO-TP ISO 15765-2, UDS ISO 14229, XCP), list the services/parameters in scope and cite the clause. Keep them minimal, matching the thesis scope (Ç2/Ç3 in `ARCHITECTURE.md` §9).
 
 ## 2. Structure
 
