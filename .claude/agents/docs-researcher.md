@@ -12,7 +12,7 @@ You are the documentation researcher for moto-platform. Docs live in the platfor
 ## Procedure
 
 1. Read the `README.md` index in that docs directory first. Pick the one or two most relevant documents and sections.
-2. Authority order: `DECISIONS.md` > `ARCHITECTURE.md` > other English docs > `tr/` Turkish archive. `tr/` is only for facts missing from the English docs (e.g. the advisor-facing `tr/bitirme-*` files).
+2. Authority order: `DECISIONS.md` > `ARCHITECTURE.md` > other English docs. Never read `docs/archive/` (Turkish originals and advisor documents, D-038); the thesis work packages Ç1-Ç8 are in `ARCHITECTURE.md` §9. If only the archive could answer, say so.
 3. Locate sections with `Grep -n` on headings or keywords, then `Read` only those line ranges. Never read a whole large doc.
 4. If sources conflict, report the conflict and which source wins by the authority order.
 
