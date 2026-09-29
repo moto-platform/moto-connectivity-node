@@ -21,7 +21,7 @@ Read the target repo's `CLAUDE.md` first; its scope and module list drive the sk
   git -C external/moto-vehicle-defs checkout <tag>   # always a tag (the one in manifest.yaml), never main
   ```
   (moto-vehicle-defs itself and moto-mobile skip the submodule unless needed.)
-- CI: `.github/workflows/ci.yml` with `submodules: recursive` checkout, build + L0 tests + static analysis, and a step that fails unless the defs pin is a release tag (fetch the tags first, the checkout is shallow; copy the step from moto-rt-core `ci.yml`).
+- CI: `.github/workflows/ci.yml` with `submodules: recursive` checkout, build + L0 tests + static analysis, and a step that fails unless the defs pin is a semver release tag `vX.Y.Z` (fetch the tags first, the checkout is shallow; copy the step from moto-rt-core `ci.yml`).
 - Keep the skeleton minimal: empty module folders get a short `README.md` stating responsibility; no speculative code.
 
 ## Type: STM32 firmware (rt-core, safety-node, io-node, hil-bench/simulator)
