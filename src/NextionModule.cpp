@@ -31,7 +31,7 @@ void NextionModule::setTxt(const char* name, const char* text) {
     // anything outside printable 7-bit ASCII (and '"'/'\\') and hard-cap the length.
     char safe[NEXTION_MAX_TEXT_LEN + 1];
     size_t i = 0;
-    for (; text[i] != '\0' && i < NEXTION_MAX_TEXT_LEN; i++) {
+    for (; i < NEXTION_MAX_TEXT_LEN && text[i] != '\0'; i++) {
         unsigned char c = (unsigned char)text[i];
         safe[i] = (c == '"' || c == '\\' || c < 0x20 || c >= 0x7F) ? '_' : (char)c;
     }

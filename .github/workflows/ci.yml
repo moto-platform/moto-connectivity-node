@@ -7,7 +7,8 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Pinned, like the cppcheck cache key below.
+    runs-on: ubuntu-24.04
     steps:
       # moto-vehicle-defs is public (D-033): the submodule needs no secret.
       - uses: actions/checkout@v4
@@ -22,12 +23,35 @@ jobs:
           test -n "$tag" || { echo "::error::external/moto-vehicle-defs is not pinned to a vX.Y.Z release tag"; exit 1; }
           echo "defs pin: $tag"
 
-      - name: Install cppcheck
-        timeout-minutes: 10
+      # Same cppcheck as moto-vehicle-defs: 2.22.0, built once and cached. Ubuntu's apt
+      # cppcheck (2.13) grades some checks differently, so local and CI runs would disagree.
+      - name: Restore cppcheck 2.22.0
+        id: cppcheck
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/cppcheck
+          key: cppcheck-2.22.0-ubuntu-24.04
+
+      - name: Build cppcheck 2.22.0
+        if: steps.cppcheck.outputs.cache-hit != 'true'
+        timeout-minutes: 30
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cppcheck
-          cppcheck --version
+          git clone --quiet --depth 1 --branch 2.22.0 https://github.com/danmar/cppcheck.git "$RUNNER_TEMP/cppcheck-src"
+          cmake -S "$RUNNER_TEMP/cppcheck-src" -B "$RUNNER_TEMP/cppcheck-build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/cppcheck-build" -j "$(nproc)"
+          cp -r "$RUNNER_TEMP/cppcheck-build/bin" ~/cppcheck
+
+      - name: Save cppcheck 2.22.0
+        if: steps.cppcheck.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/cppcheck
+          key: cppcheck-2.22.0-ubuntu-24.04
+
+      - name: Use cppcheck 2.22.0
+        run: |
+          echo "$HOME/cppcheck" >> "$GITHUB_PATH"
+          "$HOME/cppcheck/cppcheck" --version
 
       # D-046 item 3: warning/portability/performance findings block. The ESP-IDF and
       # Arduino headers are not on the include path, so they are never analysed.
