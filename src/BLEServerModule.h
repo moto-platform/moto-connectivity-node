@@ -68,7 +68,7 @@ private:
 
     // IMU samples to stream (D-032), nullptr when the build has no IMU sampler.
     ImuRing* _imuRing = nullptr;
-    uint8_t _imuBlock[IMU_BLOCK_MAX_BYTES];
+    uint8_t _imuBlock[IMU_BLOCK_MAX_BYTES] = {};
 
     // Negotiated ATT MTU of the current peer, written by the GATT event handler on the BLE
     // stack task and read by update() on the main loop task.

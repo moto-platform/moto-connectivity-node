@@ -33,6 +33,7 @@ PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espid
 - `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`, pinned to `v0.1.0`); the defs repo is public (D-033), so CI needs no secret
 - `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock` / `-e esp32-s3-devkitc-1-no-tester` (poller off); needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
 - `pio test -e native`, or `scripts/native_tests.sh` (g++ + Unity, no PlatformIO registry needed)
+- Static analysis in CI (D-046 item 3): cppcheck warning/portability/performance on `src/` is **blocking** (run the CI command locally before pushing); the MISRA C:2012 addon + style checks only **report** (job summary)
 
 ## Legacy telemetry port (D-023)
 

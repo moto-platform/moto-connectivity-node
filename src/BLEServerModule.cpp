@@ -283,10 +283,10 @@ void BLEServerModule::sendTelemetry(const SystemState& state, unsigned long now,
     // the v2 fallback goes out instead. Both share the sequence counter.
     if (telemetryVersionForMtu(mtu) == BLE_PACKET_VERSION) {
         BLETelemetryPacketV3 packet = buildTelemetryPacketV3(state, _txSeq++, (uint32_t)now);
-        _pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(packet));
+        _pTxCharacteristic->setValue(reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
     } else {
         BLETelemetryPacketV2 packet = buildTelemetryPacketV2(state, _txSeq++);
-        _pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(packet));
+        _pTxCharacteristic->setValue(reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
     }
     _pTxCharacteristic->notify();
 }

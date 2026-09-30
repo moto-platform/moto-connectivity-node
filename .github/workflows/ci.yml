@@ -22,6 +22,41 @@ jobs:
           test -n "$tag" || { echo "::error::external/moto-vehicle-defs is not pinned to a vX.Y.Z release tag"; exit 1; }
           echo "defs pin: $tag"
 
+      - name: Install cppcheck
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck
+          cppcheck --version
+
+      # D-046 item 3: warning/portability/performance findings block. The ESP-IDF and
+      # Arduino headers are not on the include path, so they are never analysed.
+      - name: Static analysis (cppcheck, blocking)
+        run: |
+          cppcheck --std=c++11 --enable=warning,performance,portability \
+            --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem \
+            -I src -I external/moto-vehicle-defs/gen/c/conn src
+
+      # D-046 item 3: the MISRA C:2012 addon only reports here. conn is temporary and not
+      # safety-related; its vehicle-bus safety rests on the gen/c gates, which are
+      # MISRA-checked in moto-vehicle-defs, and on tester_policy. conn is C++, so the C:2012
+      # rules are indicative only. misra-config (identifiers from the absent ESP-IDF headers,
+      # C++ keywords) and external/ (checked in moto-vehicle-defs) are left out.
+      - name: MISRA C:2012 + style report (cppcheck, non-blocking)
+        continue-on-error: true
+        run: |
+          cppcheck --std=c++11 --enable=style --addon=misra --inline-suppr --quiet \
+            --suppress=missingIncludeSystem --suppress=misra-config '--suppress=*:*external/*' \
+            --template='{file}:{line}:{column}: {severity}: {message} [{id}]' \
+            -I src -I external/moto-vehicle-defs/gen/c/conn src 2> misra-report.txt
+          cat misra-report.txt
+          {
+            echo "### MISRA C:2012 + style report (non-blocking, D-046): $(wc -l < misra-report.txt) findings"
+            echo '```'
+            cat misra-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
