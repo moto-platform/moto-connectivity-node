@@ -2,7 +2,9 @@
 #include "../../src/HondaCANModule.h"
 #include "../mocks/MockCanBus.h"
 #include "../mocks/MockTesterLatchStore.h"
-#include "../../src/uds_iso14229.h"
+#include "../../src/IsoTpCan.h"
+#include "uds_iso14229.h" // generated (gen/c/conn/, D-040)
+#include <vector>
 
 // [env:native] sets test_build_src = no (most of src/ needs ESP32-only libraries
 // that don't exist on the host), so this suite pulls in the one real implementation
@@ -399,7 +401,7 @@ static bool isAllowedEmittedFrame(const CanFrame& f) {
     if (len == 2 && f.data[1] == VEHICLE_CL250_SESSION_SID && f.data[2] == VEHICLE_CL250_SESSION_SUBFUNCTION) return true;
     if (len == 2 && f.data[1] == VEHICLE_CL250_TESTER_PRESENT_SID &&
         f.data[2] == VEHICLE_CL250_TESTER_PRESENT_SUBFUNCTION) return true;
-    if (len == 3 && f.data[1] == uds::kSidReadDataByIdentifier) {
+    if (len == 3 && f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER) {
         uint16_t did = (uint16_t)((f.data[2] << 8) | f.data[3]);
         return vehicle_cl250_find(did) != nullptr;
     }
@@ -423,8 +425,8 @@ void test_emitted_set_is_exact_across_ecu_behaviours(void) {
         setClock(t);
         uint8_t phase = (uint8_t)((t / 2000) % 4);
         if (phase == 0 && t % 40 == 0) bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x1A, 0xF8));
-        if (phase == 1 && t % 30 == 0) bus.injectRxFrame(makeNegativeResponse(uds::kSidReadDataByIdentifier, 0x31));
-        if (phase == 2 && t % 20 == 0) bus.injectRxFrame(makeNegativeResponse(uds::kSidReadDataByIdentifier, uds::kNrcResponsePending));
+        if (phase == 1 && t % 30 == 0) bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+        if (phase == 2 && t % 20 == 0) bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
         if (phase == 3 && t == 6500) bus.setState(CanBusState::BUS_OFF);
         if (phase == 3 && t == 6600) bus.setState(CanBusState::STOPPED);
         if (phase == 3 && t == 6700) bus.setState(CanBusState::RUNNING);
@@ -452,12 +454,16 @@ void test_forbidden_requests_are_refused_and_never_transmitted(void) {
         expectedBlocked++;
     }
     const uint8_t ok[] = {VEHICLE_CL250_SESSION_SID, VEHICLE_CL250_SESSION_SUBFUNCTION};
-    TEST_ASSERT_FALSE(module.testSendFrame(0x7DF, ok, 2));      // functional broadcast ID
+    for (uint8_t i = 0; i < VEHICLE_CL250_FUNCTIONAL_WATCH_COUNT; i++) {
+        // The OBD functional IDs are watch-only (D-040): never sent on.
+        TEST_ASSERT_FALSE(module.testSendFrame(vehicle_cl250_functional_watch[i].id, ok, 2));
+        expectedBlocked++;
+    }
     TEST_ASSERT_FALSE(module.testSendFrame(0x18DA11F1, ok, 2)); // another ECU
     TEST_ASSERT_FALSE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, ok, 0));
     const uint8_t eight[8] = {0x22, 0xF4, 0x0C, 0, 0, 0, 0, 0};
     TEST_ASSERT_FALSE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, eight, 8)); // not a Single Frame
-    expectedBlocked += 4;
+    expectedBlocked += 3;
     TEST_ASSERT_EQUAL_UINT32(0, bus.txLog.size());
     TEST_ASSERT_EQUAL_UINT32(expectedBlocked, module.blockedFrameCount());
     TEST_ASSERT_TRUE(module.testSendFrame(VEHICLE_CL250_REQUEST_ID, ok, 2));
@@ -478,7 +484,7 @@ void test_response_pending_storm_still_times_out(void) {
     unsigned long t = 100;
     for (; t < 100 + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 400; t += 20) {
         setClock(t);
-        bus.injectRxFrame(makeNegativeResponse(uds::kSidReadDataByIdentifier, uds::kNrcResponsePending));
+        bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
         module.update(state);
         if ((uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 2) break;
     }
@@ -519,7 +525,7 @@ void test_foreign_tester_latches_poller_off(void) {
     foreign.id = VEHICLE_CL250_REQUEST_ID;
     foreign.extended = true;
     foreign.dlc = 8;
-    const uint8_t d[8] = {0x03, uds::kSidReadDataByIdentifier, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
+    const uint8_t d[8] = {0x03, UDS_SID_READ_DATA_BY_IDENTIFIER, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
     for (int i = 0; i < 8; i++) foreign.data[i] = d[i];
     bus.injectRxFrame(foreign);
     setClock(20);
@@ -646,7 +652,7 @@ void test_health_marks_foreign_tester_latch_and_freezes(void) {
     foreign.id = VEHICLE_CL250_REQUEST_ID;
     foreign.extended = true;
     foreign.dlc = 8;
-    const uint8_t d[8] = {0x03, uds::kSidReadDataByIdentifier, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
+    const uint8_t d[8] = {0x03, UDS_SID_READ_DATA_BY_IDENTIFIER, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
     for (int i = 0; i < 8; i++) foreign.data[i] = d[i];
     bus.injectRxFrame(foreign);
     setClock(10);
@@ -692,7 +698,7 @@ static CanFrame makeForeignRequest(uint32_t id = VEHICLE_CL250_REQUEST_ID, bool 
     f.id = id;
     f.extended = extended;
     f.dlc = 8;
-    const uint8_t d[8] = {0x03, uds::kSidReadDataByIdentifier, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
+    const uint8_t d[8] = {0x03, UDS_SID_READ_DATA_BY_IDENTIFIER, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
     for (int i = 0; i < 8; i++) f.data[i] = d[i];
     return f;
 }
@@ -904,14 +910,53 @@ void test_unsolicited_ecu_answer_during_listen_window_latches(void) {
     TEST_ASSERT_TRUE(runSilently(module, bus, state, 110, 10000));
 }
 
+static bool latchesOn(const CanFrame& f) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    bus.injectRxFrame(f);
+    setClock(10);
+    module.update(state);
+    return module.foreignTesterDetected();
+}
+
+// Known-answer check of the gen/ watch table (safety review of C-1, MINOR-1): the
+// literals below are ISO 15765-4 OBD functional request IDs used as golden vectors, not
+// signal definitions. If a defs release drops or mis-flags an entry, this fails instead
+// of the latch silently getting weaker.
+void test_obd_functional_request_ids_known_answer(void) {
+    for (uint8_t i = 0; i < VEHICLE_CL250_FUNCTIONAL_WATCH_COUNT; i++) {
+        const vehicle_cl250_watch_id_t& w = vehicle_cl250_functional_watch[i];
+        TEST_ASSERT_TRUE(w.extended == isotp::isExtendedId(w.id));
+    }
+    TEST_ASSERT_TRUE(latchesOn(makeForeignRequest(0x7DFu, false)));       // 11-bit functional
+    TEST_ASSERT_TRUE(latchesOn(makeForeignRequest(0x18DB33F1u, true)));   // 29-bit, SA 0xF1
+    TEST_ASSERT_TRUE(latchesOn(makeForeignRequest(0x18DB33F2u, true)));   // 29-bit, any SA
+    // Not a functional request to the OBD target address 0x33.
+    TEST_ASSERT_FALSE(latchesOn(makeForeignRequest(0x7DFu, true)));       // 0x7DF as a 29-bit ID
+    TEST_ASSERT_FALSE(latchesOn(makeForeignRequest(0x7DEu, false)));
+    TEST_ASSERT_FALSE(latchesOn(makeForeignRequest(0x18DB34F1u, true)));  // other target address
+    TEST_ASSERT_FALSE(latchesOn(makeForeignRequest(0x18DA33F1u, true)));  // physical, not our ECU
+}
+
 void test_any_diagnostic_request_id_counts_as_foreign_tester(void) {
-    const uint32_t otherSource = (VEHICLE_CL250_REQUEST_ID & ~uds::kNormalFixedSourceAddressMask) | 0xF2u;
-    const CanFrame frames[] = {
+    const uint32_t otherSource = (VEHICLE_CL250_REQUEST_ID & ~isotp::kNormalFixedSourceAddressMask) | 0xF2u;
+    std::vector<CanFrame> frames = {
         makeForeignRequest(otherSource, true),                                   // same ECU, other tester address
-        makeForeignRequest(uds::kFunctionalRequestId11, false),                  // OBD functional 11-bit
-        makeForeignRequest(uds::kFunctionalRequestId29Prefix | 0xF1u, true),     // OBD functional 29-bit
         makeForeignRequest(VEHICLE_CL250_FALLBACK_REQUEST_ID, false),
     };
+    // Q-021/D-040: every OBD functional watch ID from gen/; a 29-bit one also from
+    // another source address (0x18DB<TA><SA>).
+    for (uint8_t i = 0; i < VEHICLE_CL250_FUNCTIONAL_WATCH_COUNT; i++) {
+        const vehicle_cl250_watch_id_t& w = vehicle_cl250_functional_watch[i];
+        frames.push_back(makeForeignRequest(w.id, w.extended));
+        if (w.extended) {
+            frames.push_back(makeForeignRequest((w.id & ~isotp::kNormalFixedSourceAddressMask) | 0xF2u, true));
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT32(2 + VEHICLE_CL250_FUNCTIONAL_WATCH_COUNT + 1, frames.size()); // one 29-bit entry
     for (const CanFrame& f : frames) {
         MockCanBus bus;
         MockTesterLatchStore latchStore;
@@ -1213,6 +1258,7 @@ int main(int, char**) {
     RUN_TEST(test_foreign_tester_during_listen_window_latches_before_any_tx);
     RUN_TEST(test_unsolicited_ecu_answer_during_listen_window_latches);
     RUN_TEST(test_any_diagnostic_request_id_counts_as_foreign_tester);
+    RUN_TEST(test_obd_functional_request_ids_known_answer);
     RUN_TEST(test_foreign_frame_right_after_normal_mode_blocks_the_session_request);
     RUN_TEST(test_foreign_tester_latch_survives_reset);
     RUN_TEST(test_bus_off_latch_survives_reset);

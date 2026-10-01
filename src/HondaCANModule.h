@@ -104,9 +104,11 @@ private:
         unsigned long skipUntilMs;    // temporarily skipped after repeated timeouts
     };
 
-    // Same order as the generated table, which is priority ordered: engine speed (50 ms)
-    // is checked first every cycle, so a slow DID's wait can never starve it for more
-    // than one response timeout.
+    // Same order as the generated table (table order, not the D-043 poll priority):
+    // engine speed (50 ms) is checked first every cycle, so a slow DID's wait can never
+    // starve it for more than one response timeout. This temporary tester deliberately
+    // ignores vehicle_cl250_did_t.priority; the priority-first scheduler belongs to
+    // rt-core (D-043, ISSUES E-4). Changing the order here needs safety-reviewer.
     DidSlot _dids[VEHICLE_CL250_DID_COUNT];
 
     UdsRequestState _udsState = UdsRequestState::IDLE;
