@@ -18,6 +18,9 @@ cp platformio_local.ini.example platformio_local.ini   # set your own AP passwor
 pio run -e esp32-s3-devkitc-1          # real CAN/UDS
 pio run -e esp32-s3-devkitc-1-mock     # synthetic telemetry, no ECU needed
 pio test -e native                     # host tests (or: scripts/native_tests.sh)
+cppcheck --std=c++11 --enable=warning,performance,portability --error-exitcode=1 \
+  --inline-suppr --suppress=missingIncludeSystem \
+  -I src -I external/moto-vehicle-defs/gen/c/conn src   # blocking in CI (D-046)
 ```
 
 Toolchain: PlatformIO, `framework = arduino, espidf` (Arduino-ESP32 2.0.x on ESP-IDF 4.4), board `esp32-s3-devkitc-1`.

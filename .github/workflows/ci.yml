@@ -7,7 +7,8 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Pinned, like the cppcheck cache key below.
+    runs-on: ubuntu-24.04
     steps:
       # moto-vehicle-defs is public (D-033): the submodule needs no secret.
       - uses: actions/checkout@v4
@@ -21,6 +22,64 @@ jobs:
           tag=$(git -C external/moto-vehicle-defs tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
           test -n "$tag" || { echo "::error::external/moto-vehicle-defs is not pinned to a vX.Y.Z release tag"; exit 1; }
           echo "defs pin: $tag"
+
+      # Same cppcheck as moto-vehicle-defs: 2.22.0, built once and cached. Ubuntu's apt
+      # cppcheck (2.13) grades some checks differently, so local and CI runs would disagree.
+      - name: Restore cppcheck 2.22.0
+        id: cppcheck
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/cppcheck
+          key: cppcheck-2.22.0-ubuntu-24.04
+
+      - name: Build cppcheck 2.22.0
+        if: steps.cppcheck.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: |
+          git clone --quiet --depth 1 --branch 2.22.0 https://github.com/danmar/cppcheck.git "$RUNNER_TEMP/cppcheck-src"
+          cmake -S "$RUNNER_TEMP/cppcheck-src" -B "$RUNNER_TEMP/cppcheck-build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/cppcheck-build" -j "$(nproc)"
+          cp -r "$RUNNER_TEMP/cppcheck-build/bin" ~/cppcheck
+
+      - name: Save cppcheck 2.22.0
+        if: steps.cppcheck.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/cppcheck
+          key: cppcheck-2.22.0-ubuntu-24.04
+
+      - name: Use cppcheck 2.22.0
+        run: |
+          echo "$HOME/cppcheck" >> "$GITHUB_PATH"
+          "$HOME/cppcheck/cppcheck" --version
+
+      # D-046 item 3: warning/portability/performance findings block. The ESP-IDF and
+      # Arduino headers are not on the include path, so they are never analysed.
+      - name: Static analysis (cppcheck, blocking)
+        run: |
+          cppcheck --std=c++11 --enable=warning,performance,portability \
+            --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem \
+            -I src -I external/moto-vehicle-defs/gen/c/conn src
+
+      # D-046 item 3: the MISRA C:2012 addon only reports here. conn is temporary and not
+      # safety-related; its vehicle-bus safety rests on the gen/c gates, which are
+      # MISRA-checked in moto-vehicle-defs, and on tester_policy. conn is C++, so the C:2012
+      # rules are indicative only. misra-config (identifiers from the absent ESP-IDF headers,
+      # C++ keywords) and external/ (checked in moto-vehicle-defs) are left out.
+      - name: MISRA C:2012 + style report (cppcheck, non-blocking)
+        continue-on-error: true
+        run: |
+          cppcheck --std=c++11 --enable=style --addon=misra --inline-suppr --quiet \
+            --suppress=missingIncludeSystem --suppress=misra-config '--suppress=*:*external/*' \
+            --template='{file}:{line}:{column}: {severity}: {message} [{id}]' \
+            -I src -I external/moto-vehicle-defs/gen/c/conn src 2> misra-report.txt
+          cat misra-report.txt
+          {
+            echo "### MISRA C:2012 + style report (non-blocking, D-046): $(wc -l < misra-report.txt) findings"
+            echo '```'
+            cat misra-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-python@v5
         with:
