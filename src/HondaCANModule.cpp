@@ -1,5 +1,6 @@
 #include "HondaCANModule.h"
-#include "uds_iso14229.h"
+#include "IsoTpCan.h"
+#include "uds_iso14229.h" // generated: D-040 client subset (gen/c/conn/)
 
 namespace {
 // Typed copies of the generated timing macros, so min()/comparisons see one type.
@@ -44,6 +45,17 @@ const char* latchReasonText(TesterLatchReason reason) {
         case TesterLatchReason::BUS_OFF: return "too many bus-off events";
         case TesterLatchReason::UNKNOWN: return "latch record invalid after a reset";
         default: return "not latched";
+    }
+}
+
+// NRC name for logs only. Only the NRCs the generated client subset names (D-040);
+// the log line always carries the raw code as well.
+const char* nrcName(uint8_t nrc) {
+    switch (nrc) {
+        case UDS_NRC_RESPONSE_PENDING: return "responsePending";
+        case UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION: return "subFunctionNotSupportedInActiveSession";
+        case UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION: return "serviceNotSupportedInActiveSession";
+        default: return "other";
     }
 }
 
@@ -106,7 +118,7 @@ bool HondaCANModule::begin() {
 
 bool HondaCANModule::sendFrame(uint32_t id, const uint8_t* request, uint8_t len) {
     CanFrame frame;
-    frame.extended = uds::isExtendedId(id);
+    frame.extended = isotp::isExtendedId(id);
     frame.id = id;
     frame.dlc = VEHICLE_CL250_FRAME_DLC;
     frame.data[0] = len; // ISO-TP single-frame PCI
@@ -117,7 +129,7 @@ bool HondaCANModule::sendFrame(uint32_t id, const uint8_t* request, uint8_t len)
     // D-021: only the ECU's own request IDs; D-020: only allow-listed services, Single
     // Frames only. The generated guard is the last word on what may reach the vehicle bus.
     bool idAllowed = (id == VEHICLE_CL250_REQUEST_ID) || (id == VEHICLE_CL250_FALLBACK_REQUEST_ID);
-    if (!idAllowed || len == 0 || len > uds::kIsoTpSingleFrameMaxLen ||
+    if (!idAllowed || len == 0 || len > isotp::kSingleFrameMaxLen ||
         !vehicle_cl250_frame_allowed(frame.data, frame.dlc)) {
         _blockedFrames++;
         Serial.printf("[UDS BLOCKED] Frame 0x%08lX [%02X %02X %02X] refused by the D-020 guard (total=%lu).\n",
@@ -133,7 +145,7 @@ void HondaCANModule::sendRequest(const uint8_t* request, uint8_t len) {
 }
 
 void HondaCANModule::requestDID(uint16_t did) {
-    const uint8_t request[] = {uds::kSidReadDataByIdentifier, (uint8_t)((did >> 8) & 0xFF), (uint8_t)(did & 0xFF)};
+    const uint8_t request[] = {UDS_SID_READ_DATA_BY_IDENTIFIER, (uint8_t)((did >> 8) & 0xFF), (uint8_t)(did & 0xFF)};
     sendRequest(request, sizeof(request));
 }
 
@@ -407,19 +419,25 @@ void HondaCANModule::listenStep(SystemState& state, unsigned long now) {
 bool HondaCANModule::isForeignTesterFrame(const CanFrame& f) {
     // Our ECU's physical request ID from any source address (29-bit normal fixed
     // addressing 0x18DA<TA><SA>), or exactly the ID when it is an 11-bit one.
-    const bool primaryExtended = uds::isExtendedId(VEHICLE_CL250_REQUEST_ID);
-    const uint32_t primaryMask = primaryExtended ? ~uds::kNormalFixedSourceAddressMask : 0xFFFFFFFFu;
+    const bool primaryExtended = isotp::isExtendedId(VEHICLE_CL250_REQUEST_ID);
+    const uint32_t primaryMask = primaryExtended ? ~isotp::kNormalFixedSourceAddressMask : 0xFFFFFFFFu;
     if (f.extended == primaryExtended && (f.id & primaryMask) == (VEHICLE_CL250_REQUEST_ID & primaryMask)) {
         return true;
     }
-    if (f.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_REQUEST_ID) && f.id == VEHICLE_CL250_FALLBACK_REQUEST_ID) {
+    if (f.extended == isotp::isExtendedId(VEHICLE_CL250_FALLBACK_REQUEST_ID) && f.id == VEHICLE_CL250_FALLBACK_REQUEST_ID) {
         return true;
     }
-    // ISO 15765-4 functional (broadcast) requests from a generic OBD tester.
-    if (!f.extended && f.id == uds::kFunctionalRequestId11) {
-        return true;
+    // Q-021/D-040: the watch-only OBD functional (broadcast) request IDs of a generic OBD
+    // tester. A 29-bit entry (0x18DB<TA><SA>) matches from any source address, like the
+    // physical ID above; an 11-bit entry matches exactly.
+    for (uint8_t i = 0; i < VEHICLE_CL250_FUNCTIONAL_WATCH_COUNT; i++) {
+        const vehicle_cl250_watch_id_t& w = vehicle_cl250_functional_watch[i];
+        const uint32_t mask = w.extended ? ~isotp::kNormalFixedSourceAddressMask : 0xFFFFFFFFu;
+        if (f.extended == w.extended && (f.id & mask) == (w.id & mask)) {
+            return true;
+        }
     }
-    return f.extended && (f.id & ~uds::kNormalFixedSourceAddressMask) == uds::kFunctionalRequestId29Prefix;
+    return false;
 }
 
 // Reads incoming CAN frames. Bounded: at most kMaxRxFramesPerPass per call.
@@ -439,9 +457,9 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             return DrainResult::LATCHED;
         }
         bool isUDSResponse =
-            (rxMsg.id == VEHICLE_CL250_RESPONSE_ID && rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) ||
+            (rxMsg.id == VEHICLE_CL250_RESPONSE_ID && rxMsg.extended == isotp::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) ||
             (rxMsg.id == VEHICLE_CL250_FALLBACK_RESPONSE_ID &&
-             rxMsg.extended == uds::isExtendedId(VEHICLE_CL250_FALLBACK_RESPONSE_ID));
+             rxMsg.extended == isotp::isExtendedId(VEHICLE_CL250_FALLBACK_RESPONSE_ID));
         if (!isUDSResponse || rxMsg.dlc < 2) {
             continue;
         }
@@ -492,7 +510,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                 Serial.println("[UDS SUCCESS] Extended diagnostic session (0x10 0x03) confirmed by ECU.");
             }
             _lastGoodResponseMs = now;
-        } else if (rxMsg.data[1] == uds::kSidNegativeResponse && rxMsg.dlc >= 4) {
+        } else if (rxMsg.data[1] == UDS_SID_NEGATIVE_RESPONSE && rxMsg.dlc >= 4) {
             // G2.1 -- Negative response: [PCI][0x7F][echoed SID][NRC].
             uint8_t echoedSid = rxMsg.data[2];
             uint8_t nrc = rxMsg.data[3];
@@ -501,9 +519,9 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // Only an NRC for ReadDataByIdentifier can resolve or extend the pending DID
             // request; NRCs for 0x10/0x3E are logged and otherwise ignored.
             bool forPendingRead = (_udsState == UdsRequestState::WAITING) &&
-                                  (echoedSid == uds::kSidReadDataByIdentifier);
+                                  (echoedSid == UDS_SID_READ_DATA_BY_IDENTIFIER);
 
-            if (nrc == uds::kNrcResponsePending) {
+            if (nrc == UDS_NRC_RESPONSE_PENDING) {
                 // responsePending: the ECU is still working on the DID we're WAITING on.
                 // Reset and double the timeout, but never beyond the generated maximum
                 // total wait since the request was sent, so a 0x78 storm still times out.
@@ -521,7 +539,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             } else {
                 if (takeLogSlot(logBudget)) {
                     Serial.printf("[UDS WARNING] Negative response: SID=0x%02X NRC=0x%02X (%s) [total NRCs=%lu]\n",
-                        echoedSid, nrc, uds::nrcName(nrc), (unsigned long)_nrcCount);
+                        echoedSid, nrc, nrcName(nrc), (unsigned long)_nrcCount);
                 }
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
