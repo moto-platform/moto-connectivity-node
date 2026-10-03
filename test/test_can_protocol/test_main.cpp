@@ -33,6 +33,10 @@ static void setClock(unsigned long relativeMs) {
     test_setMillis(kT0 + relativeMs);
 }
 
+// Engine speed is the first table entry, so it is the first DID due after the session
+// request at setClock(0): one generated poll period later (110 ms since D-053).
+static const unsigned long kRpmDueMs = vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].poll_period_ms;
+
 static bool startPolling(HondaCANModule& module, SystemState& state) {
     test_setMillis(kT0 - kListenOnlyWindowMs - 10);
     if (!module.begin()) return false;
@@ -244,10 +248,10 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
     SystemState state;
     startPolling(module, state);
 
-    // Never inject any response. Drive exactly 5 send/timeout cycles for RPM (highest
-    // priority DID, 50ms cadence, 100ms base timeout) by hand, matching the module's
+    // Never inject any response. Drive exactly 5 send/timeout cycles for RPM (first
+    // table entry, generated cadence, 100ms base timeout) by hand, matching the module's
     // real IDLE->WAITING->TIMEOUT->IDLE transitions one call at a time.
-    unsigned long t = 50;
+    unsigned long t = kRpmDueMs;
     for (int cycle = 0; cycle < 5; cycle++) {
         setClock(t);
         module.update(state); // IDLE -> send RPM request -> WAITING
@@ -257,6 +261,7 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
         t += 1;
     }
     // The 5th timeout should have just triggered a 5s skip for DID VEHICLE_CL250_DID_ENGINE_SPEED.
+    const unsigned long skipStart = t - 1;
     int rpmReqsAtSkipStart = bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED);
 
     // Stay well inside the 5s cooldown and confirm RPM is never re-requested, even
@@ -266,7 +271,7 @@ void test_did_skipped_after_max_consecutive_timeouts_then_resumes(void) {
         setClock(t);
         module.update(state);
     }
-    TEST_ASSERT_TRUE(t < 5809 + 50); // sanity check we're still inside the cooldown window
+    TEST_ASSERT_TRUE(t < skipStart + VEHICLE_CL250_DID_SKIP_COOLDOWN_MS); // still inside the cooldown
     TEST_ASSERT_EQUAL(rpmReqsAtSkipStart, bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED));
 
     // Advance well past the cooldown and confirm RPM gets requested again.
@@ -477,19 +482,19 @@ void test_response_pending_storm_still_times_out(void) {
     SystemState state;
     startPolling(module, state);
     bus.clearTxLog();
-    setClock(100);
+    setClock(kRpmDueMs);
     module.update(state); // engine speed request goes out
     TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED)); // primary + fallback
     // The ECU answers 0x78 forever; the request must still end within the generated maximum.
-    unsigned long t = 100;
-    for (; t < 100 + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 400; t += 20) {
+    unsigned long t = kRpmDueMs;
+    for (; t < kRpmDueMs + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 400; t += 20) {
         setClock(t);
         bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
         module.update(state);
         if ((uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 2) break;
     }
     TEST_ASSERT_TRUE((uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 2);
-    TEST_ASSERT_TRUE(t <= 100 + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 100);
+    TEST_ASSERT_TRUE(t <= kRpmDueMs + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 100);
 }
 
 void test_nrc_for_other_service_does_not_resolve_pending_read(void) {
@@ -499,16 +504,16 @@ void test_nrc_for_other_service_does_not_resolve_pending_read(void) {
     SystemState state;
     startPolling(module, state);
     bus.clearTxLog();
-    setClock(100);
+    setClock(kRpmDueMs);
     module.update(state); // engine speed request pending
     TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED));
     size_t before = bus.txLog.size();
     // NRC for TesterPresent must not end the pending ReadDataByIdentifier early. Without
     // the fix the request completes and the next DID is requested at once.
-    setClock(110);
+    setClock(kRpmDueMs + 10);
     bus.injectRxFrame(makeNegativeResponse(VEHICLE_CL250_TESTER_PRESENT_SID, 0x12));
     module.update(state);
-    setClock(120);
+    setClock(kRpmDueMs + 20);
     module.update(state);
     TEST_ASSERT_EQUAL_UINT32(before, bus.txLog.size()); // still waiting, nothing new sent
 }
@@ -621,7 +626,7 @@ void test_health_counts_unanswered_did_requests(void) {
     HondaCANModule module(bus, latchStore);
     SystemState state;
     startPolling(module, state);
-    unsigned long t = 50;
+    unsigned long t = kRpmDueMs;
     for (int cycle = 0; cycle < 3; cycle++) {
         setClock(t);
         module.update(state); // send
