@@ -10,6 +10,12 @@ ESP32-S3 firmware of the [moto-platform](https://github.com/moto-platform) motor
 
 Signal definitions come from the `external/moto-vehicle-defs` submodule (generated `gen/c/conn/`); nothing vehicle-specific is hand-written here.
 
+### Poller timing against D-053 (temporary tester scope)
+
+- The poller takes the generated periods (speed and RPM 110 ms since D-053) and keeps one request in flight. It picks the first due DID in table order; the `priority` field and the D-050..D-052 fault rules are implemented in rt-core only, which replaces this tester (D-021).
+- Order (D-053 item 2): each `update()` drains RX before its response-timeout check (Q-018), so an answer already queued resolves its request instead of counting as a timeout.
+- Step (D-053 `client_step_max_ms` = 10 ms): the step is one `loop()` pass, which also runs the BLE, Wi-Fi, Nextion and logger modules, and its worst case is not bounded or counted at runtime. The G0.1 loop timing report (max per 10 s) is the measurement; a pass longer than 10 ms can let an answer just inside the base timeout be seen after its DID is due again. Accepted for the temporary tester until rt-core polls; a measured worst case above 10 ms needs a conn change or a larger defs value.
+
 ## Build and test
 
 ```bash

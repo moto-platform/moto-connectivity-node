@@ -136,14 +136,14 @@ void test_build_packet_from_fresh_state(void) {
 
 void test_build_packet_flags_follow_staleness(void) {
     SystemState state = freshState(10000);
-    // Just past engine speed's generated stale_after_ms: RPM is stale, vehicle speed
-    // (longer stale_after_ms) is still valid.
-    uint32_t rpmStale = vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].stale_after_ms;
-    TEST_ASSERT_TRUE(rpmStale < vehicle_cl250_dids[VEHICLE_CL250_IDX_VEHICLE_SPEED].stale_after_ms);
-    test_setMillis(10000 + rpmStale + 1);
+    // Just past vehicle speed's generated stale_after_ms: speed is stale, engine speed
+    // (longer stale_after_ms since D-053: 300 vs 330 ms) is still valid.
+    uint32_t speedStale = vehicle_cl250_dids[VEHICLE_CL250_IDX_VEHICLE_SPEED].stale_after_ms;
+    TEST_ASSERT_TRUE(speedStale < vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].stale_after_ms);
+    test_setMillis(10000 + speedStale + 1);
     BLETelemetryPacketV2 p = buildTelemetryPacketV2(state, 0);
-    TEST_ASSERT_EQUAL_HEX8(0, p.flags & BLE_FLAG_RPM_VALID);
-    TEST_ASSERT_EQUAL_HEX8(BLE_FLAG_SPEED_VALID, p.flags & BLE_FLAG_SPEED_VALID);
+    TEST_ASSERT_EQUAL_HEX8(0, p.flags & BLE_FLAG_SPEED_VALID);
+    TEST_ASSERT_EQUAL_HEX8(BLE_FLAG_RPM_VALID, p.flags & BLE_FLAG_RPM_VALID);
     // Never received at all -> invalid, and ECU absent.
     SystemState empty;
     p = buildTelemetryPacketV2(empty, 0);
