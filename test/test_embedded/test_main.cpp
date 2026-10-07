@@ -21,7 +21,7 @@ void test_system_state_initialization(void) {
 }
 
 void test_ble_telemetry_packet_packing(void) {
-    // G3.3 -- low-MTU fallback layout per docs/ble_telemetry_packet_schema.json
+    // G3.3 -- low-MTU fallback layout per moto-vehicle-defs ble/ble_schema.json (D-061)
     // `lowMtuFallback` (version 2, 16 bytes). Version 3 is covered by the native tests.
     BLETelemetryPacketV2 packet;
     packet.version = BLE_PACKET_VERSION_LEGACY;

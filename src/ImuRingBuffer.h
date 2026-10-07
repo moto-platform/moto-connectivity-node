@@ -5,7 +5,7 @@
 #include <atomic>
 
 // One raw IMU sample, taken at a 100 Hz timer tick (ImuModule). Raw int16 counts in the
-// scale given by docs/ble_telemetry_packet_schema.json `imuBlock.scale`.
+// scale given by moto-vehicle-defs ble/ble_schema.json `imuBlock.scale` (BLE_IMU_ACCEL_LSB_PER_G, D-061).
 struct ImuSample {
     uint32_t index = 0;   // timer tick index; consecutive samples differ by exactly 1
     uint32_t timeMs = 0;  // node clock (millis()) of that tick

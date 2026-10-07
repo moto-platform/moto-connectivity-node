@@ -61,7 +61,8 @@ private:
     bool _oldDeviceConnected = false;
     unsigned long _disconnectedAtMs = 0;
     unsigned long _lastNotify = 0;
-    uint8_t _txSeq = 0;  // G3.3 -- rolling telemetry sequence counter (v2 and v3 share it)
+    uint8_t _txSeq = 0;  // G3.3 -- rolling telemetry sequence counter (v2 and v4 share it)
+    uint8_t _rttIndex = 0; // D-058 -- DID table index of the next telemetry packet's round-trip record
     uint8_t _imuSeq = 0; // rolling IMU block counter
     bool _imuDue = false;
     uint16_t _loggedMtu = 0;

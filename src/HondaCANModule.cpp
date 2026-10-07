@@ -177,6 +177,9 @@ void HondaCANModule::storeValue(SystemState& state, uint8_t didIndex, float valu
 }
 
 void HondaCANModule::update(SystemState& state) {
+    // D-058 item 2: every entry counts, also in the listen window and when latched (the step
+    // still runs). micros() wraps at 2^32 us; TesterStatsTracker subtracts wrap-safely.
+    _tester.onStepEntry((uint32_t)micros());
     poll(state);
     publishHealth(state);
 }
@@ -185,6 +188,8 @@ void HondaCANModule::update(SystemState& state) {
 // transmits and never changes the poller state; once latched off the driver is gone,
 // so the counters stay frozen at their last values.
 void HondaCANModule::publishHealth(SystemState& state) {
+    state.tester = _tester.stats();
+    state.tester.available = true;
     CanHealth& h = state.can;
     h.flags = CAN_HEALTH_FLAG_POLLER_ENABLED;
     if (_latchReason == TesterLatchReason::FOREIGN_TESTER || _latchReason == TesterLatchReason::UNKNOWN) {
@@ -345,6 +350,7 @@ void HondaCANModule::poll(SystemState& state) {
                 _udsState = UdsRequestState::WAITING;
                 _requestSentMs = now;
                 _requestFirstSentMs = now;
+                _pendingSawNrc78 = false;
                 _responseTimeoutMs = kResponseTimeoutMs;
                 break; // exactly one request in flight at a time
             }
@@ -498,6 +504,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
 
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
+                recordRoundTrip(now);
                 _udsState = UdsRequestState::COMPLETE;
             }
             _lastGoodResponseMs = now; // G2.3: any DID response proves the ECU is present
@@ -522,6 +529,10 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                                   (echoedSid == UDS_SID_READ_DATA_BY_IDENTIFIER);
 
             if (nrc == UDS_NRC_RESPONSE_PENDING) {
+                if (forPendingRead && !_pendingSawNrc78 && _pendingDidIndex >= 0) {
+                    _pendingSawNrc78 = true; // D-058: once per request, and no round-trip sample
+                    _tester.recordNrc78((uint8_t)_pendingDidIndex);
+                }
                 // responsePending: the ECU is still working on the DID we're WAITING on.
                 // Reset and double the timeout, but never beyond the generated maximum
                 // total wait since the request was sent, so a 0x78 storm still times out.
@@ -544,12 +555,22 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
                 if (forPendingRead) {
+                    recordRoundTrip(now);
                     _udsState = UdsRequestState::COMPLETE;
                 }
             }
         }
     }
     return DrainResult::BACKLOG;
+}
+
+// D-058 item 1: the pending request was resolved at `now` by a positive response or an NRC
+// other than 0x78. Time from its (first) send to this drain; none after a 0x78.
+void HondaCANModule::recordRoundTrip(unsigned long now) {
+    if (_pendingSawNrc78 || _pendingDidIndex < 0) {
+        return;
+    }
+    _tester.recordRoundTrip((uint8_t)_pendingDidIndex, (uint32_t)(now - _requestFirstSentMs));
 }
 
 void HondaCANModule::latchOff(TesterLatchReason reason, const char* why) {

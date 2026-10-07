@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <algorithm>
+#include <string>
 
 // SystemState.h's isStale() calls millis(). Tests control the fake clock directly
 // instead of sleeping in real time, so results are deterministic.
@@ -31,6 +32,22 @@ inline unsigned long millis() {
 // clock explicitly, e.g. to simulate "500ms have passed since the last update".
 inline void test_setMillis(unsigned long ms) {
     native_millis_ref() = ms;
+}
+
+// micros() is driven the same way (HondaCANModule's step gap, CanCaptureModule's clock). Like
+// the real Arduino-ESP32 on a 32-bit target it returns a value that wraps at 2^32; tests pass
+// values below that.
+inline unsigned long& native_micros_ref() {
+    static unsigned long fakeMicros = 0;
+    return fakeMicros;
+}
+
+inline unsigned long micros() {
+    return native_micros_ref();
+}
+
+inline void test_setMicros(unsigned long us) {
+    native_micros_ref() = us;
 }
 
 // No real hardware timing to respect on the host -- a no-op keeps tests fast and
@@ -51,6 +68,15 @@ using std::max;
 // purely so those calls compile and don't crash on the host.
 struct NativeSerialStub {
     void println(const char* s) { std::puts(s); }
+    // Raw byte output (CanCaptureModule): captured for the tests instead of printed, with a
+    // settable free-space value standing in for HardwareSerial::availableForWrite().
+    std::string written;
+    int room = 1 << 20;
+    int availableForWrite() { return room; }
+    size_t write(const uint8_t* data, size_t len) {
+        written.append(reinterpret_cast<const char*>(data), len);
+        return len;
+    }
     void printf(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);

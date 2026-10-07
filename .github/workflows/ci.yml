@@ -97,11 +97,6 @@ jobs:
       - name: Run native unit tests
         run: pio test -e native
 
-      # D-032: the telemetry v3/v2 structs and the IMU block packer must match
-      # docs/ble_telemetry_packet_schema.json field by field (g++ probe, no device).
-      - name: Check BLE layouts against the schema
-        run: python3 scripts/check_ble_schema.py
-
       # The Bluedroid build needs the BLE 4.2 feature set (legacy advertising/GATT API used
       # by BLEServerModule); sdkconfig.defaults must keep it.
       - name: Check required sdkconfig options
@@ -122,3 +117,11 @@ jobs:
 
       - name: Build firmware (poller off, D-021)
         run: pio run -e esp32-s3-devkitc-1-no-tester
+
+      - name: Build firmware (listen-only CAN capture, D-058)
+        run: pio run -e esp32-s3-devkitc-1-listen-only
+
+      # D-058 item 4 / D-037: the capture firmware links no TWAI transmit code; the tester
+      # ELF is the positive control.
+      - name: Listen-only firmware has no TWAI transmit
+        run: scripts/check_no_twai_tx.sh

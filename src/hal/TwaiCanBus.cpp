@@ -1,3 +1,7 @@
+// The listen-only capture build (D-058 item 4, CONN_CAN_LISTEN_ONLY) must not contain
+// code that can transmit: nothing of this file is compiled there.
+#if !defined(CONN_CAN_LISTEN_ONLY) || !CONN_CAN_LISTEN_ONLY
+
 #include "TwaiCanBus.h"
 #include "driver/gpio.h"
 
@@ -125,3 +129,5 @@ void TwaiCanBus::stop() {
     gpio_config(&io);
     gpio_set_level(_txPin, 1);
 }
+
+#endif // !CONN_CAN_LISTEN_ONLY

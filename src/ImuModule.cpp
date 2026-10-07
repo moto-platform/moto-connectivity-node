@@ -2,6 +2,8 @@
 
 #include <driver/i2c.h>
 
+#include "ble_schema.h" // generated (D-061): the IMU scale published to receivers
+
 namespace {
 
 // Wiring of the legacy port (GPIO 1/2 are free since the complementary filter was dropped).
@@ -26,9 +28,12 @@ const uint8_t kPwrReset = 0x80;
 const uint8_t kPwrClockPllGyroX = 0x01; // also clears SLEEP (the power-on default is asleep)
 const uint8_t kSmplrtDiv1kHz = 0x00;    // internal 1 kHz; we read the latest value at 100 Hz
 const uint8_t kConfigDlpf44Hz = 0x03;   // anti-alias below the 50 Hz Nyquist of our 100 Hz reads
-const uint8_t kGyroFs500Dps = 0x08;     // FS_SEL=1: 65.5 LSB/(deg/s), schema imuBlock.scale.gyro
-const uint8_t kAccelFs8g = 0x10;        // AFS_SEL=2: 4096 LSB/g, schema imuBlock.scale.accel
+const uint8_t kGyroFs500Dps = 0x08;     // FS_SEL=1: 65.5 LSB/(deg/s), ble_schema.json imuBlock.scale.gyro
+const uint8_t kAccelFs8g = 0x10;        // AFS_SEL=2: 4096 LSB/g, ble_schema.json imuBlock.scale.accel
 const uint8_t kFullScaleMask = 0x18;    // FS_SEL / AFS_SEL bits (self-test bits ignored)
+// The full-scale registers above must give the scale the schema tells receivers (D-061).
+static_assert(BLE_IMU_ACCEL_LSB_PER_G == 4096u, "kAccelFs8g must match the schema accel scale");
+static_assert(BLE_IMU_GYRO_LSB_PER_DPS_X10 == 655u, "kGyroFs500Dps must match the schema gyro scale");
 
 // WHO_AM_I of register-compatible parts: MPU-6050, MPU-6500, MPU-9250, MPU-9255.
 bool isKnownWhoAmI(uint8_t id) { return id == 0x68 || id == 0x70 || id == 0x71 || id == 0x73; }
