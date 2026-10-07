@@ -110,11 +110,29 @@ void setup() {
     }
 }
 
+// The Arduino loop task (priority 1, core 1) never yields by itself, and the task watchdog
+// also watches core 1's idle task (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1): a loop that
+// only polls would starve it and reset the board after TWDT_TIMEOUT_S. So each pass waits
+// up to CAPTURE_WAIT_MS for the next frame, blocked (the idle task runs; a frame wakes the
+// loop at once, so the timestamps keep their precision). A bus so busy that the queue never
+// empties still gets a one-tick delay every CAPTURE_FORCED_YIELD_MS; the 64-slot queue holds
+// about 8 ms of a fully loaded 500 kbps bus.
+const uint32_t CAPTURE_WAIT_MS = 1;
+const uint32_t CAPTURE_FORCED_YIELD_MS = 1000;
+uint32_t lastYieldMs = 0;
+
 void loop() {
     if (captureActive) {
         captureModule.update(globalState);
     }
     esp_task_wdt_reset();
+    const uint32_t now = millis();
+    if (canRx.waitForFrame(CAPTURE_WAIT_MS)) {
+        lastYieldMs = now;
+    } else if (now - lastYieldMs >= CAPTURE_FORCED_YIELD_MS) {
+        vTaskDelay(1);
+        lastYieldMs = now;
+    }
 }
 #else // normal builds
 

@@ -16,6 +16,14 @@ Signal definitions come from the `external/moto-vehicle-defs` submodule (generat
 - Order (D-053 item 2): each `update()` drains RX before its response-timeout check (Q-018), so an answer already queued resolves its request instead of counting as a timeout.
 - Step (D-053 `client_step_max_ms` = 10 ms): the step is one `loop()` pass, which also runs the BLE, Wi-Fi, Nextion and logger modules, and its worst case is not bounded or counted at runtime. The G0.1 loop timing report (max per 10 s) is the measurement; a pass longer than 10 ms can let an answer just inside the base timeout be seen after its DID is due again. Accepted for the temporary tester until rt-core polls; a measured worst case above 10 ms needs a conn change or a larger defs value.
 
+### Measurement tools (D-058)
+
+- **Round trip per DID** (BLE v4, `TesterStatsTracker`): from the request's send to the step that drains its answer, so one step is included. A request answered after NRC 0x78 counts in `nrc78` and gives no sample. A request sent within `RESPONSE_TIMEOUT_MAX_MS` (2000 ms, gen/) after any timeout gives no sample either: the timed-out request's answer may still arrive and resolve it early (a positive answer for the next read of the same DID, an NRC, which carries no DID, for any read), which would make the minimum too low; a 0x78 in that window is not counted in `nrc78` either. An ECU answering later than that is outside its own P2* limit and not covered. The counters never change request timing, order, the gate or the latch (native test compares every sent frame and its pass).
+- **Step gap**: every `update()` entry of the poller, also in the listen window and when latched.
+- **TWAI listen-only on the ESP32-S3** (capture env and the tester's 2 s listen window): the controller still sends a dominant error flag on a bus error in listen-only mode unless `CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM=y` (set in `sdkconfig.defaults`; CI checks it and the built `sdkconfig.h` of the tester and capture envs). The workaround holds REC at 128 (error passive, recessive bits only) while listen-only runs, so BLE health reports `canRxErrorCount` 128 and ERROR_WARNING during the tester's listen window at boot. The switch to normal mode reinstalls the driver, which starts error active with TEC = REC = 0 (IDF 4.4.7 `twai_hal_start`).
+- **Capture loop**: each pass waits up to 1 ms for the next frame (blocked, so core 1's idle task runs and the task watchdog does not reset the board), with a forced one-tick delay at least once a second when the queue never empties.
+- **Bench checks still to do (hardware)**: HIL sends a frame with a corrupted CRC while a scope on the bus shows no dominant error flag from conn (capture env and tester listen window); 10 min of listen-only capture without a task-watchdog reset and with the `FINAL` summary at 300 s.
+
 ## Build and test
 
 ```bash

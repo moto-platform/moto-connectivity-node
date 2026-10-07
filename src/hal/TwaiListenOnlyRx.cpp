@@ -3,6 +3,8 @@
 #if defined(CONN_CAN_LISTEN_ONLY) && CONN_CAN_LISTEN_ONLY
 
 #include "TwaiListenOnlyRx.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 // Deeper than the IDF default (5): a loop pass with a serial write must not lose frames.
@@ -32,17 +34,46 @@ bool TwaiListenOnlyRx::begin() {
     return true;
 }
 
+void TwaiListenOnlyRx::copyFrame(const twai_message_t& msg, CanFrame& frame) {
+    frame.id = msg.identifier;
+    frame.extended = msg.extd != 0;
+    frame.dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
+    for (int i = 0; i < 8; i++) {
+        frame.data[i] = msg.data[i];
+    }
+}
+
 bool TwaiListenOnlyRx::receive(CanFrame& frame) {
+    if (_held) {
+        _held = false;
+        copyFrame(_heldMsg, frame);
+        return true;
+    }
     twai_message_t rxMsg;
     if (!_installed || twai_receive(&rxMsg, 0) != ESP_OK) {
         return false;
     }
-    frame.id = rxMsg.identifier;
-    frame.extended = rxMsg.extd != 0;
-    frame.dlc = rxMsg.data_length_code > 8 ? 8 : rxMsg.data_length_code;
-    for (int i = 0; i < 8; i++) {
-        frame.data[i] = rxMsg.data[i];
+    copyFrame(rxMsg, frame);
+    return true;
+}
+
+bool TwaiListenOnlyRx::waitForFrame(uint32_t timeoutMs) {
+    if (_held) {
+        return false;
     }
+    if (!_installed) {
+        vTaskDelay(pdMS_TO_TICKS(timeoutMs));
+        return true;
+    }
+    if (twai_receive(&_heldMsg, 0) == ESP_OK) {
+        _held = true;
+        return false; // a frame was already queued: no wait
+    }
+    TickType_t ticks = pdMS_TO_TICKS(timeoutMs);
+    if (ticks == 0) {
+        ticks = 1;
+    }
+    _held = twai_receive(&_heldMsg, ticks) == ESP_OK;
     return true;
 }
 

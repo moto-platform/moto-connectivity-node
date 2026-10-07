@@ -351,6 +351,7 @@ void HondaCANModule::poll(SystemState& state) {
                 _requestSentMs = now;
                 _requestFirstSentMs = now;
                 _pendingSawNrc78 = false;
+                _pendingRttSkip = beforeDeadline(now, _rttQuietUntilMs);
                 _responseTimeoutMs = kResponseTimeoutMs;
                 break; // exactly one request in flight at a time
             }
@@ -365,6 +366,9 @@ void HondaCANModule::poll(SystemState& state) {
         DidSlot& slot = _dids[_pendingDidIndex];
         slot.consecutiveTimeouts++;
         _unansweredDidCount++;
+        // D-058: the timed-out request's answer may still come and resolve a later request
+        // early (see recordRoundTrip()); statistics only, the schedule is unchanged.
+        _rttQuietUntilMs = now + kResponsePendingMaxMs;
         Serial.printf("[UDS WARNING] Timeout waiting for DID 0x%04X (consecutive=%u/%u)\n",
             _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts);
 
@@ -531,7 +535,11 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             if (nrc == UDS_NRC_RESPONSE_PENDING) {
                 if (forPendingRead && !_pendingSawNrc78 && _pendingDidIndex >= 0) {
                     _pendingSawNrc78 = true; // D-058: once per request, and no round-trip sample
-                    _tester.recordNrc78((uint8_t)_pendingDidIndex);
+                    if (!_pendingRttSkip) {
+                        // In the quiet window after a timeout this 0x78 (no DID) may be the
+                        // timed-out read's: not counted against the pending DID.
+                        _tester.recordNrc78((uint8_t)_pendingDidIndex);
+                    }
                 }
                 // responsePending: the ECU is still working on the DID we're WAITING on.
                 // Reset and double the timeout, but never beyond the generated maximum
@@ -566,8 +574,13 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
 
 // D-058 item 1: the pending request was resolved at `now` by a positive response or an NRC
 // other than 0x78. Time from its (first) send to this drain; none after a 0x78.
+// None either for a request sent within kResponsePendingMaxMs after a timeout: the answer
+// to the timed-out request may arrive late and resolve it early, which would record a
+// too-short sample (a positive answer echoes its DID, so for the next request of the same
+// DID; an NRC carries no DID, so for any DID read). An ECU answer later than the generated
+// maximum wait is outside the ECU's own P2* limit and not covered.
 void HondaCANModule::recordRoundTrip(unsigned long now) {
-    if (_pendingSawNrc78 || _pendingDidIndex < 0) {
+    if (_pendingSawNrc78 || _pendingRttSkip || _pendingDidIndex < 0) {
         return;
     }
     _tester.recordRoundTrip((uint8_t)_pendingDidIndex, (uint32_t)(now - _requestFirstSentMs));

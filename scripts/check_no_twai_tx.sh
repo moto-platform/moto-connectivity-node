@@ -3,6 +3,10 @@
 # can never become a second tester on the vehicle bus (D-037). Checks the built ELFs:
 #   - esp32-s3-devkitc-1-listen-only: no twai_transmit symbol
 #   - esp32-s3-devkitc-1 (the tester): has it, so the check is not vacuous
+# A missing TX API alone does not keep the bus untouched: in listen-only mode the ESP32-S3
+# still sends a dominant error flag on a bus error unless the IDF errata workaround is
+# compiled in. Both builds use listen-only (the capture, and the tester's Q-018 window), so
+# both generated sdkconfig.h files must enable CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM.
 # Run after `pio run` of both envs.
 set -euo pipefail
 
@@ -25,6 +29,18 @@ symbols() {
 listen_only=$(symbols esp32-s3-devkitc-1-listen-only | grep -c 'twai_transmit' || true)
 tester=$(symbols esp32-s3-devkitc-1 | grep -c 'twai_transmit' || true)
 
+for env in esp32-s3-devkitc-1-listen-only esp32-s3-devkitc-1; do
+    cfg="$ROOT/.pio/build/$env/config/sdkconfig.h"
+    if [ ! -f "$cfg" ]; then
+        echo "missing $cfg -- run: pio run -e $env" >&2
+        exit 1
+    fi
+    if ! grep -qx '#define CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM 1' "$cfg"; then
+        echo "$env: CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM is not enabled (listen-only would send dominant error flags)" >&2
+        exit 1
+    fi
+done
+
 if [ "$tester" -eq 0 ]; then
     echo "positive control failed: the tester ELF has no twai_transmit symbol" >&2
     exit 1
@@ -33,4 +49,4 @@ if [ "$listen_only" -ne 0 ]; then
     echo "the listen-only ELF contains twai_transmit ($listen_only symbol lines)" >&2
     exit 1
 fi
-echo "listen-only ELF: no twai_transmit; tester ELF: $tester twai_transmit symbol line(s)"
+echo "listen-only ELF: no twai_transmit; tester ELF: $tester twai_transmit symbol line(s); listen-only errata workaround on in both"

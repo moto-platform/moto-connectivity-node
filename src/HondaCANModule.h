@@ -124,6 +124,8 @@ private:
     unsigned long _requestSentMs = 0;
     unsigned long _requestFirstSentMs = 0; // first send of the pending request (0x78 cap, round trip)
     bool _pendingSawNrc78 = false;         // the pending request got NRC 0x78: no round-trip sample
+    bool _pendingRttSkip = false;          // sent in the quiet window after a timeout: no sample
+    unsigned long _rttQuietUntilMs = 0;    // end of that window (0 = none), see recordRoundTrip()
     unsigned long _responseTimeoutMs = 0;
 
     // ------------------------------------------------------------------
@@ -164,7 +166,8 @@ private:
     // Copies bus/tester counters into state.can and state.tester; read-only, never transmits.
     void publishHealth(SystemState& state);
 
-    // Round-trip sample for the pending request, unless it saw NRC 0x78 (D-058).
+    // Round-trip sample for the pending request, unless it saw NRC 0x78 or was sent in the
+    // quiet window after a timeout (D-058).
     void recordRoundTrip(unsigned long now);
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);

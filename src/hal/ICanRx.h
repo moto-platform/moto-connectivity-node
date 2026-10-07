@@ -17,7 +17,9 @@ public:
 
     /**
      * @brief Installs and starts the peripheral in listen-only (bus monitoring) mode with
-     * an accept-all filter: no ACK, no error frames, no data frames.
+     * an accept-all filter: no ACK, no error frames, no data frames. "No error frames"
+     * relies on CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM (sdkconfig.defaults, checked in CI):
+     * without it the ESP32-S3 still sends a dominant error flag on a bus error.
      * @return true on success.
      */
     virtual bool begin() = 0;
