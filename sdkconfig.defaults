@@ -18,5 +18,14 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # Arduino BLE library uses the legacy (4.2) advertising API; ESP32-S3 defaults to 5.0-only.
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 
+# D-058 item 4 / Q-018 / D-037: TWAI listen-only must never drive the bus. In listen-only
+# mode the ESP32-S3 controller still sends a dominant error flag when it detects a bus error
+# (Espressif errata, IDF 4.4.7 components/driver/Kconfig). The workaround sets REC = 128 when
+# twai_start() enters listen-only mode (hal/twai_hal.c), so the controller is error passive
+# and sends recessive bits only; REC stays frozen in that mode. It covers the capture env
+# and the tester's listen window. The tester then reinstalls the driver in normal mode,
+# which starts with TEC = REC = 0. CI checks this line and the built sdkconfig.h.
+CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM=y
+
 # ImuModule creates its sampler task with a static stack/TCB (no heap).
 CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y

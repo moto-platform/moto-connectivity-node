@@ -56,8 +56,9 @@ struct TelematicsData {
 };
 
 // Vehicle-bus CAN/tester health, written by the CAN producer (HondaCANModule) and sent
-// in BLE telemetry v3 (docs/ble_telemetry_packet_schema.json `canHealth`). The numeric
-// values of CanHealthState and the CAN_HEALTH_FLAG_* bits are part of that schema.
+// in BLE telemetry v4 (moto-vehicle-defs ble/ble_schema.json, D-061). The numeric values of
+// CanHealthState and the CAN_HEALTH_FLAG_* bits are part of that schema (static_assert in
+// BLETelemetryPacket.h).
 enum class CanHealthState : uint8_t {
     NOT_INSTALLED = 0, // no TWAI driver (poller-off build) or synthetic data (mock build)
     RUNNING = 1,
@@ -83,6 +84,29 @@ struct CanHealth {
     uint8_t flags = 0;               // CAN_HEALTH_FLAG_* bits
 };
 
+// D-058: statistics about the tester itself, kept by HondaCANModule and sent in BLE telemetry
+// v4. TEMPORARY like the lean fields (rt-core's health DID 0xFD02 replaces them, D-055).
+// A build without a tester (mock, poller off, listen-only) leaves `available` false.
+constexpr uint16_t TESTER_RTT_NONE_MS = 65535; // min round trip while there is no sample yet
+
+// Round trip of one DID as the tester sees it: from the request's send to the step that
+// drains its answer (positive response or an NRC other than 0x78), so it includes one step
+// and loop latency. A request that got 0x78 counts in nrc78Count and gives no sample.
+struct DidRoundTripStats {
+    uint16_t minMs = TESTER_RTT_NONE_MS; // TESTER_RTT_NONE_MS = no sample yet
+    uint16_t maxMs = 0;
+    uint32_t sumMs = 0;                  // saturating
+    uint32_t count = 0;                  // samples, saturating
+    uint16_t nrc78Count = 0;             // requests that saw NRC 0x78, saturating
+};
+
+struct TesterStats {
+    bool available = false;
+    uint16_t stepGapMaxMs = 0;     // max gap between two poller step entries since boot, ms rounded up
+    uint16_t stepGapOverCount = 0; // gaps above VEHICLE_CL250_CLIENT_STEP_MAX_MS
+    DidRoundTripStats rtt[VEHICLE_CL250_DID_COUNT]; // generated DID table order
+};
+
 /**
  * @brief State of the on-board IMU sampler (ImuModule), mirrored here by its update()
  * so consumers can see it without touching the sampler task's data.
@@ -100,6 +124,7 @@ struct ImuStatus {
 struct SystemState {
     EngineData engine;
     CanHealth can;
+    TesterStats tester;
     ImuStatus imu;
     // No lean angle here: the legacy complementary filter was dropped (D-023). Lean comes
     // from the rt-core EKF (platform.dbc LeanEstimate) once this node reads the platform bus.

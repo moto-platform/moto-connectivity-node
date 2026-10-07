@@ -23,7 +23,7 @@ fi
 OUT="$CACHE/native"
 mkdir -p "$OUT"
 status=0
-for suite in test_native test_can_protocol; do
+for suite in test_native test_can_protocol test_can_capture; do
     exe="$OUT/$suite"
     g++ -std=c++11 -pthread -Wall -Wextra -D CONN_NATIVE_TEST \
         -I "$ROOT/test/native_stubs" -I "$GEN" -I "$UNITY/src" \

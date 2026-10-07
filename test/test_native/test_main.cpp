@@ -76,8 +76,8 @@ void test_did_stale_threshold_comes_from_generated_table(void) {
 // ---------------------------------------------------------------------------
 
 void test_ble_packet_size_and_offsets(void) {
-    // Must match docs/ble_telemetry_packet_schema.json exactly. A mismatch here
-    // means the C++ struct, the schema, and the moto-mobile decoder have drifted apart.
+    // Hand-typed copy of the version 2 layout next to the generated ble_schema.h macros the
+    // header static_asserts against (D-061): a mismatch means the schema changed.
     TEST_ASSERT_EQUAL(2, BLE_PACKET_VERSION_LEGACY);
     TEST_ASSERT_EQUAL(16, sizeof(BLETelemetryPacketV2));
     TEST_ASSERT_EQUAL(0,  offsetof(BLETelemetryPacketV2, version));
@@ -177,35 +177,54 @@ void test_ble_packet_raw_byte_layout_is_little_endian(void) {
 }
 
 // ---------------------------------------------------------------------------
-// BLETelemetryPacketV3 (D-032 -- schema top-level `fields`)
+// BLETelemetryPacketV4 (D-058, D-061 -- generated ble_schema.h)
 // ---------------------------------------------------------------------------
 
-void test_ble_v3_size_and_offsets(void) {
-    TEST_ASSERT_EQUAL(3, BLE_PACKET_VERSION);
-    TEST_ASSERT_EQUAL(37, sizeof(BLETelemetryPacketV3));
-    TEST_ASSERT_EQUAL(0,  offsetof(BLETelemetryPacketV3, version));
-    TEST_ASSERT_EQUAL(1,  offsetof(BLETelemetryPacketV3, seq));
-    TEST_ASSERT_EQUAL(2,  offsetof(BLETelemetryPacketV3, deviceTimeMs));
-    TEST_ASSERT_EQUAL(6,  offsetof(BLETelemetryPacketV3, rpm));
-    TEST_ASSERT_EQUAL(8,  offsetof(BLETelemetryPacketV3, speed));
-    TEST_ASSERT_EQUAL(9,  offsetof(BLETelemetryPacketV3, coolantTemp));
-    TEST_ASSERT_EQUAL(10, offsetof(BLETelemetryPacketV3, throttlePos));
-    TEST_ASSERT_EQUAL(11, offsetof(BLETelemetryPacketV3, batteryVolt));
-    TEST_ASSERT_EQUAL(13, offsetof(BLETelemetryPacketV3, leanAngle));
-    TEST_ASSERT_EQUAL(15, offsetof(BLETelemetryPacketV3, maxLeanRight));
-    TEST_ASSERT_EQUAL(17, offsetof(BLETelemetryPacketV3, maxLeanLeft));
-    TEST_ASSERT_EQUAL(19, offsetof(BLETelemetryPacketV3, flags));
-    TEST_ASSERT_EQUAL(20, offsetof(BLETelemetryPacketV3, rpmAgeMs));
-    TEST_ASSERT_EQUAL(22, offsetof(BLETelemetryPacketV3, speedAgeMs));
-    TEST_ASSERT_EQUAL(24, offsetof(BLETelemetryPacketV3, coolantTempAgeMs));
-    TEST_ASSERT_EQUAL(26, offsetof(BLETelemetryPacketV3, throttlePosAgeMs));
-    TEST_ASSERT_EQUAL(28, offsetof(BLETelemetryPacketV3, batteryVoltAgeMs));
-    TEST_ASSERT_EQUAL(30, offsetof(BLETelemetryPacketV3, canBusState));
-    TEST_ASSERT_EQUAL(31, offsetof(BLETelemetryPacketV3, canTxErrorCount));
-    TEST_ASSERT_EQUAL(32, offsetof(BLETelemetryPacketV3, canRxErrorCount));
-    TEST_ASSERT_EQUAL(33, offsetof(BLETelemetryPacketV3, canBusOffCount));
-    TEST_ASSERT_EQUAL(34, offsetof(BLETelemetryPacketV3, unansweredDidCount));
-    TEST_ASSERT_EQUAL(36, offsetof(BLETelemetryPacketV3, canFlags));
+// Every field's offset and size against the generated macros, at run time too (the header
+// static_asserts the same at compile time).
+#define CHECK_V4_FIELD(field, MACRO) \
+    do { \
+        TEST_ASSERT_EQUAL(MACRO##_OFFSET, offsetof(BLETelemetryPacketV4, field)); \
+        TEST_ASSERT_EQUAL(MACRO##_SIZE, sizeof(((BLETelemetryPacketV4*)nullptr)->field)); \
+    } while (0)
+
+void test_ble_v4_size_and_offsets_match_the_generated_schema(void) {
+    TEST_ASSERT_EQUAL(4, BLE_PACKET_VERSION);
+    TEST_ASSERT_EQUAL(57, sizeof(BLETelemetryPacketV4));
+    TEST_ASSERT_EQUAL(BLE_TELEMETRY_V4_TOTAL_BYTES, sizeof(BLETelemetryPacketV4));
+    CHECK_V4_FIELD(version, BLE_TELEMETRY_V4_VERSION);
+    CHECK_V4_FIELD(seq, BLE_TELEMETRY_V4_SEQ);
+    CHECK_V4_FIELD(deviceTimeMs, BLE_TELEMETRY_V4_DEVICE_TIME_MS);
+    CHECK_V4_FIELD(rpm, BLE_TELEMETRY_V4_RPM);
+    CHECK_V4_FIELD(speed, BLE_TELEMETRY_V4_SPEED);
+    CHECK_V4_FIELD(coolantTemp, BLE_TELEMETRY_V4_COOLANT_TEMP);
+    CHECK_V4_FIELD(throttlePos, BLE_TELEMETRY_V4_THROTTLE_POS);
+    CHECK_V4_FIELD(batteryVolt, BLE_TELEMETRY_V4_BATTERY_VOLT);
+    CHECK_V4_FIELD(leanAngle, BLE_TELEMETRY_V4_LEAN_ANGLE);
+    CHECK_V4_FIELD(maxLeanRight, BLE_TELEMETRY_V4_MAX_LEAN_RIGHT);
+    CHECK_V4_FIELD(maxLeanLeft, BLE_TELEMETRY_V4_MAX_LEAN_LEFT);
+    CHECK_V4_FIELD(flags, BLE_TELEMETRY_V4_FLAGS);
+    CHECK_V4_FIELD(rpmAgeMs, BLE_TELEMETRY_V4_RPM_AGE_MS);
+    CHECK_V4_FIELD(speedAgeMs, BLE_TELEMETRY_V4_SPEED_AGE_MS);
+    CHECK_V4_FIELD(coolantTempAgeMs, BLE_TELEMETRY_V4_COOLANT_TEMP_AGE_MS);
+    CHECK_V4_FIELD(throttlePosAgeMs, BLE_TELEMETRY_V4_THROTTLE_POS_AGE_MS);
+    CHECK_V4_FIELD(batteryVoltAgeMs, BLE_TELEMETRY_V4_BATTERY_VOLT_AGE_MS);
+    CHECK_V4_FIELD(canBusState, BLE_TELEMETRY_V4_CAN_BUS_STATE);
+    CHECK_V4_FIELD(canTxErrorCount, BLE_TELEMETRY_V4_CAN_TX_ERROR_COUNT);
+    CHECK_V4_FIELD(canRxErrorCount, BLE_TELEMETRY_V4_CAN_RX_ERROR_COUNT);
+    CHECK_V4_FIELD(canBusOffCount, BLE_TELEMETRY_V4_CAN_BUS_OFF_COUNT);
+    CHECK_V4_FIELD(unansweredDidCount, BLE_TELEMETRY_V4_UNANSWERED_DID_COUNT);
+    CHECK_V4_FIELD(canFlags, BLE_TELEMETRY_V4_CAN_FLAGS);
+    CHECK_V4_FIELD(stepGapMaxMs, BLE_TELEMETRY_V4_STEP_GAP_MAX_MS);
+    CHECK_V4_FIELD(stepGapOverCount, BLE_TELEMETRY_V4_STEP_GAP_OVER_COUNT);
+    CHECK_V4_FIELD(rttDid, BLE_TELEMETRY_V4_RTT_DID);
+    CHECK_V4_FIELD(rttMinMs, BLE_TELEMETRY_V4_RTT_MIN_MS);
+    CHECK_V4_FIELD(rttMaxMs, BLE_TELEMETRY_V4_RTT_MAX_MS);
+    CHECK_V4_FIELD(rttSumMs, BLE_TELEMETRY_V4_RTT_SUM_MS);
+    CHECK_V4_FIELD(rttCount, BLE_TELEMETRY_V4_RTT_COUNT);
+    CHECK_V4_FIELD(rttNrc78Count, BLE_TELEMETRY_V4_RTT_NRC78_COUNT);
+    TEST_ASSERT_EQUAL(37, offsetof(BLETelemetryPacketV4, stepGapMaxMs)); // v3 ended at 37
+    TEST_ASSERT_EQUAL(55, offsetof(BLETelemetryPacketV4, rttNrc78Count));
     TEST_ASSERT_EQUAL_HEX8(0x80, BLE_FLAG_IMU_ACTIVE);
     TEST_ASSERT_EQUAL(0, (int)CanHealthState::NOT_INSTALLED);
     TEST_ASSERT_EQUAL(1, (int)CanHealthState::RUNNING);
@@ -218,8 +237,24 @@ void test_ble_v3_size_and_offsets(void) {
     TEST_ASSERT_EQUAL_HEX8(0x08, CAN_HEALTH_FLAG_SYNTHETIC_DATA);
 }
 
-void test_build_v3_packet_values_ages_and_health(void) {
+static SystemState stateWithTesterStats() {
     SystemState state = freshState(10000);
+    state.tester.available = true;
+    state.tester.stepGapMaxMs = 23;
+    state.tester.stepGapOverCount = 5;
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        DidRoundTripStats& r = state.tester.rtt[i];
+        r.minMs = (uint16_t)(10 + i);
+        r.maxMs = (uint16_t)(40 + i);
+        r.sumMs = 1000u + i;
+        r.count = 70000u + i;
+        r.nrc78Count = (uint16_t)(2 + i);
+    }
+    return state;
+}
+
+void test_build_v4_packet_values_ages_health_and_tester_stats(void) {
+    SystemState state = stateWithTesterStats();
     state.engine.speedUpdatedMs = 9950;       // 50 ms old at build time
     state.engine.coolantTempUpdatedMs = 0;    // never received
     state.imu.active = true;
@@ -230,8 +265,9 @@ void test_build_v3_packet_values_ages_and_health(void) {
     state.can.unansweredDidCount = 70000;     // saturates to 65535
     state.can.flags = CAN_HEALTH_FLAG_POLLER_ENABLED;
     test_setMillis(10000);
-    BLETelemetryPacketV3 p = buildTelemetryPacketV3(state, 9, 10000);
-    TEST_ASSERT_EQUAL_UINT8(3, p.version);
+    BLETelemetryPacketV4 p = buildTelemetryPacketV4(state, 9, 10000, 0);
+    TEST_ASSERT_EQUAL_UINT8(BLE_TELEMETRY_CURRENT_VERSION, p.version);
+    TEST_ASSERT_EQUAL_UINT8(4, p.version);
     TEST_ASSERT_EQUAL_UINT8(9, p.seq);
     TEST_ASSERT_EQUAL_UINT32(10000, p.deviceTimeMs);
     TEST_ASSERT_EQUAL_UINT16(4500, p.rpm);
@@ -251,27 +287,84 @@ void test_build_v3_packet_values_ages_and_health(void) {
     TEST_ASSERT_EQUAL_UINT8(2, p.canBusOffCount);
     TEST_ASSERT_EQUAL_UINT16(65535, p.unansweredDidCount);
     TEST_ASSERT_EQUAL_HEX8(0x01, p.canFlags);
+    // D-058: step gap + the round-trip record of DID table index 0.
+    TEST_ASSERT_EQUAL_UINT16(23, p.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(5, p.stepGapOverCount);
+    TEST_ASSERT_EQUAL_UINT16(vehicle_cl250_dids[0].did, p.rttDid);
+    TEST_ASSERT_EQUAL_UINT16(10, p.rttMinMs);
+    TEST_ASSERT_EQUAL_UINT16(40, p.rttMaxMs);
+    TEST_ASSERT_EQUAL_UINT32(1000, p.rttSumMs);
+    TEST_ASSERT_EQUAL_UINT32(70000, p.rttCount);
+    TEST_ASSERT_EQUAL_UINT16(2, p.rttNrc78Count);
 }
 
-void test_v3_age_saturates_and_valid_bit_follows_generated_stale_limit(void) {
+void test_v4_round_trip_record_rotates_through_the_did_table(void) {
+    SystemState state = stateWithTesterStats();
+    test_setMillis(10000);
+    // One DID per packet, index % DID_COUNT, so the cycle repeats and covers every DID.
+    for (uint32_t i = 0; i < 3u * VEHICLE_CL250_DID_COUNT; i++) {
+        BLETelemetryPacketV4 p = buildTelemetryPacketV4(state, 0, 10000, i);
+        uint8_t idx = (uint8_t)(i % VEHICLE_CL250_DID_COUNT);
+        TEST_ASSERT_EQUAL_UINT16(vehicle_cl250_dids[idx].did, p.rttDid);
+        TEST_ASSERT_EQUAL_UINT16(10 + idx, p.rttMinMs);
+        TEST_ASSERT_EQUAL_UINT16(40 + idx, p.rttMaxMs);
+        TEST_ASSERT_EQUAL_UINT32(1000u + idx, p.rttSumMs);
+        TEST_ASSERT_EQUAL_UINT32(70000u + idx, p.rttCount);
+        TEST_ASSERT_EQUAL_UINT16(2 + idx, p.rttNrc78Count);
+    }
+}
+
+void test_v4_without_tester_stats_sends_the_no_data_values(void) {
+    // Mock, poller-off and listen-only builds never set `available`.
+    SystemState state = freshState(10000);
+    state.tester.stepGapMaxMs = 99; // ignored without `available`
+    test_setMillis(10000);
+    for (uint32_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        BLETelemetryPacketV4 p = buildTelemetryPacketV4(state, 1, 10000, i);
+        TEST_ASSERT_EQUAL_UINT16(0, p.stepGapMaxMs);
+        TEST_ASSERT_EQUAL_UINT16(0, p.stepGapOverCount);
+        TEST_ASSERT_EQUAL_UINT16(0, p.rttDid);
+        TEST_ASSERT_EQUAL_UINT16(65535, p.rttMinMs);
+        TEST_ASSERT_EQUAL_UINT16(0, p.rttMaxMs);
+        TEST_ASSERT_EQUAL_UINT32(0, p.rttSumMs);
+        TEST_ASSERT_EQUAL_UINT32(0, p.rttCount);
+        TEST_ASSERT_EQUAL_UINT16(0, p.rttNrc78Count);
+    }
+}
+
+void test_v4_tester_without_a_sample_yet_keeps_the_no_sample_markers(void) {
+    // A tester that has not answered yet: a record exists (rttDid != 0), min 65535, max 0.
+    SystemState state = freshState(10000);
+    state.tester.available = true;
+    test_setMillis(10000);
+    BLETelemetryPacketV4 p = buildTelemetryPacketV4(state, 0, 10000, 2);
+    TEST_ASSERT_EQUAL_UINT16(vehicle_cl250_dids[2].did, p.rttDid);
+    TEST_ASSERT_EQUAL_UINT16(65535, p.rttMinMs);
+    TEST_ASSERT_EQUAL_UINT16(0, p.rttMaxMs);
+    TEST_ASSERT_EQUAL_UINT32(0, p.rttCount);
+}
+
+void test_v4_age_saturates_and_valid_bit_follows_generated_stale_limit(void) {
     SystemState state = freshState(1000);
     uint32_t rpmStale = vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].stale_after_ms;
     test_setMillis(1000 + rpmStale + 1);
-    BLETelemetryPacketV3 p = buildTelemetryPacketV3(state, 0, 1000 + rpmStale + 1);
+    BLETelemetryPacketV4 p = buildTelemetryPacketV4(state, 0, 1000 + rpmStale + 1, 0);
     TEST_ASSERT_EQUAL_UINT16(rpmStale + 1, p.rpmAgeMs);
     TEST_ASSERT_EQUAL_HEX8(0, p.flags & BLE_FLAG_RPM_VALID);
     // Very old value: age saturates below the "never received" marker.
     test_setMillis(1000 + 100000);
-    p = buildTelemetryPacketV3(state, 0, 1000 + 100000);
+    p = buildTelemetryPacketV4(state, 0, 1000 + 100000, 0);
     TEST_ASSERT_EQUAL_UINT16(BLE_AGE_MAX_MS, p.rpmAgeMs);
     // millis() wrap: age is still the unsigned difference.
     TEST_ASSERT_EQUAL_UINT16(20, signalAgeMs(0xFFFFFFF0u, 4));
 }
 
-void test_v3_raw_bytes_are_little_endian(void) {
-    SystemState state = freshState(1000);
+void test_v4_raw_bytes_are_little_endian(void) {
+    SystemState state = stateWithTesterStats();
+    state.tester.rtt[0].sumMs = 0x01020304u;
+    state.tester.stepGapMaxMs = 0x0A0B;
     test_setMillis(1000);
-    BLETelemetryPacketV3 p = buildTelemetryPacketV3(state, 0, 0x11223344u);
+    BLETelemetryPacketV4 p = buildTelemetryPacketV4(state, 0, 0x11223344u, 0);
     const uint8_t* raw = reinterpret_cast<const uint8_t*>(&p);
     TEST_ASSERT_EQUAL_HEX8(0x44, raw[2]);
     TEST_ASSERT_EQUAL_HEX8(0x33, raw[3]);
@@ -279,19 +372,31 @@ void test_v3_raw_bytes_are_little_endian(void) {
     TEST_ASSERT_EQUAL_HEX8(0x11, raw[5]);
     TEST_ASSERT_EQUAL_HEX8(0x94, raw[6]); // 4500 = 0x1194
     TEST_ASSERT_EQUAL_HEX8(0x11, raw[7]);
+    TEST_ASSERT_EQUAL_HEX8(0x0B, raw[BLE_TELEMETRY_V4_STEP_GAP_MAX_MS_OFFSET]);
+    TEST_ASSERT_EQUAL_HEX8(0x0A, raw[BLE_TELEMETRY_V4_STEP_GAP_MAX_MS_OFFSET + 1]);
+    TEST_ASSERT_EQUAL_HEX8(0x04, raw[BLE_TELEMETRY_V4_RTT_SUM_MS_OFFSET]);
+    TEST_ASSERT_EQUAL_HEX8(0x03, raw[BLE_TELEMETRY_V4_RTT_SUM_MS_OFFSET + 1]);
+    TEST_ASSERT_EQUAL_HEX8(0x02, raw[BLE_TELEMETRY_V4_RTT_SUM_MS_OFFSET + 2]);
+    TEST_ASSERT_EQUAL_HEX8(0x01, raw[BLE_TELEMETRY_V4_RTT_SUM_MS_OFFSET + 3]);
 }
 
 void test_telemetry_version_follows_mtu(void) {
+    // Current (4) when MTU - 3 >= 57, i.e. MTU >= 60; else the version 2 fallback.
     TEST_ASSERT_EQUAL_UINT8(2, telemetryVersionForMtu(23));  // ATT default: 20-byte payload
-    TEST_ASSERT_EQUAL_UINT8(2, telemetryVersionForMtu(39));  // 36 < 37
-    TEST_ASSERT_EQUAL_UINT8(3, telemetryVersionForMtu(40));  // exactly fits
-    TEST_ASSERT_EQUAL_UINT8(3, telemetryVersionForMtu(185));
+    TEST_ASSERT_EQUAL_UINT8(2, telemetryVersionForMtu(40));  // fits v3 (37) but v3 is no longer sent
+    TEST_ASSERT_EQUAL_UINT8(2, telemetryVersionForMtu(59));  // 56 < 57
+    TEST_ASSERT_EQUAL_UINT8(4, telemetryVersionForMtu(60));  // exactly fits
+    TEST_ASSERT_EQUAL_UINT8(4, telemetryVersionForMtu(BLE_GATT_REQUESTED_MTU));
+    TEST_ASSERT_EQUAL_UINT8(4, telemetryVersionForMtu(512));
     TEST_ASSERT_EQUAL_UINT8(2, telemetryVersionForMtu(0));   // nonsense MTU -> smallest layout
+    TEST_ASSERT_EQUAL_UINT8(BLE_TELEMETRY_CURRENT_VERSION, telemetryVersionForMtu(60));
+    TEST_ASSERT_EQUAL_UINT8(BLE_TELEMETRY_LEGACY_VERSION, telemetryVersionForMtu(59));
     TEST_ASSERT_TRUE(sizeof(BLETelemetryPacketV2) <= blePayloadLimit(BLE_DEFAULT_MTU));
+    TEST_ASSERT_TRUE(sizeof(BLETelemetryPacketV4) <= blePayloadLimit(BLE_GATT_REQUESTED_MTU));
 }
 
 // ---------------------------------------------------------------------------
-// IMU ring buffer + block packing (D-032 -- schema `imuBlock`)
+// IMU ring buffer + block packing (D-032, D-061 -- generated ble_schema.h)
 // ---------------------------------------------------------------------------
 
 static ImuSample makeSample(uint32_t index) {
@@ -539,10 +644,13 @@ int main(int, char**) {
     RUN_TEST(test_build_packet_flags_follow_staleness);
     RUN_TEST(test_build_packet_clamps_to_field_ranges);
     RUN_TEST(test_ble_packet_raw_byte_layout_is_little_endian);
-    RUN_TEST(test_ble_v3_size_and_offsets);
-    RUN_TEST(test_build_v3_packet_values_ages_and_health);
-    RUN_TEST(test_v3_age_saturates_and_valid_bit_follows_generated_stale_limit);
-    RUN_TEST(test_v3_raw_bytes_are_little_endian);
+    RUN_TEST(test_ble_v4_size_and_offsets_match_the_generated_schema);
+    RUN_TEST(test_build_v4_packet_values_ages_health_and_tester_stats);
+    RUN_TEST(test_v4_round_trip_record_rotates_through_the_did_table);
+    RUN_TEST(test_v4_without_tester_stats_sends_the_no_data_values);
+    RUN_TEST(test_v4_tester_without_a_sample_yet_keeps_the_no_sample_markers);
+    RUN_TEST(test_v4_age_saturates_and_valid_bit_follows_generated_stale_limit);
+    RUN_TEST(test_v4_raw_bytes_are_little_endian);
     RUN_TEST(test_telemetry_version_follows_mtu);
     RUN_TEST(test_imu_samples_per_block_follow_mtu);
     RUN_TEST(test_imu_block_layout_timestamps_and_seq);

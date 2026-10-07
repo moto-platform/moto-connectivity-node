@@ -1,6 +1,10 @@
 #ifndef TWAI_CAN_BUS_H
 #define TWAI_CAN_BUS_H
 
+// The listen-only capture build (D-058 item 4, CONN_CAN_LISTEN_ONLY) must not contain
+// code that can transmit: nothing of this file is compiled there.
+#if !defined(CONN_CAN_LISTEN_ONLY) || !CONN_CAN_LISTEN_ONLY
+
 #include "ICanBus.h"
 #include "driver/twai.h"
 
@@ -34,5 +38,7 @@ public:
     bool start() override;
     void stop() override;
 };
+
+#endif // !CONN_CAN_LISTEN_ONLY
 
 #endif // TWAI_CAN_BUS_H

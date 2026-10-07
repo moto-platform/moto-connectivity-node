@@ -1227,6 +1227,462 @@ void test_rx_drain_is_bounded_and_backlog_pass_sends_nothing(void) {
     TEST_ASSERT_EQUAL_UINT32(0, bus.txLog.size());
 }
 
+// ---------------------------------------------------------------------------
+// D-058: tester statistics (step gap, per-DID round trip), exposed in state.tester
+// ---------------------------------------------------------------------------
+
+static const uint8_t kRpmIdx = VEHICLE_CL250_IDX_ENGINE_SPEED;
+
+// The DID read (SID 0x22) among the frames sent since txLog index `from`, if any (each
+// request goes out on two IDs with the same payload).
+static bool newDidRequest(const MockCanBus& bus, size_t from, uint16_t& did) {
+    for (size_t i = from; i < bus.txLog.size(); i++) {
+        const CanFrame& f = bus.txLog[i];
+        if (f.dlc >= 4 && f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER) {
+            did = (uint16_t)((f.data[2] << 8) | f.data[3]);
+            return true;
+        }
+    }
+    return false;
+}
+
+static int didIndexOf(uint16_t did) {
+    for (int i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (vehicle_cl250_dids[i].did == did) return i;
+    }
+    TEST_FAIL_MESSAGE("unknown DID");
+    return -1;
+}
+
+// Steps the module one millisecond at a time (relative clock `t`) until `did` has been
+// requested `requests` times (each request goes out on two IDs). Returns the pass time of
+// the send, which is the module's first-send stamp of that request. Reads of other DIDs are
+// answered on the next pass, so none of them times out (a timeout suppresses round-trip
+// samples for a while, see test_round_trip_none_while_a_late_answer_can_still_arrive).
+static unsigned long runUntilRequested(HondaCANModule& module, MockCanBus& bus, SystemState& state,
+                                       uint16_t did, int requests, unsigned long& t) {
+    for (unsigned long guard = 0; guard < 5000; guard++) {
+        const size_t before = bus.txLog.size();
+        t++;
+        setClock(t);
+        module.update(state);
+        if (bus.countDidRequests(did) >= 2 * requests) {
+            return t;
+        }
+        uint16_t other = 0;
+        if (newDidRequest(bus, before, other)) {
+            bus.injectRxFrame(makePositiveResponse(other, 0x46, 0x50));
+        }
+    }
+    TEST_FAIL_MESSAGE("DID was never requested");
+    return 0;
+}
+
+void test_step_gap_max_and_over_count_round_up_to_ms(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state); // micros() stays 0 so far: gaps of 0
+    TEST_ASSERT_TRUE(state.tester.available);
+    TEST_ASSERT_EQUAL_UINT16(0, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(0, state.tester.stepGapOverCount);
+
+    unsigned long us = 0;
+    const unsigned long limitMs = VEHICLE_CL250_CLIENT_STEP_MAX_MS;
+    // Exactly the limit: 10.000 ms is not above it.
+    us += limitMs * 1000;
+    test_setMicros(us);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(limitMs, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(0, state.tester.stepGapOverCount);
+    // One microsecond more rounds up to 11 ms: over the limit.
+    us += limitMs * 1000 + 1;
+    test_setMicros(us);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(limitMs + 1, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(1, state.tester.stepGapOverCount);
+    // 1 us rounds up to 1 ms (max unchanged); a zero gap is 0 ms.
+    us += 1;
+    test_setMicros(us);
+    module.update(state);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(limitMs + 1, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(1, state.tester.stepGapOverCount);
+    // A longer gap raises the maximum and counts again.
+    us += 25000;
+    test_setMicros(us);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(25, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(2, state.tester.stepGapOverCount);
+    // The accessor and the published copy agree.
+    TEST_ASSERT_EQUAL_UINT16(25, module.testerStats().stepGapMaxMs);
+    // A jump across most of the 32-bit range saturates; then 32 us across the micros() wrap at
+    // 2^32 is a 1 ms gap, not a huge one (the subtraction is wrap-safe).
+    test_setMicros(0xFFFFFFF0ul);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(65535, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(3, state.tester.stepGapOverCount);
+    test_setMicros(0x10ul);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(3, state.tester.stepGapOverCount);
+    test_setMicros(0);
+}
+
+void test_step_gap_counts_every_entry_also_in_the_listen_window_and_when_latched(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    test_setMillis(5000);
+    TEST_ASSERT_TRUE(module.begin());
+    test_setMicros(100000);
+    module.update(state); // listen window starts; the first entry only sets the reference
+    TEST_ASSERT_TRUE(module.listening());
+    test_setMicros(115000);
+    module.update(state); // 15 ms gap while only listening
+    TEST_ASSERT_EQUAL_UINT16(15, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(1, state.tester.stepGapOverCount);
+
+    // A foreign request latches the poller off; the step still runs and is still counted.
+    CanFrame foreign;
+    foreign.id = VEHICLE_CL250_REQUEST_ID;
+    foreign.extended = true;
+    foreign.dlc = 8;
+    foreign.data[0] = 0x02;
+    foreign.data[1] = 0x3E;
+    bus.injectRxFrame(foreign);
+    test_setMicros(145000);
+    module.update(state);
+    TEST_ASSERT_TRUE(module.latchedOff());
+    TEST_ASSERT_EQUAL_UINT16(30, state.tester.stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(2, state.tester.stepGapOverCount);
+    test_setMicros(157000);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(3, state.tester.stepGapOverCount);
+    TEST_ASSERT_EQUAL_UINT16(30, state.tester.stepGapMaxMs);
+    TEST_ASSERT_TRUE(state.tester.available);
+    test_setMicros(0);
+}
+
+void test_step_gap_saturates_at_65535(void) {
+    TesterStatsTracker t;
+    t.onStepEntry(0);
+    t.onStepEntry(100u * 1000u * 1000u); // 100 s: 100000 ms saturates the maximum
+    TEST_ASSERT_EQUAL_UINT16(65535, t.stats().stepGapMaxMs);
+    TEST_ASSERT_EQUAL_UINT16(1, t.stats().stepGapOverCount);
+    uint32_t us = 100u * 1000u * 1000u;
+    for (int i = 0; i < 70000; i++) {
+        us += 11000; // 11 ms: over the limit
+        t.onStepEntry(us);
+    }
+    TEST_ASSERT_EQUAL_UINT16(65535, t.stats().stepGapOverCount);
+}
+
+void test_round_trip_sample_on_positive_response(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[kRpmIdx].count);
+    TEST_ASSERT_EQUAL_UINT16(TESTER_RTT_NONE_MS, state.tester.rtt[kRpmIdx].minMs);
+    // Answer 17 ms after the send; the sample is measured at the step that drains it.
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    setClock(sent + 17);
+    module.update(state);
+    const DidRoundTripStats& r = state.tester.rtt[kRpmIdx];
+    TEST_ASSERT_EQUAL_UINT32(1, r.count);
+    TEST_ASSERT_EQUAL_UINT16(17, r.minMs);
+    TEST_ASSERT_EQUAL_UINT16(17, r.maxMs);
+    TEST_ASSERT_EQUAL_UINT32(17, r.sumMs);
+    TEST_ASSERT_EQUAL_UINT16(0, r.nrc78Count);
+    // Other DIDs are untouched.
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[VEHICLE_CL250_IDX_VEHICLE_SPEED].count);
+
+    // Second sample, 40 ms: min/max/sum/count follow.
+    t = sent + 17;
+    sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 2, t);
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    setClock(sent + 40);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(2, r.count);
+    TEST_ASSERT_EQUAL_UINT16(17, r.minMs);
+    TEST_ASSERT_EQUAL_UINT16(40, r.maxMs);
+    TEST_ASSERT_EQUAL_UINT32(57, r.sumMs);
+}
+
+void test_round_trip_none_on_timeout(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    setClock(sent + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 5);
+    module.update(state); // no answer: timeout
+    TEST_ASSERT_EQUAL_UINT32(1, state.can.unansweredDidCount);
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[kRpmIdx].count);
+    TEST_ASSERT_EQUAL_UINT16(TESTER_RTT_NONE_MS, state.tester.rtt[kRpmIdx].minMs);
+    TEST_ASSERT_EQUAL_UINT16(0, state.tester.rtt[kRpmIdx].maxMs);
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[kRpmIdx].sumMs);
+}
+
+void test_round_trip_nrc78_counted_once_per_request_and_gives_no_sample(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    // Two 0x78 for the same request, then the positive answer.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+    setClock(sent + 20);
+    module.update(state);
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+    setClock(sent + 50);
+    module.update(state);
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    setClock(sent + 90);
+    module.update(state);
+    DidRoundTripStats r = state.tester.rtt[kRpmIdx];
+    TEST_ASSERT_EQUAL_UINT16(1, r.nrc78Count);
+    TEST_ASSERT_EQUAL_UINT32(0, r.count); // answered after 0x78: no sample
+    TEST_ASSERT_EQUAL_UINT16(TESTER_RTT_NONE_MS, r.minMs);
+    TEST_ASSERT_EQUAL_FLOAT(4500.0f, state.engine.rpm); // the value itself was still used
+
+    // The next request of the same DID is a fresh one: a clean answer is sampled again.
+    t = sent + 90;
+    sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 2, t);
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    setClock(sent + 25);
+    module.update(state);
+    r = state.tester.rtt[kRpmIdx];
+    TEST_ASSERT_EQUAL_UINT32(1, r.count);
+    TEST_ASSERT_EQUAL_UINT16(25, r.minMs);
+    TEST_ASSERT_EQUAL_UINT16(1, r.nrc78Count);
+
+    // A third request with 0x78 counts again, and a 0x78 for another service does not.
+    t = sent + 25;
+    sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 3, t);
+    bus.injectRxFrame(makeNegativeResponse(VEHICLE_CL250_TESTER_PRESENT_SID, UDS_NRC_RESPONSE_PENDING));
+    setClock(sent + 5);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(1, state.tester.rtt[kRpmIdx].nrc78Count);
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+    setClock(sent + 10);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(2, state.tester.rtt[kRpmIdx].nrc78Count);
+}
+
+void test_round_trip_sample_for_nrc_other_than_0x78(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    // An NRC for another service does not resolve the request: no sample.
+    bus.injectRxFrame(makeNegativeResponse(VEHICLE_CL250_TESTER_PRESENT_SID, 0x12));
+    setClock(sent + 5);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[kRpmIdx].count);
+    // requestOutOfRange for the DID read resolves it and is a round-trip sample.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+    setClock(sent + 12);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(1, state.tester.rtt[kRpmIdx].count);
+    TEST_ASSERT_EQUAL_UINT16(12, state.tester.rtt[kRpmIdx].minMs);
+    TEST_ASSERT_EQUAL_UINT16(0, state.tester.rtt[kRpmIdx].nrc78Count);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, state.engine.rpm); // no value from an NRC
+}
+
+void test_round_trip_counters_saturate(void) {
+    TesterStatsTracker t;
+    // Samples above 16 bits clamp the 16-bit fields; 65535 stays reserved for "no sample".
+    t.recordRoundTrip(0, 0xFFFFFFF0u);
+    TEST_ASSERT_EQUAL_UINT16(65534, t.stats().rtt[0].minMs);
+    TEST_ASSERT_EQUAL_UINT16(65535, t.stats().rtt[0].maxMs);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFF0u, t.stats().rtt[0].sumMs);
+    // The 32-bit sum saturates instead of wrapping.
+    t.recordRoundTrip(0, 100);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, t.stats().rtt[0].sumMs);
+    TEST_ASSERT_EQUAL_UINT32(2, t.stats().rtt[0].count);
+    TEST_ASSERT_EQUAL_UINT16(100, t.stats().rtt[0].minMs);
+    // The 32-bit count saturates.
+    DidRoundTripStats almost;
+    almost.count = 0xFFFFFFFFu;
+    almost.minMs = 5;
+    almost.maxMs = 9;
+    almost.sumMs = 50;
+    t.testSetRoundTrip(1, almost);
+    t.recordRoundTrip(1, 7);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, t.stats().rtt[1].count);
+    TEST_ASSERT_EQUAL_UINT32(57, t.stats().rtt[1].sumMs);
+    // The 16-bit 0x78 count saturates.
+    for (int i = 0; i < 70000; i++) {
+        t.recordNrc78(2);
+    }
+    TEST_ASSERT_EQUAL_UINT16(65535, t.stats().rtt[2].nrc78Count);
+    // An index outside the DID table is ignored.
+    t.recordRoundTrip(VEHICLE_CL250_DID_COUNT, 5);
+    t.recordNrc78(VEHICLE_CL250_DID_COUNT);
+}
+
+// Steps one millisecond at a time up to relative time `until`, answering every DID read
+// (positively, drained on the next pass) except `silentDid`, so no other request times out.
+static void runAnswering(HondaCANModule& module, MockCanBus& bus, SystemState& state, unsigned long& t,
+                         unsigned long until, int silentDid = -1) {
+    while (t < until) {
+        const size_t before = bus.txLog.size();
+        t++;
+        setClock(t);
+        module.update(state);
+        uint16_t did = 0;
+        if (newDidRequest(bus, before, did) && (int)did != silentDid) {
+            bus.injectRxFrame(makePositiveResponse(did, 0x46, 0x50));
+        }
+    }
+}
+
+void test_round_trip_none_while_a_late_answer_can_still_arrive(void) {
+    // m1: the answer to a timed-out request can arrive late and resolve a later request
+    // early. Requests sent within RESPONSE_TIMEOUT_MAX_MS after a timeout give no sample.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    t = sent + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 5;
+    setClock(t);
+    module.update(state); // no answer: the first engine-speed request times out
+    TEST_ASSERT_EQUAL_UINT32(1, state.can.unansweredDidCount);
+    const unsigned long timeoutAt = t;
+
+    // Other DIDs are answered promptly meanwhile, but they too were sent in the window.
+    runAnswering(module, bus, state, t, t + 1, VEHICLE_CL250_DID_ENGINE_SPEED);
+    while (bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) < 4) {
+        runAnswering(module, bus, state, t, t + 1, VEHICLE_CL250_DID_ENGINE_SPEED);
+        TEST_ASSERT_TRUE(t < timeoutAt + 1000);
+    }
+    TEST_ASSERT_EQUAL_UINT32(1, state.can.unansweredDidCount);
+    for (int i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[i].count);
+    }
+    // The late answer of the first request arrives 2 ms after the second one went out and
+    // resolves it: its value is used, but it is no round-trip sample.
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    t += 2;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[kRpmIdx].count);
+    TEST_ASSERT_EQUAL_FLOAT(4500.0f, state.engine.rpm);
+
+    // A late NRC carries no DID: whichever read is pending next would be resolved by it.
+    size_t before = bus.txLog.size();
+    uint16_t nextDid = 0;
+    while (!newDidRequest(bus, before, nextDid)) {
+        t++;
+        setClock(t);
+        module.update(state);
+        TEST_ASSERT_TRUE(t < timeoutAt + 1500);
+    }
+    // A late 0x78 is not counted against that DID either.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT16(0, state.tester.rtt[didIndexOf(nextDid)].nrc78Count);
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[didIndexOf(nextDid)].count);
+    TEST_ASSERT_EQUAL_UINT32(1, state.can.unansweredDidCount);
+
+    // Requests sent after the window are sampled again (answered on the next 1 ms pass).
+    runAnswering(module, bus, state, t, timeoutAt + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 500);
+    TEST_ASSERT_EQUAL_UINT32(1, state.can.unansweredDidCount); // no other timeout extended it
+    const DidRoundTripStats& r = state.tester.rtt[kRpmIdx];
+    TEST_ASSERT_TRUE(r.count >= 1);
+    TEST_ASSERT_EQUAL_UINT16(1, r.minMs);
+    TEST_ASSERT_EQUAL_UINT16(1, r.maxMs);
+    TEST_ASSERT_EQUAL_UINT32(r.count, r.sumMs);
+}
+
+void test_tester_stats_do_not_change_what_is_sent(void) {
+    // Same ECU behaviour (answers, 0x78, an NRC, silences that time out), with wildly
+    // different micros() values: every transmitted frame, byte for byte, goes out in the
+    // same pass and order, so the counters never feed back into the poller.
+    struct Sent {
+        unsigned long pass;
+        CanFrame frame;
+    };
+    std::vector<Sent> runs[2];
+    for (int run = 0; run < 2; run++) {
+        MockCanBus bus;
+        MockTesterLatchStore latchStore;
+        HondaCANModule module(bus, latchStore);
+        SystemState state;
+        startPolling(module, state);
+        size_t logged = 0;
+        int rpmReads = 0;
+        unsigned long deferredAt = 0;
+        for (unsigned long t = 1; t < 6000; t++) {
+            test_setMicros(run == 0 ? 0 : (uint32_t)(t * 997u + (t % 7u) * 12345u));
+            setClock(t);
+            const bool silent = t >= 1000 && t < 2000; // one silent second: timeouts
+            if (deferredAt == t) {
+                bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+            }
+            if (!silent && t % 263 == 0) {
+                bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+            }
+            const size_t before = bus.txLog.size();
+            module.update(state);
+            uint16_t did = 0;
+            if (!silent && newDidRequest(bus, before, did)) {
+                if (did == VEHICLE_CL250_DID_ENGINE_SPEED && ++rpmReads % 4 == 0) {
+                    // Every 4th engine-speed read: 0x78 first, the answer 3 ms later.
+                    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+                    deferredAt = t + 3;
+                } else {
+                    bus.injectRxFrame(makePositiveResponse(did, 0x46, 0x50)); // drained next pass
+                }
+            }
+            for (; logged < bus.txLog.size(); logged++) {
+                runs[run].push_back(Sent{t, bus.txLog[logged]});
+            }
+        }
+        if (run == 1) {
+            // The scenario did exercise the statistics.
+            TEST_ASSERT_TRUE(state.can.unansweredDidCount > 0);
+            TEST_ASSERT_TRUE(state.tester.rtt[kRpmIdx].count > 0);
+            TEST_ASSERT_TRUE(state.tester.rtt[kRpmIdx].nrc78Count > 0);
+            TEST_ASSERT_TRUE(state.tester.stepGapMaxMs > 0);
+        }
+        test_setMicros(0);
+    }
+    TEST_ASSERT_TRUE(runs[0].size() > 50);
+    TEST_ASSERT_EQUAL_UINT32(runs[0].size(), runs[1].size());
+    for (size_t i = 0; i < runs[0].size(); i++) {
+        const Sent& a = runs[0][i];
+        const Sent& b = runs[1][i];
+        TEST_ASSERT_EQUAL_UINT32(a.pass, b.pass);
+        TEST_ASSERT_EQUAL_HEX32(a.frame.id, b.frame.id);
+        TEST_ASSERT_EQUAL(a.frame.extended, b.frame.extended);
+        TEST_ASSERT_EQUAL_UINT8(a.frame.dlc, b.frame.dlc);
+        TEST_ASSERT_EQUAL_HEX8_ARRAY(a.frame.data, b.frame.data, 8);
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -1276,5 +1732,15 @@ int main(int, char**) {
     RUN_TEST(test_queued_response_is_not_counted_as_timeout_after_slow_pass);
     RUN_TEST(test_foreign_tester_in_queue_stops_all_tx_in_that_pass);
     RUN_TEST(test_rx_drain_is_bounded_and_backlog_pass_sends_nothing);
+    RUN_TEST(test_step_gap_max_and_over_count_round_up_to_ms);
+    RUN_TEST(test_step_gap_counts_every_entry_also_in_the_listen_window_and_when_latched);
+    RUN_TEST(test_step_gap_saturates_at_65535);
+    RUN_TEST(test_round_trip_sample_on_positive_response);
+    RUN_TEST(test_round_trip_none_on_timeout);
+    RUN_TEST(test_round_trip_nrc78_counted_once_per_request_and_gives_no_sample);
+    RUN_TEST(test_round_trip_sample_for_nrc_other_than_0x78);
+    RUN_TEST(test_round_trip_counters_saturate);
+    RUN_TEST(test_round_trip_none_while_a_late_answer_can_still_arrive);
+    RUN_TEST(test_tester_stats_do_not_change_what_is_sent);
     return UNITY_END();
 }

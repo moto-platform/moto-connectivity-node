@@ -3,16 +3,7 @@
 
 #include <stdint.h>
 
-/**
- * @brief Hardware-independent CAN frame, decoupled from ESP-IDF's twai_message_t so
- * protocol code (HondaCANModule) never needs to know it's talking to a TWAI peripheral.
- */
-struct CanFrame {
-    uint32_t id = 0;
-    bool extended = false;
-    uint8_t dlc = 0;
-    uint8_t data[8] = {0};
-};
+#include "CanFrame.h"
 
 enum class CanBusState : uint8_t {
     RUNNING,
@@ -39,6 +30,9 @@ public:
     /**
      * @brief Installs and starts the peripheral in LISTEN-ONLY mode: it receives, but
      * never transmits, acknowledges or sends error frames (Q-018 observation window).
+     * On the ESP32-S3 the "no error frames" part needs CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM
+     * (sdkconfig.defaults): the controller is held error passive (REC = 128, frozen), so the
+     * receive error count reads 128 for the whole window.
      * There is deliberately no way to start straight in normal mode.
      * @return true on success.
      */
@@ -46,7 +40,9 @@ public:
 
     /**
      * @brief Leaves listen-only mode: stops the driver and restarts it in normal
-     * (transmitting, acknowledging) mode.
+     * (transmitting, acknowledging) mode. The reinstalled controller starts error active
+     * with TEC = REC = 0 (IDF 4.4.7 twai_hal_init/twai_hal_start), not with the 128 of the
+     * listen-only errata workaround.
      * @return true on success.
      */
     virtual bool enterNormalMode() = 0;

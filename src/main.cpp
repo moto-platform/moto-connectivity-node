@@ -18,6 +18,26 @@
 #error "CONN_VEHICLE_TESTER must be defined: 1 = temporary vehicle-bus tester (D-023), 0 = poller off (D-021)."
 #endif
 
+// D-058 item 4: CONN_CAN_LISTEN_ONLY=1 builds the CAN capture probe (env
+// esp32-s3-devkitc-1-listen-only): TWAI in listen-only mode, every frame streamed over USB
+// serial, nothing else running, no transmit code linked. It is a different firmware, so it
+// excludes the tester (CONN_VEHICLE_TESTER=1) and the synthetic data source.
+#ifndef CONN_CAN_LISTEN_ONLY
+#define CONN_CAN_LISTEN_ONLY 0
+#endif
+#if CONN_CAN_LISTEN_ONLY && (CONN_VEHICLE_TESTER || defined(MOCK_CAN_DATA))
+#error "CONN_CAN_LISTEN_ONLY=1 is incompatible with CONN_VEHICLE_TESTER=1 and MOCK_CAN_DATA: the capture build never transmits."
+#endif
+
+// USB serial speed. The listen-only env raises it (platformio.ini) for the frame stream.
+#ifndef CONN_SERIAL_BAUD
+#define CONN_SERIAL_BAUD 115200
+#endif
+
+#if CONN_CAN_LISTEN_ONLY
+#include "CanCaptureModule.h"
+#include "hal/TwaiListenOnlyRx.h"
+#else
 #if defined(MOCK_CAN_DATA)
 #include "MockCANModule.h"
 #elif CONN_VEHICLE_TESTER
@@ -32,6 +52,7 @@
 #include "ImuModule.h"
 #include "WiFiServerModule.h"
 #include "SerialLoggerModule.h"
+#endif // CONN_CAN_LISTEN_ONLY
 
 // ============================================================================
 // HARDWARE PIN DEFINITIONS (ESP32-S3 DevKit C1)
@@ -49,6 +70,71 @@
 // G1.4 -- Task Watchdog Timer. If loop() ever stalls (a module hangs) for longer than
 // this, the TWDT panics and resets the board rather than leaving a dead unit riding.
 #define TWDT_TIMEOUT_S  5
+
+#if CONN_CAN_LISTEN_ONLY
+// ============================================================================
+// D-058 item 4 -- CAN capture probe (Q-001, VWP section 5.5 step 1)
+// Only the capture module runs and only it writes to Serial (comment lines start with '#'):
+// no Nextion, BLE, Wi-Fi, IMU, logger or G0.1 timing report, so the loop stays short and
+// the stream clean. The driver is TWAI_MODE_LISTEN_ONLY behind the receive-only ICanRx.
+// ============================================================================
+// Serial TX ring buffer (framework driver, allocated once at Serial.begin) so a burst of
+// frame lines does not hit the 128-byte UART FIFO; the capture never blocks on it.
+const size_t SERIAL_TX_BUFFER_BYTES = 4096;
+
+TwaiListenOnlyRx canRx(CAN_TX_PIN, CAN_RX_PIN);
+CanCaptureModule captureModule(canRx);
+SystemState globalState; // the producer interface passes it; the capture does not use it
+bool captureActive = false;
+
+void setup() {
+    // Hold the transceiver's TXD recessive until the driver takes the pin (see the
+    // normal build's setup()); in listen-only mode the controller never drives it low.
+    gpio_set_level(CAN_TX_PIN, 1);
+    gpio_config_t canTxHigh = {};
+    canTxHigh.pin_bit_mask = 1ULL << CAN_TX_PIN;
+    canTxHigh.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&canTxHigh);
+    gpio_set_level(CAN_TX_PIN, 1);
+
+    Serial.setTxBufferSize(SERIAL_TX_BUFFER_BYTES);
+    Serial.begin(CONN_SERIAL_BAUD);
+    delay(500);
+
+    esp_task_wdt_init(TWDT_TIMEOUT_S, true /* panic + reset on timeout */);
+    esp_task_wdt_add(NULL);
+
+    captureActive = captureModule.begin();
+    if (!captureActive) {
+        Serial.println("# ERROR: the CAN listen-only driver failed to start; check the transceiver RX pin.");
+    }
+}
+
+// The Arduino loop task (priority 1, core 1) never yields by itself, and the task watchdog
+// also watches core 1's idle task (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1): a loop that
+// only polls would starve it and reset the board after TWDT_TIMEOUT_S. So each pass waits
+// up to CAPTURE_WAIT_MS for the next frame, blocked (the idle task runs; a frame wakes the
+// loop at once, so the timestamps keep their precision). A bus so busy that the queue never
+// empties still gets a one-tick delay every CAPTURE_FORCED_YIELD_MS; the 64-slot queue holds
+// about 8 ms of a fully loaded 500 kbps bus.
+const uint32_t CAPTURE_WAIT_MS = 1;
+const uint32_t CAPTURE_FORCED_YIELD_MS = 1000;
+uint32_t lastYieldMs = 0;
+
+void loop() {
+    if (captureActive) {
+        captureModule.update(globalState);
+    }
+    esp_task_wdt_reset();
+    const uint32_t now = millis();
+    if (canRx.waitForFrame(CAPTURE_WAIT_MS)) {
+        lastYieldMs = now;
+    } else if (now - lastYieldMs >= CAPTURE_FORCED_YIELD_MS) {
+        vTaskDelay(1);
+        lastYieldMs = now;
+    }
+}
+#else // normal builds
 
 // Hardware Serial 2 Instance for Nextion HMI Display
 HardwareSerial NextionSerial(2);
@@ -250,7 +336,7 @@ void setup() {
     gpio_config(&canTxHigh);
     gpio_set_level(CAN_TX_PIN, 1);
     // Initialize USB Serial Debug Console
-    Serial.begin(115200);
+    Serial.begin(CONN_SERIAL_BAUD);
     delay(500);
 
     Serial.println("\n==================================================");
@@ -345,3 +431,5 @@ void loop() {
         Serial.println("-----------------------------------------------\n");
     }
 }
+
+#endif // CONN_CAN_LISTEN_ONLY

@@ -11,12 +11,17 @@
 // GATT-server-side and independent of the ATT PROPERTY_* bits.
 #include <BLESecurity.h>
 
-// Custom UUIDs for Honda Telemetry BLE Service & Characteristics
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID_TX "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define CHARACTERISTIC_UUID_RX "828919fe-e41c-40ee-b4c6-2c974c2d3345"
-// IMU block notifications (docs/ble_telemetry_packet_schema.json gatt.characteristics.imu).
-#define CHARACTERISTIC_UUID_IMU "f62bc083-e25d-46b3-aa0b-2e9e6bc8f1e5"
+// GATT UUIDs and the MTU the central requests come from moto-vehicle-defs (ble_schema.h,
+// D-061); the Device Information Service below is a Bluetooth SIG assigned number.
+#define SERVICE_UUID            BLE_GATT_SERVICE_UUID
+#define CHARACTERISTIC_UUID_TX  BLE_GATT_TELEMETRY_CHAR_UUID
+#define CHARACTERISTIC_UUID_RX  BLE_GATT_TELEMATICS_RX_CHAR_UUID
+#define CHARACTERISTIC_UUID_IMU BLE_GATT_IMU_CHAR_UUID
+
+// Largest ATT MTU this node accepts; the central asks for BLE_GATT_REQUESTED_MTU (185) and the
+// negotiated value is the smaller of the two. It must not be below what the schema promises.
+constexpr uint16_t kLocalMaxMtu = 512;
+static_assert(kLocalMaxMtu >= BLE_GATT_REQUESTED_MTU, "the node must accept the MTU the central requests");
 
 // Standard Device Information Service UUID (0x180A)
 #define DEVICE_INFO_SERVICE_UUID "0000180a-0000-1000-8000-00805f9b34fb"
@@ -44,9 +49,9 @@ void BLEServerModule::gattsEventHandler(esp_gatts_cb_event_t event, esp_gatt_if_
 }
 
 bool BLEServerModule::begin() {
-    // Initialize BLE Device with maximum MTU (512 bytes)
+    // Initialize BLE Device with the largest MTU this node accepts (kLocalMaxMtu)
     BLEDevice::init("Honda-CL250-Telemetry");
-    BLEDevice::setMTU(512);
+    BLEDevice::setMTU(kLocalMaxMtu);
     BLEDevice::setCustomGattsHandler(&BLEServerModule::gattsEventHandler);
 
     // G4.2 -- BLE access control: the RX (write) characteristic accepts phone-controlled
@@ -279,10 +284,13 @@ void BLEServerModule::update(SystemState& state) {
 }
 
 void BLEServerModule::sendTelemetry(const SystemState& state, unsigned long now, uint16_t mtu) {
-    // Never larger than MTU - 3 (the stack would silently truncate it): below the v3 size
-    // the v2 fallback goes out instead. Both share the sequence counter.
+    // Never larger than MTU - 3 (the stack would silently truncate it): below the v4 size
+    // the v2 fallback goes out instead. Both share the sequence counter. The round-trip
+    // record (D-058) rotates through the DID table, one DID per packet.
+    const uint32_t rttIndex = _rttIndex;
+    _rttIndex = (uint8_t)((_rttIndex + 1u) % VEHICLE_CL250_DID_COUNT);
     if (telemetryVersionForMtu(mtu) == BLE_PACKET_VERSION) {
-        BLETelemetryPacketV3 packet = buildTelemetryPacketV3(state, _txSeq++, (uint32_t)now);
+        BLETelemetryPacketV4 packet = buildTelemetryPacketV4(state, _txSeq++, (uint32_t)now, rttIndex);
         _pTxCharacteristic->setValue(reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
     } else {
         BLETelemetryPacketV2 packet = buildTelemetryPacketV2(state, _txSeq++);

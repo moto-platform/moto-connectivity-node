@@ -97,15 +97,13 @@ jobs:
       - name: Run native unit tests
         run: pio test -e native
 
-      # D-032: the telemetry v3/v2 structs and the IMU block packer must match
-      # docs/ble_telemetry_packet_schema.json field by field (g++ probe, no device).
-      - name: Check BLE layouts against the schema
-        run: python3 scripts/check_ble_schema.py
-
       # The Bluedroid build needs the BLE 4.2 feature set (legacy advertising/GATT API used
-      # by BLEServerModule); sdkconfig.defaults must keep it.
+      # by BLEServerModule). D-058 / D-037: TWAI listen-only on the ESP32-S3 sends dominant
+      # error flags unless the errata workaround is on (capture env and tester listen window).
       - name: Check required sdkconfig options
-        run: grep -qx 'CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y' sdkconfig.defaults
+        run: |
+          grep -qx 'CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y' sdkconfig.defaults
+          grep -qx 'CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM=y' sdkconfig.defaults
 
       # G4.1 requires AP_PASSWORD from a gitignored platformio_local.ini that does
       # not exist in CI. Build-verification-only placeholder, never flashed.
@@ -122,3 +120,11 @@ jobs:
 
       - name: Build firmware (poller off, D-021)
         run: pio run -e esp32-s3-devkitc-1-no-tester
+
+      - name: Build firmware (listen-only CAN capture, D-058)
+        run: pio run -e esp32-s3-devkitc-1-listen-only
+
+      # D-058 item 4 / D-037: the capture firmware links no TWAI transmit code (the tester
+      # ELF is the positive control), and both builds have the listen-only errata workaround.
+      - name: Listen-only firmware has no TWAI transmit and no dominant error flag
+        run: scripts/check_no_twai_tx.sh

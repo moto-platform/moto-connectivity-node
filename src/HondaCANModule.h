@@ -4,6 +4,7 @@
 #include "IModule.h"
 #include "hal/ICanBus.h"
 #include "TesterLatch.h"
+#include "TesterStatsTracker.h"
 #include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
 
 /**
@@ -56,6 +57,8 @@ public:
     bool foreignTesterDetected() const { return _latchReason == TesterLatchReason::FOREIGN_TESTER; }
     // DID requests that timed out with no response at all since boot (BLE v3 health).
     uint32_t unansweredDidCount() const { return _unansweredDidCount; }
+    // D-058: step gap and per-DID round-trip statistics since boot (BLE v4). Read-only.
+    const TesterStats& testerStats() const { return _tester.stats(); }
 
 #ifdef CONN_NATIVE_TEST
     // Test hook: drives the real TX gate with an arbitrary request (never built on target).
@@ -89,6 +92,10 @@ private:
     uint32_t _nrcCount = 0;
     uint32_t _unansweredDidCount = 0;
 
+    // D-058: step gap (taken at every update() entry) and per-DID round trips. Counters only;
+    // they never influence request timing, order, the gate or the latch.
+    TesterStatsTracker _tester;
+
     // ------------------------------------------------------------------
     // G2.2 -- Single-request-in-flight UDS state machine.
     // UDS is a strict request/response protocol: only one DID is ever awaited at a
@@ -115,7 +122,10 @@ private:
     int8_t _pendingDidIndex = -1;
     uint16_t _pendingDid = 0;
     unsigned long _requestSentMs = 0;
-    unsigned long _requestFirstSentMs = 0; // first send of the pending request (0x78 cap)
+    unsigned long _requestFirstSentMs = 0; // first send of the pending request (0x78 cap, round trip)
+    bool _pendingSawNrc78 = false;         // the pending request got NRC 0x78: no round-trip sample
+    bool _pendingRttSkip = false;          // sent in the quiet window after a timeout: no sample
+    unsigned long _rttQuietUntilMs = 0;    // end of that window (0 = none), see recordRoundTrip()
     unsigned long _responseTimeoutMs = 0;
 
     // ------------------------------------------------------------------
@@ -153,8 +163,12 @@ private:
     DrainResult drainRx(SystemState& state, unsigned long now);
     // A diagnostic request that this node did not send (TWAI never receives its own).
     static bool isForeignTesterFrame(const CanFrame& frame);
-    // Copies bus/tester counters into state.can; read-only, never transmits.
+    // Copies bus/tester counters into state.can and state.tester; read-only, never transmits.
     void publishHealth(SystemState& state);
+
+    // Round-trip sample for the pending request, unless it saw NRC 0x78 or was sent in the
+    // quiet window after a timeout (D-058).
+    void recordRoundTrip(unsigned long now);
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
 
