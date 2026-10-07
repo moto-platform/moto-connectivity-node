@@ -124,7 +124,11 @@ jobs:
       - name: Build firmware (listen-only CAN capture, D-058)
         run: pio run -e esp32-s3-devkitc-1-listen-only
 
+      - name: Build firmware (tester + GPS bring-up, D-060)
+        run: pio run -e esp32-s3-devkitc-1-gps
+
       # D-058 item 4 / D-037: the capture firmware links no TWAI transmit code (the tester
-      # ELF is the positive control), and both builds have the listen-only errata workaround.
+      # ELF is the positive control), and every listen-only build (capture, tester, GPS
+      # bring-up) has the listen-only errata workaround.
       - name: Listen-only firmware has no TWAI transmit and no dominant error flag
         run: scripts/check_no_twai_tx.sh
