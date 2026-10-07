@@ -31,7 +31,7 @@ Reads signal definitions from `moto-vehicle-defs` (submodule: `external/moto-veh
 
 PlatformIO with **Arduino as an ESP-IDF component** (`framework = arduino, espidf`, D-023). Target chip: `esp32s3`.
 - `git submodule update --init` (generated `external/moto-vehicle-defs/gen/c/conn/`, pinned to `v0.5.1`); the defs repo is public (D-033), so CI needs no secret
-- `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock` / `-e esp32-s3-devkitc-1-no-tester` (poller off); needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
+- `pio run -e esp32-s3-devkitc-1` (real) / `-e esp32-s3-devkitc-1-mock` / `-e esp32-s3-devkitc-1-no-tester` (poller off) / `-e esp32-s3-devkitc-1-gps` (tester + GPS bring-up, D-060); needs `platformio_local.ini` with `[local] build_flags = -D AP_PASSWORD=...`
 - `pio test -e native`, or `scripts/native_tests.sh` (g++ + Unity, no PlatformIO registry needed)
 - Static analysis in CI (D-046 item 3, cppcheck 2.22.0 like moto-vehicle-defs): warning/portability/performance on `src/` is **blocking** (run the CI command locally before pushing); the MISRA C:2012 addon + style checks only **report** (job summary)
 
@@ -43,6 +43,14 @@ The code comes from the read-only reference repo `moto-platform/HondaCl250_Telem
 - The BLE layouts are defined in moto-vehicle-defs `ble/ble_schema.json` (D-061): telemetry v4 (v2 as low-MTU fallback; v3 is only decoded for old sessions) and the 100 Hz IMU block (D-032). The packed structs in `src/BLETelemetryPacket.h` and the IMU packer static_assert against the generated `gen/c/conn/ble_schema.h`; moto-mobile and moto-server use the generated Dart/Python. A layout change is a defs change, and conn, moto-mobile and moto-server take it together.
 - v4 carries the tester's step gap and one rotating per-DID ECU round-trip record (D-058, `TesterStatsTracker`, fed by `HondaCANModule`): counters only, they never change request timing, order, the gate or the latch. TEMPORARY until rt-core's health DID 0xFD02.
 - `esp32-s3-devkitc-1-listen-only` (`CONN_CAN_LISTEN_ONLY=1`, D-058 item 4) is the Q-001 capture probe: TWAI listen-only behind the receive-only `ICanRx`, `TwaiCanBus` not compiled, only `CanCaptureModule` runs and writes to serial (921600 baud). It can never be combined with the tester or the mock (`#error`), and CI checks its ELF has no `twai_transmit` (`scripts/check_no_twai_tx.sh`). Listen-only on the ESP32-S3 sends dominant error flags unless `CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM=y` (`sdkconfig.defaults`; REC held at 128, error passive); the same script checks it in the capture and tester builds (the tester's listen window uses the same mode). Never remove it.
+
+## GPS (D-060, TEMPORARY)
+
+A u-blox NEO-M8N on UART1 gives ground speed and heading for the Phase 0 speed check; rt-core owns the long-term GPS and takes it over.
+- UBX binary only, NMEA off (invariant 5): `UbxParser.h` (byte-wise, Fletcher checksum, static buffer, only NAV-PVT is stored), `UbxConfig.h` (CFG-PRT/RATE/MSG to RAM on every start), `GpsCore.h` (receiver set-up 38400 then 9600, silence detection, seqlock publication), `hal/EspGpsUart` (ESP-IDF UART driver), `GpsModule` (static task pinned to core 0; `update()` on the loop only copies `state.gps` every 50 ms, D-053). Native tests: `test/test_gps` against `MockGpsUart`.
+- **Never a position:** `GpsFix` holds no latitude, longitude or height and the parser never extracts them (invariant 7). Raw GPS bytes are never logged, dumped to serial or mirrored; the bring-up report prints rate, fix type, satellites and error counters only.
+- Off by default (`CONN_GPS=0`). Env `esp32-s3-devkitc-1-gps` (tester + GPS) is a stopgap: its UART pins are CONFIRM items, and with `CONN_GPS_PINS_CONFIRMED=0` the firmware never installs the UART. Once confirmed (recorded in defs `hardware-integration.md`), GPS moves into the main tester env and the extra env goes. `CONN_GPS=1` with `CONN_CAN_LISTEN_ONLY=1` is an `#error`; the gps env is in `scripts/check_no_twai_tx.sh`'s errata check.
+- Not on BLE yet: the GPS block is a defs layout (`ble_schema.json` `gpsBlock`, D-061); conn wires it after that defs release.
 
 ## Context
 

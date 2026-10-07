@@ -29,6 +29,16 @@
 #error "CONN_CAN_LISTEN_ONLY=1 is incompatible with CONN_VEHICLE_TESTER=1 and MOCK_CAN_DATA: the capture build never transmits."
 #endif
 
+// D-060: CONN_GPS=1 adds the u-blox NEO-M8N on UART1 (env esp32-s3-devkitc-1-gps; its pins
+// are CONFIRM items, see GpsModule.cpp). Off by default. The capture build runs nothing
+// but the capture, so it never has the GPS.
+#ifndef CONN_GPS
+#define CONN_GPS 0
+#endif
+#if CONN_GPS && CONN_CAN_LISTEN_ONLY
+#error "CONN_GPS=1 is incompatible with CONN_CAN_LISTEN_ONLY=1: the capture build runs only the capture."
+#endif
+
 // USB serial speed. The listen-only env raises it (platformio.ini) for the frame stream.
 #ifndef CONN_SERIAL_BAUD
 #define CONN_SERIAL_BAUD 115200
@@ -50,6 +60,9 @@
 #include "NextionModule.h"
 #include "BLEServerModule.h"
 #include "ImuModule.h"
+#if CONN_GPS
+#include "GpsModule.h"
+#endif
 #include "WiFiServerModule.h"
 #include "SerialLoggerModule.h"
 #endif // CONN_CAN_LISTEN_ONLY
@@ -171,6 +184,10 @@ NextionModule      displayModule(NextionSerial, UART2_RX_PIN, UART2_TX_PIN);
 ImuRing            imuRing;
 ImuModule          imuModule(imuRing);
 BLEServerModule    bleModule(&imuRing);
+#if CONN_GPS
+// D-060: speed and heading only, never a position. Fills state.gps; not on BLE yet.
+GpsModule          gpsModule;
+#endif
 WiFiServerModule   wifiModule(80);      // SoftAP HTTP JSON Backend Server on port 80
 SerialLoggerModule loggerModule(1000); // Prints serial log every 1000ms
 
@@ -186,6 +203,9 @@ IProducerModule* producers[] = {
     &canModule,
 #endif
     &imuModule,
+#if CONN_GPS
+    &gpsModule,
+#endif
     &bleModule,
 };
 IConsumerModule* consumers[] = {
@@ -200,7 +220,11 @@ const char* PRODUCER_NAMES[PRODUCER_COUNT] = {
 #if defined(MOCK_CAN_DATA) || CONN_VEHICLE_TESTER
     "CAN",
 #endif
-    "IMU", "BLE"};
+    "IMU",
+#if CONN_GPS
+    "GPS",
+#endif
+    "BLE"};
 const char* CONSUMER_NAMES[CONSUMER_COUNT] = {"Nextion", "WiFi", "Logger"};
 
 // ============================================================================

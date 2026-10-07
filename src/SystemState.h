@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 
+#include "GpsFix.h"
 #include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
 
 // G0.3 -- Data staleness tracking.
@@ -119,6 +120,22 @@ struct ImuStatus {
 };
 
 /**
+ * @brief State of the GPS receiver (GpsModule, D-060), mirrored by its update(). Speed,
+ * heading, accuracies, fix type and satellites only: GpsFix holds no position. Consumers
+ * compute the age as millis() - fix.rxTimeMs.
+ */
+struct GpsStatus {
+    uint8_t link = 0;            // GpsCore::Link: 0 pending, 1 ok, 2 no receiver
+    bool hasFix = false;         // at least one NAV-PVT received
+    GpsFix fix;
+    uint32_t navPvtCount = 0;
+    uint32_t checksumErrors = 0;
+    uint32_t lengthErrors = 0;
+    uint32_t uartOverflows = 0;
+    uint32_t linkLosses = 0;
+};
+
+/**
  * @brief Global System State container shared across all modules.
  */
 struct SystemState {
@@ -126,6 +143,7 @@ struct SystemState {
     CanHealth can;
     TesterStats tester;
     ImuStatus imu;
+    GpsStatus gps; // filled only in a CONN_GPS build
     // No lean angle here: the legacy complementary filter was dropped (D-023). Lean comes
     // from the rt-core EKF (platform.dbc LeanEstimate) once this node reads the platform bus.
     TelematicsData telematics;
