@@ -5,7 +5,9 @@
 #include <vector>
 
 // D-060 item 2 -- native tests of the GPS path's pure parts: the byte-wise UBX parser, the
-// UBX-CFG frame builder and the seqlock between the GPS task and the Arduino loop.
+// UBX-CFG frame builder, the seqlock between the GPS task and the Arduino loop, and the
+// BLE GPS block packer (D-060 item 3, ble_schema.json `gpsBlock`).
+#include "../../src/GpsBlockPacket.h"
 #include "../../src/GpsCore.h"
 #include "../../src/Seqlock.h"
 #include "../../src/UbxConfig.h"
@@ -487,6 +489,108 @@ void test_seqlock_reader_never_sees_a_torn_copy() {
     TEST_ASSERT_TRUE(good > 0u);
 }
 
+// ---- BLE GPS block (D-060 item 3) ----------------------------------------------------
+
+static GpsFix sampleFix() {
+    GpsFix f;
+    f.rxTimeMs = 0x01020304u;
+    f.iTowMs = 0x7E7D7C7Bu;       // must not reach the block
+    f.groundSpeedMmps = -2;       // 0xFFFFFFFE: the sign survives the copy
+    f.headingMotionE5 = 18000000; // 180 deg = 0x0112A880
+    f.speedAccMmps = 150u;
+    f.headingAccE5 = 80000u;
+    f.fixType = BLE_GPS_FIX_TYPE_FIX3D;
+    f.numSv = 11u;
+    f.gnssFixOk = 1u;
+    return f;
+}
+
+void test_gps_block_matches_known_good_bytes() {
+    const uint8_t expected[26] = {
+        0x01, 0x2A,             // version, seq
+        0x04, 0x03, 0x02, 0x01, // deviceTimeMs
+        0xFE, 0xFF, 0xFF, 0xFF, // groundSpeed -2 mm/s
+        0x80, 0xA8, 0x12, 0x01, // headingOfMotion 180.00000 deg
+        0x96, 0x00, 0x00, 0x00, // speedAccuracy 150 mm/s
+        0x80, 0x38, 0x01, 0x00, // headingAccuracy 0.80000 deg
+        0x03, 0x0B,             // fixType 3D, numSv 11
+        0x05, 0x00,             // flags, reserved
+    };
+    uint8_t out[32];
+    memset(out, 0xEE, sizeof(out));
+    size_t n = packGpsBlock(sampleFix(), 0x2Au, 0x05u, out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(26u, n);
+    TEST_ASSERT_EQUAL_UINT32(BLE_GPS_TOTAL_BYTES, n);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, out, sizeof(expected));
+    TEST_ASSERT_EQUAL_HEX8(0xEE, out[26]); // nothing written past the block
+    TEST_ASSERT_FALSE(containsBytes(out, n, (int32_t)0x7E7D7C7B));
+}
+
+void test_gps_block_refuses_a_short_buffer() {
+    uint8_t out[BLE_GPS_TOTAL_BYTES];
+    memset(out, 0xEE, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(0u, packGpsBlock(sampleFix(), 1u, 0u, out, sizeof(out) - 1u));
+    TEST_ASSERT_EQUAL_UINT32(0u, packGpsBlock(sampleFix(), 1u, 0u, nullptr, 64u));
+    for (size_t i = 0; i < sizeof(out); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0xEE, out[i]);
+    }
+    TEST_ASSERT_EQUAL_UINT32(BLE_GPS_TOTAL_BYTES, packGpsBlock(sampleFix(), 1u, 0u, out, sizeof(out)));
+}
+
+void test_gps_block_flags_from_fix_and_counter_changes() {
+    GpsFix fix = sampleFix();
+    GpsErrorCounters prev = {7u, 3u};
+    GpsErrorCounters same = {7u, 3u};
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK, gpsBlockFlags(fix, same, prev));
+    fix.gnssFixOk = 0u;
+    TEST_ASSERT_EQUAL_HEX8(0x00, gpsBlockFlags(fix, same, prev));
+
+    GpsErrorCounters parse = {8u, 3u};
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_PARSE_ERROR, gpsBlockFlags(fix, parse, prev));
+    GpsErrorCounters overflow = {7u, 4u};
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_UART_OVERFLOW, gpsBlockFlags(fix, overflow, prev));
+
+    fix.gnssFixOk = 1u;
+    GpsErrorCounters both = {9u, 5u};
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK | BLE_GPS_FLAG_PARSE_ERROR | BLE_GPS_FLAG_UART_OVERFLOW,
+                           gpsBlockFlags(fix, both, prev));
+
+    // The counters wrap mod 2^32; a wrapped counter is still a change.
+    GpsErrorCounters nearMax = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    GpsErrorCounters wrapped = {0u, 0u};
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK | BLE_GPS_FLAG_PARSE_ERROR | BLE_GPS_FLAG_UART_OVERFLOW,
+                           gpsBlockFlags(fix, wrapped, nearMax));
+}
+
+void test_gps_block_from_a_parsed_nav_pvt_has_no_position() {
+    uint8_t frame[120];
+    size_t n = navPvt(frame, 13889, -4500000, 3u, 0x01u, 9u);
+    GpsCore core;
+    core.feed(frame, n, 5000u);
+    GpsFix fix;
+    TEST_ASSERT_TRUE(core.latest(fix));
+    GpsErrorCounters now = {core.checksumErrors() + core.lengthErrors(), core.uartOverflows()};
+    uint8_t out[BLE_GPS_TOTAL_BYTES];
+    size_t len = packGpsBlock(fix, 0u, gpsBlockFlags(fix, now, now), out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(BLE_GPS_TOTAL_BYTES, len);
+
+    const uint8_t* s = &out[BLE_GPS_GROUND_SPEED_OFFSET];
+    const uint8_t* h = &out[BLE_GPS_HEADING_OF_MOTION_OFFSET];
+    const uint8_t* t = &out[BLE_GPS_DEVICE_TIME_MS_OFFSET];
+    uint32_t speed = (uint32_t)s[0] | ((uint32_t)s[1] << 8u) | ((uint32_t)s[2] << 16u) | ((uint32_t)s[3] << 24u);
+    uint32_t head = (uint32_t)h[0] | ((uint32_t)h[1] << 8u) | ((uint32_t)h[2] << 16u) | ((uint32_t)h[3] << 24u);
+    uint32_t time = (uint32_t)t[0] | ((uint32_t)t[1] << 8u) | ((uint32_t)t[2] << 16u) | ((uint32_t)t[3] << 24u);
+    TEST_ASSERT_EQUAL_INT32(13889, (int32_t)speed);
+    TEST_ASSERT_EQUAL_INT32(-4500000, (int32_t)head);
+    TEST_ASSERT_EQUAL_UINT32(5000u, time);
+    TEST_ASSERT_EQUAL_UINT8(3u, out[BLE_GPS_FIX_TYPE_OFFSET]);
+    TEST_ASSERT_EQUAL_UINT8(9u, out[BLE_GPS_NUM_SV_OFFSET]);
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK, out[BLE_GPS_FLAGS_OFFSET]);
+    TEST_ASSERT_FALSE(containsBytes(out, len, kLat));
+    TEST_ASSERT_FALSE(containsBytes(out, len, kLon));
+    TEST_ASSERT_FALSE(containsBytes(out, len, kHeight));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_cfg_frames_match_known_good_bytes);
@@ -511,5 +615,9 @@ int main(int, char**) {
     RUN_TEST(test_step_detects_silence_and_reconfigures);
     RUN_TEST(test_seqlock_read_before_write_and_round_trip);
     RUN_TEST(test_seqlock_reader_never_sees_a_torn_copy);
+    RUN_TEST(test_gps_block_matches_known_good_bytes);
+    RUN_TEST(test_gps_block_refuses_a_short_buffer);
+    RUN_TEST(test_gps_block_flags_from_fix_and_counter_changes);
+    RUN_TEST(test_gps_block_from_a_parsed_nav_pvt_has_no_position);
     return UNITY_END();
 }
