@@ -19,8 +19,8 @@
  *
  * Only ground speed, heading of motion, their accuracies, fix type, satellite count and
  * the node time ever leave GpsCore; latitude, longitude and height are never extracted
- * (invariant 7). Raw GPS bytes are never logged. Not wired to BLE yet: that follows the
- * defs GPS block (ble_schema.json `gpsBlock`, D-061).
+ * (invariant 7). Raw GPS bytes are never logged. update()'s copy is what BLEServerModule
+ * sends as the defs GPS block (ble_schema.json `gpsBlock`, D-061); BLE holds no pointer here.
  */
 class GpsModule : public IProducerModule {
 public:
