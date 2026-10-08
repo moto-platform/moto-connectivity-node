@@ -185,7 +185,8 @@ ImuRing            imuRing;
 ImuModule          imuModule(imuRing);
 BLEServerModule    bleModule(&imuRing);
 #if CONN_GPS
-// D-060: speed and heading only, never a position. Fills state.gps; not on BLE yet.
+// D-060: speed and heading only, never a position. Fills state.gps, which bleModule sends
+// as GPS blocks (no GPS pointer: BLE reads the SystemState copy).
 GpsModule          gpsModule;
 #endif
 WiFiServerModule   wifiModule(80);      // SoftAP HTTP JSON Backend Server on port 80

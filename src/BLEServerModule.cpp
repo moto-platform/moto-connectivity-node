@@ -17,6 +17,7 @@
 #define CHARACTERISTIC_UUID_TX  BLE_GATT_TELEMETRY_CHAR_UUID
 #define CHARACTERISTIC_UUID_RX  BLE_GATT_TELEMATICS_RX_CHAR_UUID
 #define CHARACTERISTIC_UUID_IMU BLE_GATT_IMU_CHAR_UUID
+#define CHARACTERISTIC_UUID_GPS BLE_GATT_GPS_CHAR_UUID
 
 // Largest ATT MTU this node accepts; the central asks for BLE_GATT_REQUESTED_MTU (185) and the
 // negotiated value is the smaller of the two. It must not be below what the schema promises.
@@ -27,6 +28,14 @@ static_assert(kLocalMaxMtu >= BLE_GATT_REQUESTED_MTU, "the node must accept the 
 #define DEVICE_INFO_SERVICE_UUID "0000180a-0000-1000-8000-00805f9b34fb"
 
 std::atomic<uint16_t> BLEServerModule::s_peerMtu{BLE_DEFAULT_MTU};
+
+namespace {
+// The GPS block's error base: the counters only grow, see GpsErrorCounters.
+GpsErrorCounters gpsErrorCounters(const GpsStatus& gps) {
+    GpsErrorCounters counters = {gps.checksumErrors + gps.lengthErrors, gps.uartOverflows};
+    return counters;
+}
+} // namespace
 
 BLEServerModule::BLEServerModule(ImuRing* imuRing) : _imuRing(imuRing) {}
 
@@ -123,6 +132,21 @@ bool BLEServerModule::begin() {
     );
     _pImuCharacteristic->addDescriptor(new BLE2902()); // one-time, see begin() note on heap use
 
+    // GPS block (Notify) Characteristic, D-060. Present in every build, like the IMU one; it
+    // only notifies once state.gps has a NAV-PVT (CONN_GPS=1 with confirmed pins).
+    // Speed + heading rebuild the route's shape by dead reckoning (D-060 item 5), so unlike
+    // telemetry and IMU, subscribing needs a bonded, encrypted link (as the G4.2 RX write):
+    // the CCCD only accepts encrypted writes and the value only encrypted reads. onConnect()
+    // clears the CCCD, so a subscription never carries over to the next peer.
+    _pGpsCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID_GPS,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    _pGpsCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
+    _pGpsCccd = new BLE2902(); // one-time, see begin() note on heap use
+    _pGpsCccd->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+    _pGpsCharacteristic->addDescriptor(_pGpsCccd);
+
     // Create Telematics RX (Write) Characteristic
     _pRxCharacteristic = pService->createCharacteristic(
         CHARACTERISTIC_UUID_RX,
@@ -158,6 +182,11 @@ bool BLEServerModule::begin() {
 
 void BLEServerModule::onConnect(BLEServer* pServer) {
     // Runs on the BLE stack task -- do not touch SystemState here, just enqueue.
+    // The BLE2902 value outlives the connection: clear the GPS subscription before the new
+    // peer can use it (this task also handles CCCD writes, so they cannot interleave).
+    if (_pGpsCccd) {
+        _pGpsCccd->setNotifications(false);
+    }
     TelematicsEvent evt;
     evt.type = TelematicsEventType::CONNECTION;
     evt.connected = true;
@@ -233,6 +262,11 @@ void BLEServerModule::update(SystemState& state) {
             if (evt.type == TelematicsEventType::CONNECTION) {
                 _deviceConnected = evt.connected;
                 state.telematics.phoneConnected = evt.connected;
+                if (evt.connected) {
+                    _gpsTracker.arm(state.gps.navPvtCount, gpsErrorCounters(state.gps));
+                } else {
+                    _gpsTracker.disarm();
+                }
             } else {
                 if (evt.hasSong)     strncpy(state.telematics.songTitle, evt.songTitle, sizeof(state.telematics.songTitle) - 1);
                 if (evt.hasArtist)   strncpy(state.telematics.artistName, evt.artistName, sizeof(state.telematics.artistName) - 1);
@@ -249,8 +283,9 @@ void BLEServerModule::update(SystemState& state) {
         uint16_t mtu = s_peerMtu.load(std::memory_order_relaxed);
         if (mtu != _loggedMtu) {
             _loggedMtu = mtu;
-            Serial.printf("[BLE] Peer MTU %u: telemetry v%u, %u IMU samples per block.\n",
-                mtu, telemetryVersionForMtu(mtu), imuSamplesPerBlock(mtu));
+            Serial.printf("[BLE] Peer MTU %u: telemetry v%u, %u IMU samples per block, GPS blocks %s.\n",
+                mtu, telemetryVersionForMtu(mtu), imuSamplesPerBlock(mtu),
+                blePayloadLimit(mtu) >= GPS_BLOCK_BYTES ? "on" : "suspended");
         }
         sendTelemetry(state, now, mtu);
         _imuDue = true;
@@ -259,6 +294,11 @@ void BLEServerModule::update(SystemState& state) {
         // carries more than IMU_MAX_BLOCKS_PER_NOTIFY notifications (CAN poller timing).
         _imuDue = false;
         sendImuBlocks(s_peerMtu.load(std::memory_order_relaxed));
+    } else if (_deviceConnected) {
+        // GPS comes after telemetry and IMU in this chain, so a pass still carries at most
+        // IMU_MAX_BLOCKS_PER_NOTIFY notifications (D-053). One block per NAV-PVT, at most one
+        // per pass; GpsNotifyTracker spaces them and keeps a held PVT for a later pass.
+        sendGpsBlock(state, now, s_peerMtu.load(std::memory_order_relaxed));
     } else if (!_deviceConnected && _imuRing) {
         // Nobody to send to: a new connection starts with fresh samples and no old events.
         _imuRing->clear();
@@ -323,4 +363,22 @@ void BLEServerModule::sendImuBlocks(uint16_t mtu) {
         _pImuCharacteristic->setValue(_imuBlock, len);
         _pImuCharacteristic->notify();
     }
+}
+
+void BLEServerModule::sendGpsBlock(const SystemState& state, unsigned long now, uint16_t mtu) {
+    // state.gps is the copy GpsModule::update() takes from the GPS task's seqlock (D-060
+    // item 2: the seqlock copy happens there, every 50 ms); this only reads that copy, so
+    // nothing here touches the UART or parses UBX. No latitude/longitude exists to send.
+    const GpsStatus& gps = state.gps;
+    GpsNotifyDecision d = _gpsTracker.step(gps.hasFix, gps.fix, gps.navPvtCount, gpsErrorCounters(gps),
+                                           (uint32_t)now, blePayloadLimit(mtu));
+    if (d.action != GpsNotifyAction::SEND) {
+        return; // SKIP_MTU: seq already advanced, the receiver sees the gap
+    }
+    size_t len = packGpsBlock(gps.fix, d.seq, d.flags, _gpsBlock, sizeof(_gpsBlock));
+    if (len == 0) {
+        return;
+    }
+    _pGpsCharacteristic->setValue(_gpsBlock, len);
+    _pGpsCharacteristic->notify();
 }

@@ -3,6 +3,7 @@
 
 #include "IModule.h"
 #include "BLETelemetryPacket.h"
+#include "GpsNotifyTracker.h"
 #include "ImuBlockPacket.h"
 
 #include <atomic>
@@ -55,6 +56,8 @@ private:
     BLECharacteristic* _pRxCharacteristic = nullptr;
 
     BLECharacteristic* _pImuCharacteristic = nullptr;
+    BLECharacteristic* _pGpsCharacteristic = nullptr;
+    BLE2902* _pGpsCccd = nullptr;
 
     bool _initialized = false;
     bool _deviceConnected = false;
@@ -71,6 +74,10 @@ private:
     ImuRing* _imuRing = nullptr;
     uint8_t _imuBlock[IMU_BLOCK_MAX_BYTES] = {};
 
+    // GPS blocks (D-060) from state.gps; state.gps.hasFix is never true without a GPS build.
+    GpsNotifyTracker _gpsTracker;
+    uint8_t _gpsBlock[GPS_BLOCK_BYTES] = {};
+
     // Negotiated ATT MTU of the current peer, written by the GATT event handler on the BLE
     // stack task and read by update() on the main loop task.
     static std::atomic<uint16_t> s_peerMtu;
@@ -79,6 +86,7 @@ private:
 
     void sendTelemetry(const SystemState& state, unsigned long now, uint16_t mtu);
     void sendImuBlocks(uint16_t mtu);
+    void sendGpsBlock(const SystemState& state, unsigned long now, uint16_t mtu);
 
     QueueHandle_t _telematicsQueue = nullptr;
 

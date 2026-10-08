@@ -6,9 +6,10 @@
 
 // D-060 item 2 -- native tests of the GPS path's pure parts: the byte-wise UBX parser, the
 // UBX-CFG frame builder, the seqlock between the GPS task and the Arduino loop, and the
-// BLE GPS block packer (D-060 item 3, ble_schema.json `gpsBlock`).
+// BLE GPS block packer (D-060 item 3, ble_schema.json `gpsBlock`) and the notify decision.
 #include "../../src/GpsBlockPacket.h"
 #include "../../src/GpsCore.h"
+#include "../../src/GpsNotifyTracker.h"
 #include "../../src/Seqlock.h"
 #include "../../src/UbxConfig.h"
 #include "../../src/UbxParser.h"
@@ -81,6 +82,7 @@ bool containsBytes(const void* hay, size_t n, int32_t needle) {
     }
     return false;
 }
+
 
 } // namespace
 
@@ -591,6 +593,199 @@ void test_gps_block_from_a_parsed_nav_pvt_has_no_position() {
     TEST_ASSERT_FALSE(containsBytes(out, len, kHeight));
 }
 
+// ---- GpsNotifyTracker: when a NAV-PVT becomes a GPS block ----------------------------------
+
+namespace {
+
+const uint16_t kRoomy = 182u;  // blePayloadLimit(185), the MTU moto-mobile requests
+const uint16_t kAttDefault = 20u; // blePayloadLimit(23), every connection's first MTU
+
+GpsFix trackerFix(uint8_t fixType = 3u, uint8_t gnssFixOk = 1u) {
+    GpsFix fix;
+    fix.rxTimeMs = 1000u;
+    fix.fixType = fixType;
+    fix.gnssFixOk = gnssFixOk;
+    fix.numSv = 9u;
+    return fix;
+}
+
+
+} // namespace
+
+void test_notify_needs_a_connection_and_a_first_nav_pvt() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    GpsFix fix = trackerFix();
+    // Not armed (no connection): nothing, even with new PVTs.
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, fix, 5u, e, 0u, kRoomy).action);
+    t.arm(0u, e);
+    // CONN_GPS=0 or unconfirmed pins: hasFix never becomes true, so never a block.
+    for (uint32_t ms = 0u; ms < 1000u; ms += 10u) {
+        TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(false, GpsFix(), 0u, e, ms, kRoomy).action);
+    }
+    // The first NAV-PVT after the connection is the first block.
+    GpsNotifyDecision d = t.step(true, fix, 1u, e, 1000u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(0u, d.seq);
+    // The same NAV-PVT is not sent twice, however many passes follow.
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, fix, 1u, e, 1100u, kRoomy).action);
+}
+
+void test_notify_starts_at_the_pvt_after_the_connection() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    t.arm(40u, e); // 40 PVTs before the phone connected: none of them is sent
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, trackerFix(), 40u, e, 0u, kRoomy).action);
+    GpsNotifyDecision d = t.step(true, trackerFix(), 41u, e, 100u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(0u, d.seq);
+}
+
+void test_notify_new_pvt_by_count_and_merged_pvts_leave_a_seq_gap() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    GpsFix fix = trackerFix();
+    t.arm(0u, e);
+    TEST_ASSERT_EQUAL_UINT8(0u, t.step(true, fix, 1u, e, 0u, kRoomy).seq);
+    // The fix time does not decide: a new count with an unchanged rxTimeMs is a new block.
+    GpsNotifyDecision d = t.step(true, fix, 2u, e, 100u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(1u, d.seq);
+    // The 50 ms mirror merged three PVTs: one block, seq jumps by three (two lost).
+    d = t.step(true, fix, 5u, e, 200u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(4u, d.seq);
+    TEST_ASSERT_EQUAL_UINT8(5u, t.step(true, fix, 6u, e, 300u, kRoomy).seq);
+}
+
+void test_notify_seq_and_pvt_count_wrap() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    GpsFix fix = trackerFix();
+    uint32_t count = 0xFFFFFFF0u;
+    t.arm(count, e);
+    uint32_t ms = 0u;
+    for (int i = 0; i < 255; i++) { // seq 0..254
+        count++;
+        ms += 100u;
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)i, t.step(true, fix, count, e, ms, kRoomy).seq);
+    }
+    // count crosses 2^32 and seq crosses 255 with a gap of 2 (seq 255 and 0 lost): 1.
+    count += 3u;
+    ms += 100u;
+    GpsNotifyDecision d = t.step(true, fix, count, e, ms, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(1u, d.seq);
+}
+
+void test_notify_low_mtu_skips_but_advances_seq_and_error_base() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    GpsFix fix = trackerFix();
+    t.arm(0u, e);
+    // MTU 23 right after connecting: produced, not sent; seq advances.
+    GpsNotifyDecision d = t.step(true, fix, 1u, e, 0u, kAttDefault);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SKIP_MTU, d.action);
+    TEST_ASSERT_EQUAL_UINT8(0u, d.seq);
+    // A checksum error and an overflow during the skipped block...
+    GpsErrorCounters e2 = {1u, 1u};
+    d = t.step(true, fix, 2u, e2, 100u, kAttDefault);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SKIP_MTU, d.action);
+    TEST_ASSERT_EQUAL_UINT8(1u, d.seq);
+    // One byte short of the block is still a skip.
+    d = t.step(true, fix, 3u, e2, 200u, (uint16_t)(GPS_BLOCK_BYTES - 1u));
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SKIP_MTU, d.action);
+    // ...after the MTU exchange the first sent block shows the gap (seq 3, 0..2 lost) and
+    // does not repeat errors that belong to skipped blocks.
+    d = t.step(true, fix, 4u, e2, 300u, (uint16_t)GPS_BLOCK_BYTES);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(3u, d.seq);
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK, d.flags);
+}
+
+void test_notify_error_flags_since_connection_and_previous_block() {
+    GpsNotifyTracker t;
+    GpsFix fix = trackerFix();
+    GpsErrorCounters boot = {7u, 3u}; // errors before the phone connected
+    t.arm(0u, boot);
+    GpsNotifyDecision d = t.step(true, fix, 1u, boot, 0u, kRoomy);
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK, d.flags); // not "since boot"
+    GpsErrorCounters parse = {8u, 3u};
+    d = t.step(true, fix, 2u, parse, 100u, kRoomy);
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK | BLE_GPS_FLAG_PARSE_ERROR, d.flags);
+    d = t.step(true, fix, 3u, parse, 200u, kRoomy); // reported once
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK, d.flags);
+    GpsErrorCounters ovf = {8u, 4u};
+    d = t.step(true, fix, 4u, ovf, 300u, kRoomy);
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK | BLE_GPS_FLAG_UART_OVERFLOW, d.flags);
+}
+
+void test_notify_blocks_without_a_usable_fix_are_sent() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    t.arm(0u, e);
+    GpsNotifyDecision d = t.step(true, trackerFix(0u, 0u), 1u, e, 0u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_HEX8(0u, d.flags);
+    d = t.step(true, trackerFix(2u, 0u), 2u, e, 100u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_HEX8(0u, d.flags);
+}
+
+void test_notify_min_spacing_holds_a_pvt_and_sends_it_later() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    GpsFix fix = trackerFix();
+    t.arm(0u, e);
+    TEST_ASSERT_EQUAL_UINT8(0u, t.step(true, fix, 1u, e, 1000u, kRoomy).seq);
+    // The next PVT arrives early (jitter): held for GPS_BLOCK_MIN_SPACING_MS...
+    const uint32_t early = 1000u + GPS_BLOCK_MIN_SPACING_MS - 1u;
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, fix, 2u, e, 1020u, kRoomy).action);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, fix, 2u, e, early, kRoomy).action);
+    // ...then sent on the next pass, with the next seq: held, never dropped.
+    GpsNotifyDecision d = t.step(true, fix, 2u, e, early + 1u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(1u, d.seq);
+    // The spacing is half the PVT period, not a 100 ms send timer: a 10 Hz source with
+    // +-40 ms jitter keeps every PVT (consecutive seq) and the delay does not accumulate.
+    const int32_t jitter[] = {40, -40, 30, -30, 40, -40, 0, 20, -20, 40};
+    uint32_t count = 2u;
+    uint8_t seq = 1u;
+    for (unsigned i = 0; i < sizeof(jitter) / sizeof(jitter[0]); i++) {
+        count++;
+        uint32_t pvtMs = (uint32_t)((int32_t)(1100u + 100u * (i + 1u)) + jitter[i]);
+        GpsNotifyDecision step = {GpsNotifyAction::NONE, 0u, 0u};
+        uint32_t ms = pvtMs;
+        while (step.action == GpsNotifyAction::NONE) {
+            step = t.step(true, fix, count, e, ms, kRoomy);
+            ms += 5u; // loop passes
+            TEST_ASSERT_TRUE(ms < pvtMs + 100u); // sent before the next PVT
+        }
+        seq++;
+        TEST_ASSERT_EQUAL_UINT8(seq, step.seq);
+    }
+}
+
+void test_notify_disconnect_resets_last_block_state() {
+    GpsNotifyTracker t;
+    GpsErrorCounters e = {0u, 0u};
+    GpsFix fix = trackerFix();
+    t.arm(0u, e);
+    TEST_ASSERT_EQUAL_UINT8(0u, t.step(true, fix, 1u, e, 1000u, kRoomy).seq);
+    t.disarm();
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, fix, 2u, e, 1100u, kRoomy).action);
+    // Reconnect 10 ms after the last block: no spacing hold from the old connection, the
+    // error base is the counters at reconnection, PVTs in between are not replayed, and seq
+    // keeps rolling.
+    GpsErrorCounters e2 = {5u, 5u};
+    t.arm(3u, e2);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::NONE, t.step(true, fix, 3u, e2, 1010u, kRoomy).action);
+    GpsNotifyDecision d = t.step(true, fix, 4u, e2, 1010u, kRoomy);
+    TEST_ASSERT_EQUAL(GpsNotifyAction::SEND, d.action);
+    TEST_ASSERT_EQUAL_UINT8(1u, d.seq);
+    TEST_ASSERT_EQUAL_HEX8(BLE_GPS_FLAG_GNSS_FIX_OK, d.flags);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_cfg_frames_match_known_good_bytes);
@@ -619,5 +814,14 @@ int main(int, char**) {
     RUN_TEST(test_gps_block_refuses_a_short_buffer);
     RUN_TEST(test_gps_block_flags_from_fix_and_counter_changes);
     RUN_TEST(test_gps_block_from_a_parsed_nav_pvt_has_no_position);
+    RUN_TEST(test_notify_needs_a_connection_and_a_first_nav_pvt);
+    RUN_TEST(test_notify_starts_at_the_pvt_after_the_connection);
+    RUN_TEST(test_notify_new_pvt_by_count_and_merged_pvts_leave_a_seq_gap);
+    RUN_TEST(test_notify_seq_and_pvt_count_wrap);
+    RUN_TEST(test_notify_low_mtu_skips_but_advances_seq_and_error_base);
+    RUN_TEST(test_notify_error_flags_since_connection_and_previous_block);
+    RUN_TEST(test_notify_blocks_without_a_usable_fix_are_sent);
+    RUN_TEST(test_notify_min_spacing_holds_a_pvt_and_sends_it_later);
+    RUN_TEST(test_notify_disconnect_resets_last_block_state);
     return UNITY_END();
 }
