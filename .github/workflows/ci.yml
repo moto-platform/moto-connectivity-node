@@ -82,14 +82,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: "3.11"
 
+      # The ESP-IDF venv in ~/.platformio/penv links to the exact setup-python interpreter
+      # (/opt/hostedtoolcache/Python/3.11.x). A cache saved under another patch release
+      # restores a broken venv ("Missing Python executable"), so the key carries the
+      # full version.
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: ${{ runner.os }}-platformio-${{ hashFiles('platformio.ini', 'sdkconfig.defaults') }}
+          key: ${{ runner.os }}-platformio-py${{ steps.python.outputs.python-version }}-${{ hashFiles('platformio.ini', 'sdkconfig.defaults') }}
 
       - name: Install PlatformIO
         run: pip install --upgrade platformio
