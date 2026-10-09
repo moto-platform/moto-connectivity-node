@@ -5,7 +5,12 @@
 #include "hal/ICanBus.h"
 #include "TesterLatch.h"
 #include "TesterStatsTracker.h"
+#include "hal/CanRxQueue.h" // also defaults CONN_DISCOVERY_PROBE to 0
 #include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+#if CONN_DISCOVERY_PROBE
+#include "DiscoveryScan.h"
+#include "IsoTpReceiver.h"
+#endif
 
 /**
  * @brief UDS tester for the Honda CL250 engine ECU over a generic ICanBus.
@@ -38,6 +43,13 @@
  *  - Every pass drains the RX queue first, before any transmission and before the
  *    response-timeout check, so a slow pass cannot count a queued answer as a timeout.
  *    If the bounded drain cannot empty the queue, the pass transmits nothing.
+ *
+ * D-059 item 3, only in the probe env (CONN_DISCOVERY_PROBE=1, esp32-s3-devkitc-1-probe):
+ * after the listen window and the session start, the generated discovery_scan list runs
+ * once (one request in flight, the yaml timeouts), then the DIDs are polled as usual. A
+ * segmented answer to the in-flight scan request gets the one generated FC.CTS through the
+ * frame gate; nothing else is sent while it is received. Other builds compile none of it
+ * and keep dropping First/Consecutive Frames.
  */
 class HondaCANModule : public IProducerModule {
 public:
@@ -59,10 +71,19 @@ public:
     uint32_t unansweredDidCount() const { return _unansweredDidCount; }
     // D-058: step gap and per-DID round-trip statistics since boot (BLE v4). Read-only.
     const TesterStats& testerStats() const { return _tester.stats(); }
+#if CONN_DISCOVERY_PROBE
+    // D-059: true once the discovery scan ran through its list (normal polling from then on).
+    bool discoveryScanDone() const { return _scanPhase == ScanPhase::DONE; }
+    // True while a segmented answer is being received.
+    bool receivingSegmented() const { return _isoRx.active(); }
+#endif
 
 #ifdef CONN_NATIVE_TEST
     // Test hook: drives the real TX gate with an arbitrary request (never built on target).
     bool testSendFrame(uint32_t id, const uint8_t* request, uint8_t len) { return sendFrame(id, request, len); }
+#if CONN_DISCOVERY_PROBE
+    DiscoveryScan& testScan() { return _scan; }
+#endif
 #endif
 
 private:
@@ -121,6 +142,7 @@ private:
     UdsRequestState _udsState = UdsRequestState::IDLE;
     int8_t _pendingDidIndex = -1;
     uint16_t _pendingDid = 0;
+    uint8_t _pendingSid = 0;               // SID of the request in flight (NRC matching)
     unsigned long _requestSentMs = 0;
     unsigned long _requestFirstSentMs = 0; // first send of the pending request (0x78 cap, round trip)
     bool _pendingSawNrc78 = false;         // the pending request got NRC 0x78: no round-trip sample
@@ -175,6 +197,45 @@ private:
     // Saves the latch, then stops the CAN driver and all polling (survives resets
     // other than power-on, see ITesterLatchStore).
     void latchOff(TesterLatchReason reason, const char* why);
+
+#if CONN_DISCOVERY_PROBE
+    // ------------------------------------------------------------------
+    // D-059 item 3 -- one-shot discovery scan and segmented reception (probe env only).
+    // ------------------------------------------------------------------
+    enum class ScanPhase : uint8_t { WAIT_SESSION, RUNNING, DONE };
+    ScanPhase _scanPhase = ScanPhase::WAIT_SESSION;
+    DiscoveryScan _scan;
+    IsoTpReceiver _isoRx;
+    int8_t _pendingScanIndex = -1;       // scan entry in flight, -1 = none (or a DID)
+    bool _fcSentForPending = false;      // one FC per request (BS 0)
+    // An accepted First Frame waits here until the drain is complete (Q-018: nothing is
+    // sent before the whole queue was checked for a foreign tester); then its FC goes out.
+    bool _fcPending = false;
+    CanFrame _fcPendingFrame;
+    unsigned long _fcPendingMs = 0;
+    uint32_t _scanLostBaseline = 0;      // driver lost count when the scan request went out
+    unsigned long _firstSessionRequestMs = 0;
+    unsigned long _txQuietUntilMs = 0;   // no request at all until then (yaml flow_control rule)
+    unsigned long _scanHoldUntilMs = 0;  // no scan request until then (a late answer may come)
+
+    // Starts the scan once the session is confirmed (or one retry interval after the first
+    // session request) and sends the next entry; marks the scan done at the end of the list.
+    void scanStep(unsigned long now);
+    // A Single Frame answer to the scan entry in flight. False if it is not one (then the
+    // normal handling runs, e.g. for a session confirm or an NRC 0x78).
+    bool onScanSingleFrame(const CanFrame& frame, unsigned long now);
+    void onFirstFrame(const CanFrame& frame, unsigned long now);
+    void onConsecutiveFrame(const CanFrame& frame, unsigned long now);
+    // The reception completed or was aborted: report it and resolve the scan request.
+    void endReception(unsigned long now);
+    // Sends the generated FC.CTS on the request ID paired with the First Frame's response
+    // ID, through the same checks as every request. False if refused or not sent.
+    bool sendFlowControl(const CanFrame& firstFrame);
+    // After a complete drain: sends the pending FC (or aborts the entry) and starts the
+    // reception. Called only when the drain returned DRAINED.
+    void sendPendingFlowControl(unsigned long now);
+    void holdTx(unsigned long now);
+#endif
 };
 
 #endif // HONDA_CAN_MODULE_H
