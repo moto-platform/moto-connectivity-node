@@ -196,6 +196,38 @@ void test_multiframe_response_is_dropped_not_misparsed(void) {
     TEST_ASSERT_EQUAL_UINT32(0, state.engine.rpmUpdatedMs);
 }
 
+// D-059 item 3: segmented reception exists only in the probe env (test_discovery_probe).
+// In this build a First Frame, even a valid one answering the request in flight, never
+// gets a Flow Control: every transmitted frame stays a Single Frame.
+void test_first_frame_never_gets_a_flow_control_outside_the_probe(void) {
+    TEST_ASSERT_EQUAL(0, CONN_DISCOVERY_PROBE);
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    for (unsigned long t = 1; t < 3000; t += 5) {
+        setClock(t);
+        size_t before = bus.txLog.size();
+        module.update(state);
+        for (size_t i = before; i < bus.txLog.size(); i++) {
+            const CanFrame& f = bus.txLog[i];
+            if (f.id == VEHICLE_CL250_REQUEST_ID && f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER) {
+                CanFrame ff = makeMultiFrameFirstFrame();
+                ff.data[1] = 0x0A; // FF_DL 10
+                ff.data[2] = 0x62; // positive answer to the DID in flight
+                ff.data[3] = f.data[2];
+                ff.data[4] = f.data[3];
+                bus.injectRxFrame(ff);
+            }
+        }
+    }
+    TEST_ASSERT_TRUE(bus.txLog.size() > 10);
+    for (const CanFrame& f : bus.txLog) {
+        TEST_ASSERT_EQUAL_HEX8(0x0, f.data[0] & 0xF0); // Single Frames only, never an FC
+    }
+}
+
 void test_bus_off_triggers_recovery_with_backoff(void) {
     MockCanBus bus;
     MockTesterLatchStore latchStore;
@@ -1689,6 +1721,7 @@ int main(int, char**) {
     RUN_TEST(test_session_confirm_is_recognized);
     RUN_TEST(test_nrc_other_than_pending_resolves_request_without_corrupting_state);
     RUN_TEST(test_multiframe_response_is_dropped_not_misparsed);
+    RUN_TEST(test_first_frame_never_gets_a_flow_control_outside_the_probe);
     RUN_TEST(test_bus_off_triggers_recovery_with_backoff);
     RUN_TEST(test_bus_recovery_complete_restarts_driver);
     RUN_TEST(test_did_skipped_after_max_consecutive_timeouts_then_resumes);

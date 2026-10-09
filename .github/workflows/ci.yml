@@ -132,8 +132,12 @@ jobs:
       - name: Build firmware (tester + GPS bring-up, D-060)
         run: pio run -e esp32-s3-devkitc-1-gps
 
+      - name: Build firmware (tester + discovery probe, D-059)
+        run: pio run -e esp32-s3-devkitc-1-probe
+
       # D-058 item 4 / D-037: the capture firmware links no TWAI transmit code (the tester
       # ELF is the positive control), and every listen-only build (capture, tester, GPS
-      # bring-up) has the listen-only errata workaround.
+      # bring-up, discovery probe) has the listen-only errata workaround. D-059: the discovery
+      # scan and its FC sender are only in the probe ELF.
       - name: Listen-only firmware has no TWAI transmit and no dominant error flag
         run: scripts/check_no_twai_tx.sh

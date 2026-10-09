@@ -39,6 +39,16 @@
 #error "CONN_GPS=1 is incompatible with CONN_CAN_LISTEN_ONLY=1: the capture build runs only the capture."
 #endif
 
+// D-059 item 3: CONN_DISCOVERY_PROBE=1 (env esp32-s3-devkitc-1-probe) is the tester build
+// plus the one-shot discovery scan with segmented reception (one FC.CTS per answer). Only
+// that env compiles it, and only on top of the real tester.
+#ifndef CONN_DISCOVERY_PROBE
+#define CONN_DISCOVERY_PROBE 0
+#endif
+#if CONN_DISCOVERY_PROBE && (!CONN_VEHICLE_TESTER || defined(MOCK_CAN_DATA) || CONN_CAN_LISTEN_ONLY)
+#error "CONN_DISCOVERY_PROBE=1 needs CONN_VEHICLE_TESTER=1 and excludes MOCK_CAN_DATA and CONN_CAN_LISTEN_ONLY."
+#endif
+
 // USB serial speed. The listen-only env raises it (platformio.ini) for the frame stream.
 #ifndef CONN_SERIAL_BAUD
 #define CONN_SERIAL_BAUD 115200
