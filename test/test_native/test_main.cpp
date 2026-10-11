@@ -4,6 +4,7 @@
 #include "../../src/SystemState.h"
 #include "../../src/BLETelemetryPacket.h"
 #include "../../src/ImuBlockPacket.h"
+#include "../../src/VehicleSignalBlock.h"
 #include "../../src/TelemetryJson.h"
 
 // [env:native] builds no src/ and no library, so this suite pulls in the implementation
@@ -631,6 +632,175 @@ void test_json_reports_overflow_instead_of_truncating(void) {
     TEST_ASSERT_EQUAL_STRING("", small);
 }
 
+// ---------------------------------------------------------------------------
+// D-066 item 4: vehicle-signal block (VehicleSignalBlock.h)
+// ---------------------------------------------------------------------------
+
+static uint16_t vsigLe16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t vsigLe32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+void test_vsig_raw_is_big_endian_data_bytes_and_length_guarded(void) {
+    VehicleSignalRecord r;
+    const uint8_t two[2] = {0x46, 0x50};
+    vsigRecordPositive(r, two, 2, 1000u);
+    TEST_ASSERT_TRUE(r.hasValue);
+    TEST_ASSERT_EQUAL_HEX32(0x4650, r.raw);
+    TEST_ASSERT_EQUAL_UINT32(1000u, r.updatedMs);
+    const uint8_t four[4] = {0x12, 0x34, 0x56, 0x78};
+    vsigRecordPositive(r, four, 4, 2000u);
+    TEST_ASSERT_EQUAL_HEX32(0x12345678, r.raw);
+    VehicleSignalRecord untouched;
+    const uint8_t five[5] = {1, 2, 3, 4, 5};
+    vsigRecordPositive(untouched, five, 5, 3000u);
+    vsigRecordPositive(untouched, five, 0, 3000u);
+    vsigRecordPositive(untouched, nullptr, 2, 3000u);
+    TEST_ASSERT_FALSE(untouched.hasValue);
+}
+
+void test_vsig_state_precedence_age_and_raw_field(void) {
+    VehicleSignalRecord r;
+    const uint16_t stale = 300;
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_NEVER_RECEIVED, vsigState(r, stale, 5000u));
+    TEST_ASSERT_EQUAL_UINT16(BLE_TELEMETRY_AGE_NEVER_RECEIVED, vsigAgeMs(r, 5000u));
+    TEST_ASSERT_EQUAL_UINT32(0u, vsigRawField(r, vsigState(r, stale, 5000u)));
+
+    const uint8_t b[1] = {0x2A};
+    vsigRecordPositive(r, b, 1, 5000u);
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_VALID, vsigState(r, stale, 5300u)); // age == stale_after_ms
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_STALE, vsigState(r, stale, 5301u));
+    TEST_ASSERT_EQUAL_UINT32(0x2Au, vsigRawField(r, BLE_VSIG_STATE_STALE));
+    TEST_ASSERT_EQUAL_UINT16(301u, vsigAgeMs(r, 5301u));
+    TEST_ASSERT_EQUAL_UINT16(BLE_TELEMETRY_AGE_MAX, vsigAgeMs(r, 5000u + 70000u)); // saturates
+    TEST_ASSERT_EQUAL_UINT16(10u, vsigAgeMs(r, 4990u + 20u));
+
+    vsigRecordNrc(r, 0x31);
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_NEGATIVE_RESPONSE, vsigState(r, stale, 5001u));
+    TEST_ASSERT_EQUAL_UINT32(0x31u, vsigRawField(r, BLE_VSIG_STATE_NEGATIVE_RESPONSE));
+    TEST_ASSERT_EQUAL_UINT16(1u, vsigAgeMs(r, 5001u)); // age of the last positive answer
+    r.skipped = true;
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_SKIPPED, vsigState(r, stale, 5001u)); // skipped first
+    TEST_ASSERT_EQUAL_UINT32(0u, vsigRawField(r, BLE_VSIG_STATE_SKIPPED));
+    r.skipped = false;
+    vsigRecordPositive(r, b, 1, 6000u); // a positive answer clears the NRC
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_VALID, vsigState(r, stale, 6000u));
+    // millis() wrap
+    VehicleSignalRecord w;
+    vsigRecordPositive(w, b, 1, 0xFFFFFFF0u);
+    TEST_ASSERT_EQUAL_UINT16(0x20u, vsigAgeMs(w, 0x10u));
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_VALID, vsigState(w, stale, 0x10u));
+}
+
+void test_vsig_every_generated_did_fits_the_raw_field(void) {
+    // safety-reviewer M3: vsigRecordPositive() ignores a longer DID; defs codegen refuses one.
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_TRUE(vehicle_cl250_dids[i].length >= 1u);
+        TEST_ASSERT_TRUE(vehicle_cl250_dids[i].length <= BLE_VSIG_RECORD_RAW_SIZE);
+    }
+}
+
+void test_vsig_records_per_block_follow_mtu(void) {
+    TEST_ASSERT_EQUAL_UINT8(1, vsigRecordsPerBlock(blePayloadLimit(BLE_DEFAULT_MTU))); // never suspended
+    TEST_ASSERT_EQUAL_UINT8(0, vsigRecordsPerBlock(18));
+    TEST_ASSERT_EQUAL_UINT8(1, vsigRecordsPerBlock(19));
+    TEST_ASSERT_EQUAL_UINT8(2, vsigRecordsPerBlock(28));
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_MAX_RECORDS_PER_BLOCK, vsigRecordsPerBlock(blePayloadLimit(BLE_GATT_REQUESTED_MTU)));
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_MAX_RECORDS_PER_BLOCK, vsigRecordsPerBlock(blePayloadLimit(512)));
+}
+
+void test_vsig_block_layout_matches_the_schema(void) {
+    VehicleSignalStore store;
+    const uint8_t rpm[2] = {0x46, 0x50};
+    vsigRecordPositive(store.dids[0], rpm, 2, 9000u);
+    vsigRecordNrc(store.dids[1], 0x31);
+    uint8_t out[VSIG_BLOCK_MAX_BYTES];
+    memset(out, 0xEE, sizeof(out));
+    const uint8_t n = VEHICLE_CL250_DID_COUNT;
+    size_t len = packVehicleSignalBlock(store, 0, n, 7, 9040u, out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(BLE_VSIG_HEADER_BYTES + n * BLE_VSIG_RECORD_BYTES, len);
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_BLOCK_VERSION, out[0]);
+    TEST_ASSERT_EQUAL_UINT8(7, out[1]);
+    TEST_ASSERT_EQUAL_UINT32(9040u, vsigLe32(&out[2]));
+    TEST_ASSERT_EQUAL_UINT8(VEHICLE_CL250_DID_COUNT, out[6]);
+    TEST_ASSERT_EQUAL_UINT8(0, out[7]);
+    TEST_ASSERT_EQUAL_UINT8(n, out[8]);
+    TEST_ASSERT_EQUAL_UINT8(0, out[9]);
+    const uint8_t* r0 = &out[BLE_VSIG_HEADER_BYTES];
+    TEST_ASSERT_EQUAL_HEX16(vehicle_cl250_dids[0].did, vsigLe16(&r0[0])); // DID from gen/, little-endian
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_VALID, r0[2]);
+    TEST_ASSERT_EQUAL_UINT16(40u, vsigLe16(&r0[3]));
+    TEST_ASSERT_EQUAL_HEX32(0x4650, vsigLe32(&r0[5]));
+    const uint8_t* r1 = r0 + BLE_VSIG_RECORD_BYTES;
+    TEST_ASSERT_EQUAL_HEX16(vehicle_cl250_dids[1].did, vsigLe16(&r1[0]));
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_NEGATIVE_RESPONSE, r1[2]);
+    TEST_ASSERT_EQUAL_UINT16(BLE_TELEMETRY_AGE_NEVER_RECEIVED, vsigLe16(&r1[3]));
+    TEST_ASSERT_EQUAL_HEX32(0x31, vsigLe32(&r1[5]));
+    const uint8_t* rLast = r0 + (n - 1) * BLE_VSIG_RECORD_BYTES;
+    TEST_ASSERT_EQUAL_HEX16(vehicle_cl250_dids[n - 1].did, vsigLe16(&rLast[0]));
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_NEVER_RECEIVED, rLast[2]);
+    TEST_ASSERT_EQUAL_HEX32(0, vsigLe32(&rLast[5]));
+    TEST_ASSERT_EQUAL_HEX8(0xEE, out[len]); // nothing written past the block
+
+    // A sub-range starts at its table index.
+    len = packVehicleSignalBlock(store, 1, 1, 8, 9040u, out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(BLE_VSIG_HEADER_BYTES + BLE_VSIG_RECORD_BYTES, len);
+    TEST_ASSERT_EQUAL_UINT8(1, out[7]);
+    TEST_ASSERT_EQUAL_HEX16(vehicle_cl250_dids[1].did, vsigLe16(&out[BLE_VSIG_HEADER_BYTES]));
+}
+
+void test_vsig_block_refuses_bad_ranges_and_small_buffers(void) {
+    VehicleSignalStore store;
+    uint8_t out[VSIG_BLOCK_MAX_BYTES];
+    memset(out, 0xEE, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(0, packVehicleSignalBlock(store, 0, 0, 0, 0, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT32(0, packVehicleSignalBlock(store, VEHICLE_CL250_DID_COUNT, 1, 0, 0, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT32(0, packVehicleSignalBlock(store, 1, VEHICLE_CL250_DID_COUNT, 0, 0, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT32(0, packVehicleSignalBlock(store, 0, 1, 0, 0, out, BLE_VSIG_HEADER_BYTES + BLE_VSIG_RECORD_BYTES - 1));
+    TEST_ASSERT_EQUAL_UINT32(0, packVehicleSignalBlock(store, 0, 1, 0, 0, nullptr, sizeof(out)));
+    TEST_ASSERT_EQUAL_HEX8(0xEE, out[0]); // untouched
+}
+
+void test_vsig_period_plan_pages_through_the_table(void) {
+    const uint8_t total = VEHICLE_CL250_DID_COUNT;
+    // Full MTU: the whole table in one block, the next period starts at 0 again.
+    VsigPeriodPlan p = planVehicleSignalPeriod(0, BLE_VSIG_MAX_RECORDS_PER_BLOCK);
+    TEST_ASSERT_EQUAL_UINT8(1, p.blocks);
+    TEST_ASSERT_EQUAL_UINT8(0, p.first[0]);
+    TEST_ASSERT_EQUAL_UINT8(total, p.count[0]);
+    TEST_ASSERT_EQUAL_UINT8(0, p.next);
+    // Default MTU: one record per block, at most 3 blocks, the next period continues.
+    p = planVehicleSignalPeriod(0, 1);
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_MAX_BLOCKS_PER_PERIOD < total ? BLE_VSIG_MAX_BLOCKS_PER_PERIOD : total, p.blocks);
+    for (uint8_t b = 0; b < p.blocks; b++) {
+        TEST_ASSERT_EQUAL_UINT8(b, p.first[b]);
+        TEST_ASSERT_EQUAL_UINT8(1, p.count[b]);
+    }
+    // Starting mid-table: the block ends at the table end, the next one starts at 0, and no
+    // record is sent twice in one period.
+    p = planVehicleSignalPeriod((uint8_t)(total - 1), BLE_VSIG_MAX_RECORDS_PER_BLOCK);
+    TEST_ASSERT_EQUAL_UINT8(total > 1 ? 2 : 1, p.blocks);
+    TEST_ASSERT_EQUAL_UINT8(total - 1, p.first[0]);
+    TEST_ASSERT_EQUAL_UINT8(1, p.count[0]);
+    if (total > 1) {
+        TEST_ASSERT_EQUAL_UINT8(0, p.first[1]);
+        TEST_ASSERT_EQUAL_UINT8(total - 1, p.count[1]);
+    }
+    TEST_ASSERT_EQUAL_UINT8(total - 1, p.next);
+    // Every DID is covered within ceil(total / 3) periods at the default MTU.
+    uint8_t seen[VEHICLE_CL250_DID_COUNT] = {};
+    uint8_t next = 0;
+    for (int period = 0; period < (total + 2) / 3; period++) {
+        p = planVehicleSignalPeriod(next, 1);
+        for (uint8_t b = 0; b < p.blocks; b++) seen[p.first[b]]++;
+        next = p.next;
+    }
+    for (uint8_t i = 0; i < total; i++) TEST_ASSERT_TRUE(seen[i] >= 1);
+    // Nothing fits: nothing planned; an out-of-table start restarts at 0.
+    TEST_ASSERT_EQUAL_UINT8(0, planVehicleSignalPeriod(0, 0).blocks);
+    TEST_ASSERT_EQUAL_UINT8(0, planVehicleSignalPeriod(200, 1).first[0]);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_system_state_initial_values);
@@ -664,5 +834,12 @@ int main(int, char**) {
     RUN_TEST(test_json_stale_values_are_null);
     RUN_TEST(test_json_escapes_phone_strings_and_fits_worst_case);
     RUN_TEST(test_json_reports_overflow_instead_of_truncating);
+    RUN_TEST(test_vsig_raw_is_big_endian_data_bytes_and_length_guarded);
+    RUN_TEST(test_vsig_state_precedence_age_and_raw_field);
+    RUN_TEST(test_vsig_every_generated_did_fits_the_raw_field);
+    RUN_TEST(test_vsig_records_per_block_follow_mtu);
+    RUN_TEST(test_vsig_block_layout_matches_the_schema);
+    RUN_TEST(test_vsig_block_refuses_bad_ranges_and_small_buffers);
+    RUN_TEST(test_vsig_period_plan_pages_through_the_table);
     return UNITY_END();
 }

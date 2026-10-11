@@ -213,6 +213,17 @@ void HondaCANModule::publishHealth(SystemState& state) {
     }
     h.busOffCount = _busOffEventCount;
     h.unansweredDidCount = _unansweredDidCount;
+    // D-066 item 4: which DIDs sit in their timeout cool-down (read-only mirror). Once
+    // latched off nothing is read any more: no DID is skipped and no NRC is current, so the
+    // values only age into STALE (safety-reviewer M1).
+    const unsigned long now = millis();
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        VehicleSignalRecord& r = state.vehicleSignals.dids[i];
+        r.skipped = !_latchedOff && beforeDeadline(now, _dids[i].skipUntilMs);
+        if (_latchedOff) {
+            r.lastWasNrc = false;
+        }
+    }
     if (_latchedOff) {
         h.busState = CanHealthState::STOPPED;
         return;
@@ -447,6 +458,9 @@ void HondaCANModule::poll(SystemState& state) {
         DidSlot& slot = _dids[_pendingDidIndex];
         slot.consecutiveTimeouts++;
         _unansweredDidCount++;
+        // D-066 item 4: silence is now this DID's latest answer, so an earlier NRC is no
+        // longer shown (safety-reviewer M1); the record falls back to its value's age.
+        state.vehicleSignals.dids[_pendingDidIndex].lastWasNrc = false;
         // D-058: the timed-out request's answer may still come and resolve a later request
         // early (see recordRoundTrip()); statistics only, the schedule is unchanged.
         _rttQuietUntilMs = now + kResponsePendingMaxMs;
@@ -611,7 +625,11 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
         const vehicle_cl250_did_t* entry = vehicle_cl250_find(echoedDid);
         float value = 0.0f;
         if (entry != nullptr && vehicle_cl250_parse_response(echoedDid, rxMsg.data, rxMsg.dlc, &value)) {
-            storeValue(state, (uint8_t)(entry - vehicle_cl250_dids), value, now);
+            const uint8_t didIndex = (uint8_t)(entry - vehicle_cl250_dids);
+            storeValue(state, didIndex, value, now);
+            // D-066 item 4: the same validated answer, as raw data bytes for the BLE
+            // vehicle-signal block. Bookkeeping only; nothing here changes what is sent.
+            vsigRecordPositive(state.vehicleSignals.dids[didIndex], &rxMsg.data[4], entry->length, (uint32_t)now);
 
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
@@ -670,6 +688,13 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
                 if (forPendingRead) {
+                    // D-066 item 4: shown as the pending DID's answer, except in the quiet
+                    // window after a timeout, where the NRC (it carries no DID) may belong to
+                    // the timed-out read (see recordRoundTrip()). A scan entry is no DID
+                    // (_pendingDidIndex -1). Bookkeeping only, like the round-trip record.
+                    if (_pendingDidIndex >= 0 && !_pendingRttSkip) {
+                        vsigRecordNrc(state.vehicleSignals.dids[_pendingDidIndex], nrc);
+                    }
                     recordRoundTrip(now);
                     _udsState = UdsRequestState::COMPLETE;
                 }

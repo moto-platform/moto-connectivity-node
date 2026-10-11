@@ -1638,6 +1638,8 @@ void test_round_trip_none_while_a_late_answer_can_still_arrive(void) {
     module.update(state);
     TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[didIndexOf(nextDid)].count);
     TEST_ASSERT_EQUAL_UINT32(1, state.can.unansweredDidCount);
+    // D-066 item 4: nor is it shown as that DID's negative answer on the vehicle-signal block.
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[didIndexOf(nextDid)].lastWasNrc);
 
     // Requests sent after the window are sampled again (answered on the next 1 ms pass).
     runAnswering(module, bus, state, t, timeoutAt + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 500);
@@ -1647,6 +1649,201 @@ void test_round_trip_none_while_a_late_answer_can_still_arrive(void) {
     TEST_ASSERT_EQUAL_UINT16(1, r.minMs);
     TEST_ASSERT_EQUAL_UINT16(1, r.maxMs);
     TEST_ASSERT_EQUAL_UINT32(r.count, r.sumMs);
+}
+
+// ---------------------------------------------------------------------------
+// D-066 item 4: the tester's per-DID bookkeeping for the BLE vehicle-signal block
+// ---------------------------------------------------------------------------
+
+void test_vehicle_signals_keep_raw_bytes_of_the_validated_answer(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_FALSE(state.vehicleSignals.dids[i].hasValue);
+    }
+    unsigned long t = 0;
+    runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    const VehicleSignalRecord& rpm = state.vehicleSignals.dids[kRpmIdx];
+    TEST_ASSERT_TRUE(rpm.hasValue);
+    TEST_ASSERT_EQUAL_HEX32(0x4650, rpm.raw); // the 2 data bytes, big-endian, unscaled
+    TEST_ASSERT_EQUAL_UINT32(kT0 + t, rpm.updatedMs);
+    TEST_ASSERT_FALSE(rpm.lastWasNrc);
+
+    // A one-byte DID keeps one byte, the padding after it is not part of raw.
+    const uint8_t speedIdx = VEHICLE_CL250_IDX_VEHICLE_SPEED;
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_VEHICLE_SPEED, 0x2A, 0xAA, 5));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[speedIdx].hasValue);
+    TEST_ASSERT_EQUAL_HEX32(0x2A, state.vehicleSignals.dids[speedIdx].raw);
+
+    // An answer the generated parser refuses (out of range / short) is not recorded.
+    const uint8_t battIdx = VEHICLE_CL250_IDX_BATTERY_VOLTAGE;
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_BATTERY_VOLTAGE, 0x30, 0x00, 5));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[battIdx].hasValue);
+}
+
+void test_vehicle_signals_nrc_of_the_pending_read_then_answer_clears_it(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    // 0x78 is no answer: nothing recorded.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    TEST_ASSERT_EQUAL_HEX8(0x31, state.vehicleSignals.dids[kRpmIdx].nrc);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].hasValue);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (i != kRpmIdx) TEST_ASSERT_FALSE(state.vehicleSignals.dids[i].lastWasNrc);
+    }
+    // An NRC for another service (session control) is never attributed to a DID.
+    runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 2, t);
+    bus.injectRxFrame(makeNegativeResponse(0x10, 0x22));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_EQUAL_HEX8(0x31, state.vehicleSignals.dids[kRpmIdx].nrc);
+    // The next positive answer clears it.
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x10, 0x00));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[kRpmIdx].hasValue);
+    TEST_ASSERT_EQUAL_HEX32(0x1000, state.vehicleSignals.dids[kRpmIdx].raw);
+}
+
+void test_vehicle_signals_mirror_the_skip_cooldown(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = kRpmDueMs;
+    for (unsigned cycle = 0; cycle < VEHICLE_CL250_MAX_CONSECUTIVE_TIMEOUTS; cycle++) {
+        TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].skipped);
+        setClock(t);
+        module.update(state);
+        t += 151;
+        setClock(t);
+        module.update(state);
+        t += 1;
+    }
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[kRpmIdx].skipped);
+    t += VEHICLE_CL250_DID_SKIP_COOLDOWN_MS + 10;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].skipped);
+}
+
+void test_vehicle_signals_nrc_cleared_by_a_timeout_and_by_the_latch(void) {
+    // safety-reviewer M1: an NRC is shown only while it is the DID's latest answer.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    // The next engine-speed read gets no answer at all: the NRC is no longer current.
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 2, t);
+    t = sent + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 5;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_TRUE(state.can.unansweredDidCount >= 1);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_NEVER_RECEIVED,
+                            vsigState(state.vehicleSignals.dids[kRpmIdx], vehicle_cl250_dids[kRpmIdx].stale_after_ms,
+                                      (uint32_t)(kT0 + t)));
+
+    // An NRC, then a foreign tester latches the poller off: no NRC and no skip stay current.
+    // First leave the quiet window after the timeout (an NRC in it is not attributed),
+    // answering every engine-speed read meanwhile so no new timeout extends it.
+    const unsigned long quietEnd = t + VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS + 10;
+    int reads = 3;
+    for (;;) {
+        sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, reads++, t);
+        if (sent > quietEnd) {
+            break;
+        }
+        bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    }
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x22));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    CanFrame foreign;
+    foreign.id = VEHICLE_CL250_REQUEST_ID;
+    foreign.extended = true;
+    foreign.dlc = 8;
+    const uint8_t d[8] = {0x03, UDS_SID_READ_DATA_BY_IDENTIFIER, 0xF4, 0x0D, 0xAA, 0xAA, 0xAA, 0xAA};
+    for (int i = 0; i < 8; i++) foreign.data[i] = d[i];
+    bus.injectRxFrame(foreign);
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_TRUE(module.latchedOff());
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_FALSE(state.vehicleSignals.dids[i].lastWasNrc);
+        TEST_ASSERT_FALSE(state.vehicleSignals.dids[i].skipped);
+    }
+}
+
+void test_vehicle_signals_quiet_window_nrc_then_answer_stays_valid(void) {
+    // An NRC in the quiet window after a timeout (it may be the timed-out read's) is not
+    // shown, and the next positive answer makes the record VALID.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    unsigned long sent = runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 1, t);
+    t = sent + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 5;
+    setClock(t);
+    module.update(state); // timeout: the quiet window starts
+    runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 2, t);
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, 0x31));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
+    runUntilRequested(module, bus, state, VEHICLE_CL250_DID_ENGINE_SPEED, 3, t);
+    bus.injectRxFrame(makePositiveResponse(VEHICLE_CL250_DID_ENGINE_SPEED, 0x46, 0x50));
+    t += 1;
+    setClock(t);
+    module.update(state);
+    TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_VALID,
+                            vsigState(state.vehicleSignals.dids[kRpmIdx], vehicle_cl250_dids[kRpmIdx].stale_after_ms,
+                                      (uint32_t)(kT0 + t)));
 }
 
 void test_tester_stats_do_not_change_what_is_sent(void) {
@@ -1667,6 +1864,7 @@ void test_tester_stats_do_not_change_what_is_sent(void) {
         size_t logged = 0;
         int rpmReads = 0;
         unsigned long deferredAt = 0;
+        bool sawValue = false, sawNrc = false, sawSkip = false;
         for (unsigned long t = 1; t < 6000; t++) {
             test_setMicros(run == 0 ? 0 : (uint32_t)(t * 997u + (t % 7u) * 12345u));
             setClock(t);
@@ -1679,6 +1877,28 @@ void test_tester_stats_do_not_change_what_is_sent(void) {
             }
             const size_t before = bus.txLog.size();
             module.update(state);
+            if (run == 1) {
+                // D-066 item 4: note what the bookkeeping saw, then overwrite it with garbage
+                // and pack it: what is sent must not depend on it.
+                for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+                    const VehicleSignalRecord& r = state.vehicleSignals.dids[i];
+                    sawValue = sawValue || r.hasValue;
+                    sawNrc = sawNrc || r.lastWasNrc;
+                    sawSkip = sawSkip || r.skipped;
+                }
+                for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+                    VehicleSignalRecord& r = state.vehicleSignals.dids[i];
+                    r.raw = 0xDEADBEEFu ^ (uint32_t)t;
+                    r.updatedMs = (uint32_t)(t * 31u);
+                    r.hasValue = (t & 1u) != 0u;
+                    r.lastWasNrc = (t & 2u) != 0u;
+                    r.nrc = 0x7F;
+                    r.skipped = (t & 4u) != 0u;
+                }
+                uint8_t block[VSIG_BLOCK_MAX_BYTES];
+                (void)packVehicleSignalBlock(state.vehicleSignals, 0, VEHICLE_CL250_DID_COUNT, (uint8_t)t,
+                                             (uint32_t)t, block, sizeof(block));
+            }
             uint16_t did = 0;
             if (!silent && newDidRequest(bus, before, did)) {
                 if (did == VEHICLE_CL250_DID_ENGINE_SPEED && ++rpmReads % 4 == 0) {
@@ -1699,6 +1919,9 @@ void test_tester_stats_do_not_change_what_is_sent(void) {
             TEST_ASSERT_TRUE(state.tester.rtt[kRpmIdx].count > 0);
             TEST_ASSERT_TRUE(state.tester.rtt[kRpmIdx].nrc78Count > 0);
             TEST_ASSERT_TRUE(state.tester.stepGapMaxMs > 0);
+            TEST_ASSERT_TRUE(sawValue);
+            TEST_ASSERT_TRUE(sawNrc);
+            TEST_ASSERT_TRUE(sawSkip);
         }
         test_setMicros(0);
     }
@@ -1774,6 +1997,11 @@ int main(int, char**) {
     RUN_TEST(test_round_trip_sample_for_nrc_other_than_0x78);
     RUN_TEST(test_round_trip_counters_saturate);
     RUN_TEST(test_round_trip_none_while_a_late_answer_can_still_arrive);
+    RUN_TEST(test_vehicle_signals_keep_raw_bytes_of_the_validated_answer);
+    RUN_TEST(test_vehicle_signals_nrc_of_the_pending_read_then_answer_clears_it);
+    RUN_TEST(test_vehicle_signals_mirror_the_skip_cooldown);
+    RUN_TEST(test_vehicle_signals_nrc_cleared_by_a_timeout_and_by_the_latch);
+    RUN_TEST(test_vehicle_signals_quiet_window_nrc_then_answer_stays_valid);
     RUN_TEST(test_tester_stats_do_not_change_what_is_sent);
     return UNITY_END();
 }
