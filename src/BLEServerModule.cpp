@@ -18,6 +18,7 @@
 #define CHARACTERISTIC_UUID_RX  BLE_GATT_TELEMATICS_RX_CHAR_UUID
 #define CHARACTERISTIC_UUID_IMU BLE_GATT_IMU_CHAR_UUID
 #define CHARACTERISTIC_UUID_GPS BLE_GATT_GPS_CHAR_UUID
+#define CHARACTERISTIC_UUID_VSIG BLE_GATT_VEHICLE_SIGNALS_CHAR_UUID
 
 // Largest ATT MTU this node accepts; the central asks for BLE_GATT_REQUESTED_MTU (185) and the
 // negotiated value is the smaller of the two. It must not be below what the schema promises.
@@ -147,6 +148,14 @@ bool BLEServerModule::begin() {
     _pGpsCccd->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
     _pGpsCharacteristic->addDescriptor(_pGpsCccd);
 
+    // Vehicle-signal block (Notify) Characteristic, D-066 item 4: every DID of the tester's
+    // table, keyed by DID. Engine data like telemetry, so no encryption requirement.
+    _pVsigCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID_VSIG,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    _pVsigCharacteristic->addDescriptor(new BLE2902()); // one-time, see begin() note on heap use
+
     // Create Telematics RX (Write) Characteristic
     _pRxCharacteristic = pService->createCharacteristic(
         CHARACTERISTIC_UUID_RX,
@@ -263,6 +272,7 @@ void BLEServerModule::update(SystemState& state) {
                 _deviceConnected = evt.connected;
                 state.telematics.phoneConnected = evt.connected;
                 if (evt.connected) {
+                    _vsigNext = 0; // a new peer gets the table from its start
                     _gpsTracker.arm(state.gps.navPvtCount, gpsErrorCounters(state.gps));
                 } else {
                     _gpsTracker.disarm();
@@ -283,9 +293,11 @@ void BLEServerModule::update(SystemState& state) {
         uint16_t mtu = s_peerMtu.load(std::memory_order_relaxed);
         if (mtu != _loggedMtu) {
             _loggedMtu = mtu;
-            Serial.printf("[BLE] Peer MTU %u: telemetry v%u, %u IMU samples per block, GPS blocks %s.\n",
+            Serial.printf("[BLE] Peer MTU %u: telemetry v%u, %u IMU samples per block, GPS blocks %s, "
+                "%u vehicle-signal records per block.\n",
                 mtu, telemetryVersionForMtu(mtu), imuSamplesPerBlock(mtu),
-                blePayloadLimit(mtu) >= GPS_BLOCK_BYTES ? "on" : "suspended");
+                blePayloadLimit(mtu) >= GPS_BLOCK_BYTES ? "on" : "suspended",
+                vsigRecordsPerBlock(blePayloadLimit(mtu)));
         }
         sendTelemetry(state, now, mtu);
         _imuDue = true;
@@ -294,6 +306,11 @@ void BLEServerModule::update(SystemState& state) {
         // carries more than IMU_MAX_BLOCKS_PER_NOTIFY notifications (CAN poller timing).
         _imuDue = false;
         sendImuBlocks(s_peerMtu.load(std::memory_order_relaxed));
+    } else if (_deviceConnected && (now - _lastVsigNotify >= BLE_VSIG_NOTIFY_PERIOD_MS)) {
+        // D-066 item 4: vehicle-signal blocks on a pass of their own, at most
+        // BLE_VSIG_MAX_BLOCKS_PER_PERIOD (3) notifications, like the IMU pass (D-053).
+        _lastVsigNotify = now;
+        sendVehicleSignalBlocks(state, now, s_peerMtu.load(std::memory_order_relaxed));
     } else if (_deviceConnected) {
         // GPS comes after telemetry and IMU in this chain, so a pass still carries at most
         // IMU_MAX_BLOCKS_PER_NOTIFY notifications (D-053). One block per NAV-PVT, at most one
@@ -362,6 +379,23 @@ void BLEServerModule::sendImuBlocks(uint16_t mtu) {
         events = 0; // reported once, with the first block after the event
         _pImuCharacteristic->setValue(_imuBlock, len);
         _pImuCharacteristic->notify();
+    }
+}
+
+void BLEServerModule::sendVehicleSignalBlocks(const SystemState& state, unsigned long now, uint16_t mtu) {
+    // Reads state.vehicleSignals only (the tester's bookkeeping); one record still fits the
+    // default MTU, so the block is never suspended, a small MTU only pages more slowly.
+    VsigPeriodPlan plan = planVehicleSignalPeriod(_vsigNext, vsigRecordsPerBlock(blePayloadLimit(mtu)));
+    for (uint8_t b = 0; b < plan.blocks; b++) {
+        size_t len = packVehicleSignalBlock(state.vehicleSignals, plan.first[b], plan.count[b], _vsigSeq,
+                                            (uint32_t)now, _vsigBlock, sizeof(_vsigBlock));
+        if (len == 0) {
+            return;
+        }
+        _vsigSeq++;
+        _vsigNext = (uint8_t)((plan.first[b] + plan.count[b]) % VEHICLE_CL250_DID_COUNT);
+        _pVsigCharacteristic->setValue(_vsigBlock, len);
+        _pVsigCharacteristic->notify();
     }
 }
 

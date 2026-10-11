@@ -4,6 +4,7 @@
 #include <Arduino.h>
 
 #include "GpsFix.h"
+#include "VehicleSignalBlock.h"
 #include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
 
 // G0.3 -- Data staleness tracking.
@@ -144,6 +145,9 @@ struct SystemState {
     TesterStats tester;
     ImuStatus imu;
     GpsStatus gps; // filled only in a CONN_GPS build
+    // D-066 item 4: per-DID raw value, age and answer state of the tester's whole DID table
+    // (written by HondaCANModule only), sent as the BLE vehicle-signal block.
+    VehicleSignalStore vehicleSignals;
     // No lean angle here: the legacy complementary filter was dropped (D-023). Lean comes
     // from the rt-core EKF (platform.dbc LeanEstimate) once this node reads the platform bus.
     TelematicsData telematics;

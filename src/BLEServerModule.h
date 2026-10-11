@@ -5,6 +5,7 @@
 #include "BLETelemetryPacket.h"
 #include "GpsNotifyTracker.h"
 #include "ImuBlockPacket.h"
+#include "VehicleSignalBlock.h"
 
 #include <atomic>
 
@@ -78,6 +79,14 @@ private:
     GpsNotifyTracker _gpsTracker;
     uint8_t _gpsBlock[GPS_BLOCK_BYTES] = {};
 
+    // Vehicle-signal blocks (D-066 item 4) from state.vehicleSignals, paged through the DID
+    // table (VehicleSignalBlock.h).
+    BLECharacteristic* _pVsigCharacteristic = nullptr;
+    unsigned long _lastVsigNotify = 0;
+    uint8_t _vsigSeq = 0;  // rolling vehicle-signal block counter
+    uint8_t _vsigNext = 0; // table index the next period starts at
+    uint8_t _vsigBlock[VSIG_BLOCK_MAX_BYTES] = {};
+
     // Negotiated ATT MTU of the current peer, written by the GATT event handler on the BLE
     // stack task and read by update() on the main loop task.
     static std::atomic<uint16_t> s_peerMtu;
@@ -87,6 +96,7 @@ private:
     void sendTelemetry(const SystemState& state, unsigned long now, uint16_t mtu);
     void sendImuBlocks(uint16_t mtu);
     void sendGpsBlock(const SystemState& state, unsigned long now, uint16_t mtu);
+    void sendVehicleSignalBlocks(const SystemState& state, unsigned long now, uint16_t mtu);
 
     QueueHandle_t _telematicsQueue = nullptr;
 
