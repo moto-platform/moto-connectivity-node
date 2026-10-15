@@ -44,6 +44,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 ## Conventions
 
 - Conventional Commits (`feat(uds): ...`). Commit or push only when the user asks.
+- AI tools other than Claude Code follow `AGENTS.md` (D-071): edit zones (red = Claude only), `ext/<tool>-<topic>` branches, an `AI-Agent: <tool>/<model>` commit trailer and a session log in `moto-workspace/external-ai/log/`; Claude reviews their work with `/external-review`.
 - `moto-vehicle-defs` uses semver. Consumers pin the `external/moto-vehicle-defs` submodule (relative URL) to a **tag**. The known-good combination is recorded in `moto-workspace/manifest.yaml`.
 - Releases (D-036): bump the build-file version (CMake `project(VERSION)`, `pyproject.toml`, `pubspec.yaml`) in a PR → merge after green CI → `gh release create vX.Y.Z -R moto-platform/<repo> --target main --title vX.Y.Z --generate-notes` → pin the tag in `manifest.yaml` (workspace PR). moto-vehicle-defs also adds a `CHANGELOG.md` entry; docs-only changes need no tag.
 - `docs/archive/` (Turkish originals, advisor documents) is not read by Claude (D-038).
