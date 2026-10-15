@@ -104,6 +104,36 @@ HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
     }
 }
 
+void HondaCANModule::rearmStoppedReads() {
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        DidSlot& slot = _dids[i];
+        if (slot.verified || !slot.unsupported) {
+            continue;
+        }
+        // D-069 item 3: the stop rule starts again from zero. lastRequestMs is kept, so the
+        // DID is due one cadence after its last request (never above its tier rate, D-068
+        // budget unchanged).
+        slot.unsupported = false;
+        slot.nrc31Count = 0;
+        slot.consecutiveTimeouts = 0;
+    }
+}
+
+void HondaCANModule::watchEngineStart(float rpm) {
+    if (rpm <= 0.0f) {
+        _rpmZeroSeen = true;
+        _rpmRunSamples = 0;
+        return;
+    }
+    if (!_rpmZeroSeen || _engineStartRearmed) {
+        return;
+    }
+    if (++_rpmRunSamples >= kEngineStartSamples) {
+        _engineStartRearmed = true; // once per confirmed session, not on every stall/restart
+        rearmStoppedReads();
+    }
+}
+
 void HondaCANModule::armUnverifiedReads(unsigned long now) {
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         DidSlot& slot = _dids[i];
@@ -117,6 +147,10 @@ void HondaCANModule::armUnverifiedReads(unsigned long now) {
         slot.skipUntilMs = 0;
         slot.lastRequestMs = now - slot.cadenceMs; // due at once (unsigned, wrap-safe)
     }
+    // D-069 item 3: a new confirmed session may re-arm once more at its first engine start.
+    _engineStartRearmed = false;
+    _rpmZeroSeen = false;
+    _rpmRunSamples = 0;
 }
 
 bool HondaCANModule::begin() {
@@ -500,6 +534,9 @@ void HondaCANModule::poll(SystemState& state) {
         Serial.printf("[UDS WARNING] Timeout waiting for DID 0x%04X (consecutive=%u/%u)\n",
             _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts);
 
+        if (_pendingDidIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
+            _rpmRunSamples = 0; // D-069 item 3: the RPM samples must be consecutive
+        }
         if (slot.consecutiveTimeouts >= kMaxConsecutiveTimeouts) {
             slot.consecutiveTimeouts = 0;
             if (!slot.verified && !slot.answered) {
@@ -675,9 +712,19 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             _dids[didIndex].answered = true;
             _dids[didIndex].unsupported = false;
             _dids[didIndex].nrc31Count = 0;
-
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
+                if (didIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
+                    // D-069 item 3: only the answer to the current request is a fresh sample.
+                    // In the quiet window after a timeout it may be the timed-out read's late
+                    // answer (same DID echo), so it breaks the run instead (safety-reviewer
+                    // MINOR-1).
+                    if (_pendingRttSkip) {
+                        _rpmRunSamples = 0;
+                    } else {
+                        watchEngineStart(value);
+                    }
+                }
                 recordRoundTrip(now);
                 _udsState = UdsRequestState::COMPLETE;
             }
@@ -767,6 +814,9 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                             Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x31) -- not asked again until the session is confirmed again (D-068).\n",
                                 _pendingDid);
                         }
+                    }
+                    if (_pendingDidIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
+                        _rpmRunSamples = 0; // D-069 item 3: an NRC breaks the run (MINOR-2)
                     }
                     recordRoundTrip(now);
                     _udsState = UdsRequestState::COMPLETE;

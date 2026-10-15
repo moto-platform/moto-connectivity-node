@@ -211,6 +211,17 @@ private:
     // D-068 item 2: the session was (re)confirmed. Every unverified DID is due at once and
     // asked again, whatever the last session found.
     void armUnverifiedReads(unsigned long now);
+    // D-069 item 3: every unverified DID stopped since the session confirmation becomes
+    // pollable again, due one cadence after its last request (lastRequestMs kept).
+    void rearmStoppedReads();
+    // D-069 item 3: the first engine start of a confirmed session (kEngineStartSamples
+    // consecutive answered RPM samples above 0 after a valid 0) re-arms once. The stop logs
+    // stay bounded: each DID logs its stop at most twice per confirmed session.
+    void watchEngineStart(float rpm);
+    static constexpr uint8_t kEngineStartSamples = 2;
+    bool _engineStartRearmed = false;
+    bool _rpmZeroSeen = false;
+    uint8_t _rpmRunSamples = 0;
 
     // Saves the latch, then stops the CAN driver and all polling (survives resets
     // other than power-on, see ITesterLatchStore).
