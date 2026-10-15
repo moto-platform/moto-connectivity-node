@@ -13,8 +13,8 @@
 /**
  * @brief 100 Hz raw accel + gyro sampler for data collection (D-032, Claude proposal).
  *
- * Sensor: MPU-6050 register-compatible 6-axis IMU on I2C (SDA GPIO6,
- * SCL GPIO7, 400 kHz, address 0x68), configured to +-8 g / +-500 deg/s so the raw counts
+ * Sensor: MPU-6050 register-compatible 6-axis IMU on I2C (SDA GPIO7,
+ * SCL GPIO6, 400 kHz, address 0x68), configured to +-8 g / +-500 deg/s so the raw counts
  * match the schema scale (4096 LSB/g, 65.5 LSB/(deg/s)).
  *
  * Timing: an esp_timer fires every 10 ms and only wakes a dedicated sampler task pinned to

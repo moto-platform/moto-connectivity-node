@@ -6,11 +6,11 @@
 
 namespace {
 
-// Phase 0 wiring (hardware-integration.md §3.3): GPIO6/7, moved from the legacy GPIO1/2
+// Phase 0 wiring (hardware-integration.md §3.3): SDA GPIO7 / SCL GPIO6, moved from the legacy GPIO1/2
 // (Phase 0 build, 2026-10-15); GPIO4/5 stay with CAN.
 const i2c_port_t kI2cPort = I2C_NUM_0;
-const gpio_num_t kSdaPin = GPIO_NUM_6;
-const gpio_num_t kSclPin = GPIO_NUM_7;
+const gpio_num_t kSdaPin = GPIO_NUM_7;
+const gpio_num_t kSclPin = GPIO_NUM_6;
 const uint32_t kI2cClockHz = 400000;
 const TickType_t kI2cTimeoutTicks = pdMS_TO_TICKS(5); // 14-byte burst read takes ~0.4 ms
 
