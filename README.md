@@ -4,7 +4,7 @@ ESP32-S3 firmware of the [moto-platform](https://github.com/moto-platform) motor
 
 - `HondaCANModule`: UDS tester for the CL250 engine ECU. This node is the **temporary sole vehicle-bus tester** (D-021/D-023); only the D-020 service allow-list can be sent, enforced by the generated `vehicle_cl250_frame_allowed()` guard.
 - `BLEServerModule`: telemetry notifications to moto-mobile, layout in moto-vehicle-defs `ble/ble_schema.json` (D-061, generated `gen/c/conn/ble_schema.h`): version 4 with node clock, signal ages, CAN health and the tester statistics of D-058 (step gap, one rotating per-DID ECU round-trip record); version 2 when the negotiated MTU is too small, plus 100 Hz IMU sample blocks on a second characteristic (D-032) and, in the GPS build, one speed/heading block per UBX NAV-PVT on a third (D-060; no position; subscribing needs a bonded link), and the vehicle-signal block on a fourth: every polled DID keyed by DID with state, age and raw value, decoded by the receivers through the defs catalog (D-066 item 4).
-- `ImuModule`: MPU-6050 compatible IMU on I2C (SDA GPIO1, SCL GPIO2), sampled at 100 Hz by an esp_timer-driven task on core 0 into a static ring buffer, so it never delays the CAN poller in the main loop. Raw data for analysis only, no lean estimate.
+- `ImuModule`: MPU-6050 compatible IMU on I2C (SDA GPIO6, SCL GPIO7), sampled at 100 Hz by an esp_timer-driven task on core 0 into a static ring buffer, so it never delays the CAN poller in the main loop. Raw data for analysis only, no lean estimate.
 - `WiFiServerModule`: on-demand access point with `/api/telemetry` JSON (static buffers, no Arduino `String`).
 - `NextionModule`, `SerialLoggerModule`, `MockCANModule` (synthetic data for bench tests).
 
