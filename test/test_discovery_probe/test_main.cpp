@@ -490,12 +490,15 @@ void test_no_fc_without_a_scan_request_in_flight(void) {
         setClock(t += 5);
         module.update(state);
     }
+    // D-068: the unverified DIDs' first reads went out right after the scan and this mock
+    // ECU answers none of them, so count only what the FF changes.
+    const uint32_t unansweredBefore = module.unansweredDidCount();
     Bytes did = {0x62, 0xF4, 0x0C, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
     bus.injectRxFrame(firstFrame(did));
     setClock(t += 5);
     module.update(state);
     TEST_ASSERT_EQUAL(0, countFc(bus));
-    TEST_ASSERT_EQUAL_UINT32(0, module.unansweredDidCount());
+    TEST_ASSERT_EQUAL_UINT32(unansweredBefore, module.unansweredDidCount());
     // An unsolicited FF while idle: no FC either.
     bus.injectRxFrame(firstFrame(defaultEcu(requestOf(kDtcList))));
     setClock(t += 5);
@@ -1041,6 +1044,36 @@ void test_supported_ids_do_not_wrap_at_the_end_of_a_range(void) {
     TEST_ASSERT_TRUE(anyLine("supported: F4E1 F500"));
 }
 
+void test_d068_first_frame_answer_stops_an_unverified_did(void) {
+    // Safety-reviewer MINOR-2: a segmented answer to an unverified DID gets no FC and holds
+    // every request for the quiet time; the DID is stopped instead of asked each period.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = startScan(module, bus, state);
+    runScan(module, bus, state, t, defaultEcu);
+    uint8_t idx = 0;
+    while (vehicle_cl250_dids[idx].verified) idx++;
+    const uint16_t did = vehicle_cl250_dids[idx].did;
+    bus.clearTxLog(); // the scan's own FCs are not this test's
+    while (bus.countDidRequests(did) == 0) {
+        setClock(t += 1);
+        module.update(state);
+    }
+    bus.injectRxFrame(firstFrame({0x62, (uint8_t)(did >> 8), (uint8_t)(did & 0xFF), 1, 2, 3, 4, 5, 6, 7}));
+    setClock(t += 1);
+    module.update(state);
+    TEST_ASSERT_EQUAL(0, countFc(bus));
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    const int requests = bus.countDidRequests(did);
+    for (int i = 0; i < 300; i++) {
+        setClock(t += 50);
+        module.update(state);
+    }
+    TEST_ASSERT_EQUAL(requests, bus.countDidRequests(did));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_table_indexes_used_by_these_tests);
@@ -1078,5 +1111,6 @@ int main(int, char**) {
     RUN_TEST(test_a_reception_longer_than_the_maximum_wait_is_aborted);
     RUN_TEST(test_nrc_0x78_then_a_segmented_answer);
     RUN_TEST(test_supported_ids_do_not_wrap_at_the_end_of_a_range);
+    RUN_TEST(test_d068_first_frame_answer_stops_an_unverified_did);
     return UNITY_END();
 }
