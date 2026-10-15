@@ -2326,6 +2326,35 @@ void test_d069_engine_start_rearms_the_stopped_dids_once(void) {
     gAlwaysRefusedDid = 0;
 }
 
+static int gRpmReads = 0;
+static EcuReply ecuRpmRunBrokenByNrc(uint16_t did) {
+    if (did == VEHICLE_CL250_DID_ENGINE_SPEED && gEngineRunning) {
+        // Running: every other RPM read is refused, so no two answers above 0 are consecutive.
+        return (gRpmReads++ % 2 == 0) ? EcuReply::ANSWER : EcuReply::NRC_OUT_OF_RANGE;
+    }
+    return ecuServesStopDidOnlyWithEngineRunning(did);
+}
+
+void test_d069_an_nrc_on_rpm_breaks_the_engine_start_run(void) {
+    // safety-reviewer MINOR-2: 0, >0, NRC, >0, NRC ... is no engine start.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gEngineRunning = false;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuRpmRunBrokenByNrc);
+    runEcu(module, bus, state, t, 8000, ecuRpmRunBrokenByNrc);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    gEngineRunning = true;
+    gRpmReads = 0;
+    runEcu(module, bus, state, t, t + 3000, ecuRpmRunBrokenByNrc);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+}
+
 void test_d069_engine_start_rearm_keeps_the_tier_slot(void) {
     // D-069 item 3 (safety-reviewer, Q-030): a re-armed DID is due one cadence after its last
     // request, not at once, so the re-ask never exceeds its tier rate.
@@ -2459,5 +2488,6 @@ int main(int, char**) {
     RUN_TEST(test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids);
     RUN_TEST(test_d069_engine_start_rearms_the_stopped_dids_once);
     RUN_TEST(test_d069_engine_start_rearm_keeps_the_tier_slot);
+    RUN_TEST(test_d069_an_nrc_on_rpm_breaks_the_engine_start_run);
     return UNITY_END();
 }

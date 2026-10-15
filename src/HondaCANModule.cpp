@@ -715,9 +715,15 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
                 if (didIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
-                    // D-069 item 3: only the answer to the current request is a fresh sample;
-                    // a late answer is not counted.
-                    watchEngineStart(value);
+                    // D-069 item 3: only the answer to the current request is a fresh sample.
+                    // In the quiet window after a timeout it may be the timed-out read's late
+                    // answer (same DID echo), so it breaks the run instead (safety-reviewer
+                    // MINOR-1).
+                    if (_pendingRttSkip) {
+                        _rpmRunSamples = 0;
+                    } else {
+                        watchEngineStart(value);
+                    }
                 }
                 recordRoundTrip(now);
                 _udsState = UdsRequestState::COMPLETE;
@@ -808,6 +814,9 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                             Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x31) -- not asked again until the session is confirmed again (D-068).\n",
                                 _pendingDid);
                         }
+                    }
+                    if (_pendingDidIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
+                        _rpmRunSamples = 0; // D-069 item 3: an NRC breaks the run (MINOR-2)
                     }
                     recordRoundTrip(now);
                     _udsState = UdsRequestState::COMPLETE;
