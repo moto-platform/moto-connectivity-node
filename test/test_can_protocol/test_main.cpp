@@ -1943,7 +1943,7 @@ void test_tester_stats_do_not_change_what_is_sent(void) {
 // ---------------------------------------------------------------------------
 
 // What the simulated ECU does with a DID read.
-enum class EcuReply : uint8_t { ANSWER, NRC_OUT_OF_RANGE, SILENT, PENDING, NRC_THEN_ANSWER };
+enum class EcuReply : uint8_t { ANSWER, NRC_OUT_OF_RANGE, SILENT, PENDING, NRC_THEN_ANSWER, ANSWER_ZERO };
 typedef EcuReply (*EcuBehaviour)(uint16_t did);
 
 static EcuReply ecuAnswersAll(uint16_t) { return EcuReply::ANSWER; }
@@ -1985,6 +1985,9 @@ static unsigned long runEcu(HondaCANModule& module, MockCanBus& bus, SystemState
                 bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_REQUEST_OUT_OF_RANGE));
                 break;
             case EcuReply::SILENT: break;
+            case EcuReply::ANSWER_ZERO: // raw 0 (e.g. engine speed with the engine off)
+                bus.injectRxFrame(makePositiveResponse(did, 0x00, 0x00, (uint8_t)(4u + vehicle_cl250_find(did)->length)));
+                break;
             case EcuReply::PENDING: // NRC 0x78, then nothing
                 bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
                 break;
@@ -2257,6 +2260,100 @@ static int countSessionRequests(const MockCanBus& bus) {
     return n;
 }
 
+static bool gEngineRunning = false;
+static uint16_t gAlwaysRefusedDid = 0;
+static EcuReply ecuServesStopDidOnlyWithEngineRunning(uint16_t did) {
+    if (did == VEHICLE_CL250_DID_ENGINE_SPEED) {
+        return gEngineRunning ? EcuReply::ANSWER : EcuReply::ANSWER_ZERO;
+    }
+    if (did == gAlwaysRefusedDid) {
+        return EcuReply::NRC_OUT_OF_RANGE;
+    }
+    if (did == gStopDid) {
+        return gEngineRunning ? EcuReply::ANSWER : EcuReply::NRC_OUT_OF_RANGE;
+    }
+    return EcuReply::ANSWER;
+}
+
+static uint8_t secondUnverifiedIdx() {
+    bool first = true;
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (vehicle_cl250_dids[i].verified) continue;
+        if (!first) return i;
+        first = false;
+    }
+    TEST_FAIL_MESSAGE("fewer than two unverified DIDs in the table");
+    return 0;
+}
+
+void test_d069_engine_start_rearms_the_stopped_dids_once(void) {
+    // D-069 item 3. Key-on sweep with the engine off: the ECU refuses one PID it serves only
+    // when running, and another it never serves. The first engine start (two RPM samples
+    // above 0 after a valid 0) asks both again; a stall and restart in the same session does
+    // not re-arm a second time.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    const uint8_t refusedIdx = secondUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gAlwaysRefusedDid = vehicle_cl250_dids[refusedIdx].did;
+    gEngineRunning = false;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuServesStopDidOnlyWithEngineRunning);
+    runEcu(module, bus, state, t, 8000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx));
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[idx].hasValue);
+
+    // Engine start: both are pollable again and the engine-only PID now has a value.
+    gEngineRunning = true;
+    runEcu(module, bus, state, t, t + 5000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].hasValue);
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx)); // asked again, refused twice, stopped again
+
+    // Stall and restart: no second re-arm in this confirmed session.
+    const int refusedRequests = bus.countDidRequests(gAlwaysRefusedDid);
+    gEngineRunning = false;
+    runEcu(module, bus, state, t, t + 2000, ecuServesStopDidOnlyWithEngineRunning);
+    gEngineRunning = true;
+    runEcu(module, bus, state, t, t + 5000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx));
+    TEST_ASSERT_EQUAL_INT(refusedRequests, bus.countDidRequests(gAlwaysRefusedDid));
+    gAlwaysRefusedDid = 0;
+}
+
+void test_d069_engine_start_rearm_keeps_the_tier_slot(void) {
+    // D-069 item 3 (safety-reviewer, Q-030): a re-armed DID is due one cadence after its last
+    // request, not at once, so the re-ask never exceeds its tier rate.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gEngineRunning = false;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuServesStopDidOnlyWithEngineRunning);
+    // Stop it, then start the engine right after its last request.
+    while (!module.didStopped(idx)) {
+        runEcu(module, bus, state, t, t + 10, ecuServesStopDidOnlyWithEngineRunning);
+        TEST_ASSERT_TRUE_MESSAGE(t < 8000, "the DID was never stopped");
+    }
+    const int requests = bus.countDidRequests(gStopDid);
+    gEngineRunning = true;
+    const unsigned long period = vehicle_cl250_dids[idx].poll_period_ms;
+    runEcu(module, bus, state, t, t + period / 2, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_FALSE(module.didStopped(idx));                         // re-armed ...
+    TEST_ASSERT_EQUAL_INT(requests, bus.countDidRequests(gStopDid));  // ... but not asked yet
+    runEcu(module, bus, state, t, t + period + 500, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) > requests);
+}
+
 void test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids(void) {
     // Safety-reviewer MINOR-1: the ECU drops to the default session (short reset, S3) and
     // refuses reads with 0x7F; the tester asks for the session again and its confirmation
@@ -2360,5 +2457,7 @@ int main(int, char**) {
     RUN_TEST(test_d068_one_nrc31_does_not_stop_an_unverified_did);
     RUN_TEST(test_d068_a_positive_answer_undoes_an_nrc31_stop);
     RUN_TEST(test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids);
+    RUN_TEST(test_d069_engine_start_rearms_the_stopped_dids_once);
+    RUN_TEST(test_d069_engine_start_rearm_keeps_the_tier_slot);
     return UNITY_END();
 }
