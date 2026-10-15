@@ -71,6 +71,11 @@ public:
     uint32_t unansweredDidCount() const { return _unansweredDidCount; }
     // D-058: step gap and per-DID round-trip statistics since boot (BLE v4). Read-only.
     const TesterStats& testerStats() const { return _tester.stats(); }
+    // D-068 item 2: true while the tester no longer asks for this DID (table index) in this
+    // session: an unverified DID the ECU refused with NRC 0x31 or never answered.
+    bool didStopped(uint8_t index) const {
+        return index < VEHICLE_CL250_DID_COUNT && _dids[index].unsupported;
+    }
 #if CONN_DISCOVERY_PROBE
     // D-059: true once the discovery scan ran through its list (normal polling from then on).
     bool discoveryScanDone() const { return _scanPhase == ScanPhase::DONE; }
@@ -130,9 +135,18 @@ private:
         unsigned long lastRequestMs;
         uint8_t consecutiveTimeouts;
         unsigned long skipUntilMs;    // temporarily skipped after repeated timeouts
+        // D-068 item 2, only for a DID whose support is not verified (yaml `verified: false`):
+        // read once when the session is confirmed, then not asked again until the next
+        // confirmation if the ECU refuses it (NRC 0x31) or never answers it.
+        bool verified;                // vehicle_cl250_did_t.verified
+        bool answered;                // a positive answer since the session was confirmed
+        bool unsupported;             // stopped until the session is confirmed again
+        uint8_t nrc31Count;           // NRC 0x31 reads since the last positive answer
     };
 
     // Same order as the generated table (table order, not the D-043 poll priority):
+    // the unverified D-068 DIDs come after every verified one (codegen checks it), so they
+    // delay a verified DID by at most the one read in flight.
     // engine speed (50 ms) is checked first every cycle, so a slow DID's wait can never
     // starve it for more than one response timeout. This temporary tester deliberately
     // ignores vehicle_cl250_did_t.priority; the priority-first scheduler belongs to
@@ -193,6 +207,10 @@ private:
     void recordRoundTrip(unsigned long now);
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
+
+    // D-068 item 2: the session was (re)confirmed. Every unverified DID is due at once and
+    // asked again, whatever the last session found.
+    void armUnverifiedReads(unsigned long now);
 
     // Saves the latch, then stops the CAN driver and all polling (survives resets
     // other than power-on, see ITesterLatchStore).

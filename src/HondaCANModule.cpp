@@ -19,6 +19,10 @@ const unsigned long kBackoffMaxMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MAX_MS;
 // OEM bus forever and putting error frames on it. Candidate for moto-vehicle-defs.
 const uint32_t kMaxBusOffEvents = 5;
 
+// D-068 item 2 (safety-reviewer MAJOR-2): NRC 0x31 on this many separate reads, with no
+// positive answer between them, stops an unverified DID. Local policy of this tester.
+const uint8_t kNrc31ToStop = 2;
+
 // Local policy of this TEMPORARY tester (Q-018): listen-only for this long after begin()
 // before the first request, so a tester that is already polling the ECU is seen before
 // this node ever transmits (D-021). Candidate for moto-vehicle-defs, like the one above.
@@ -57,6 +61,7 @@ const char* nrcName(uint8_t nrc) {
         case UDS_NRC_RESPONSE_PENDING: return "responsePending";
         case UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION: return "subFunctionNotSupportedInActiveSession";
         case UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION: return "serviceNotSupportedInActiveSession";
+        case UDS_NRC_REQUEST_OUT_OF_RANGE: return "requestOutOfRange";
         default: return "other";
     }
 }
@@ -92,6 +97,25 @@ HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
         _dids[i].lastRequestMs = 0;
         _dids[i].consecutiveTimeouts = 0;
         _dids[i].skipUntilMs = 0;
+        _dids[i].verified = vehicle_cl250_dids[i].verified;
+        _dids[i].answered = false;
+        _dids[i].unsupported = false;
+        _dids[i].nrc31Count = 0;
+    }
+}
+
+void HondaCANModule::armUnverifiedReads(unsigned long now) {
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        DidSlot& slot = _dids[i];
+        if (slot.verified) {
+            continue; // the D-050..D-053 schedule of a verified DID is unchanged
+        }
+        slot.answered = false;
+        slot.unsupported = false;
+        slot.nrc31Count = 0;
+        slot.consecutiveTimeouts = 0;
+        slot.skipUntilMs = 0;
+        slot.lastRequestMs = now - slot.cadenceMs; // due at once (unsigned, wrap-safe)
     }
 }
 
@@ -219,7 +243,10 @@ void HondaCANModule::publishHealth(SystemState& state) {
     const unsigned long now = millis();
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         VehicleSignalRecord& r = state.vehicleSignals.dids[i];
-        r.skipped = !_latchedOff && beforeDeadline(now, _dids[i].skipUntilMs);
+        // D-068: a DID stopped after timeouts shows as skipped; one stopped by NRC 0x31 keeps
+        // showing that NRC (its last answer).
+        r.skipped = !_latchedOff && (beforeDeadline(now, _dids[i].skipUntilMs) ||
+                                     (_dids[i].unsupported && !r.lastWasNrc));
         if (_latchedOff) {
             r.lastWasNrc = false;
         }
@@ -417,6 +444,12 @@ void HondaCANModule::poll(SystemState& state) {
             if (beforeDeadline(now, slot.skipUntilMs)) {
                 continue; // temporarily skipped after repeated timeouts
             }
+            if (slot.unsupported || (!slot.verified && !_sessionConfirmed)) {
+                // D-068 item 2: an unverified DID is asked only in a confirmed session (an
+                // ECU that serves it only there would refuse it before), and not at all
+                // once stopped.
+                continue;
+            }
             if (now - slot.lastRequestMs >= slot.cadenceMs) {
                 slot.lastRequestMs = now;
                 _pendingDidIndex = i;
@@ -468,10 +501,17 @@ void HondaCANModule::poll(SystemState& state) {
             _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts);
 
         if (slot.consecutiveTimeouts >= kMaxConsecutiveTimeouts) {
-            slot.skipUntilMs = now + kDidSkipCooldownMs;
             slot.consecutiveTimeouts = 0;
-            Serial.printf("[UDS WARNING] DID 0x%04X unresponsive -- skipping requests for %lu ms.\n",
-                _pendingDid, kDidSkipCooldownMs);
+            if (!slot.verified && !slot.answered) {
+                // D-068 item 2: never answered in this session: probably not served at all.
+                slot.unsupported = true;
+                Serial.printf("[UDS] DID 0x%04X never answered -- not asked again until the session is confirmed again (D-068).\n",
+                    _pendingDid);
+            } else {
+                slot.skipUntilMs = now + kDidSkipCooldownMs;
+                Serial.printf("[UDS WARNING] DID 0x%04X unresponsive -- skipping requests for %lu ms.\n",
+                    _pendingDid, kDidSkipCooldownMs);
+            }
         }
         _udsState = UdsRequestState::IDLE;
     }
@@ -630,6 +670,11 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // D-066 item 4: the same validated answer, as raw data bytes for the BLE
             // vehicle-signal block. Bookkeeping only; nothing here changes what is sent.
             vsigRecordPositive(state.vehicleSignals.dids[didIndex], &rxMsg.data[4], entry->length, (uint32_t)now);
+            // D-068: the DID echo proves the ECU serves this DID, also for a late answer, so
+            // an earlier stop (e.g. an NRC 0x31 from the other response ID) is undone.
+            _dids[didIndex].answered = true;
+            _dids[didIndex].unsupported = false;
+            _dids[didIndex].nrc31Count = 0;
 
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
@@ -643,6 +688,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // G2.3 -- Positive response to DiagnosticSessionControl (0x10).
             if (!_sessionConfirmed) {
                 _sessionConfirmed = true;
+                armUnverifiedReads(now); // D-068 item 2: read every unverified DID once now
                 Serial.println("[UDS SUCCESS] Extended diagnostic session (0x10 0x03) confirmed by ECU.");
             }
             _lastGoodResponseMs = now;
@@ -669,8 +715,12 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                 // responsePending: the ECU is still working on the DID we're WAITING on.
                 // Reset and double the timeout, but never beyond the generated maximum
                 // total wait since the request was sent, so a 0x78 storm still times out.
+                // D-068 (safety-reviewer MAJOR-1): never for an unverified DID, like a D-050
+                // faulty read: its read holds the slot for at most the base timeout + one
+                // step, the premise of the verified DIDs' gap bounds. Scan entries (-1) keep it.
                 unsigned long waited = now - _requestFirstSentMs;
-                if (forPendingRead && waited < kResponsePendingMaxMs) {
+                const bool extendable = _pendingDidIndex < 0 || _dids[_pendingDidIndex].verified;
+                if (forPendingRead && extendable && waited < kResponsePendingMaxMs) {
                     unsigned long left = kResponsePendingMaxMs - waited;
                     unsigned long doubled = min(_responseTimeoutMs * 2, kResponsePendingMaxMs);
                     _requestSentMs = now;
@@ -685,6 +735,18 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                     Serial.printf("[UDS WARNING] Negative response: SID=0x%02X NRC=0x%02X (%s) [total NRCs=%lu]\n",
                         echoedSid, nrc, nrcName(nrc), (unsigned long)_nrcCount);
                 }
+                // D-068 (safety-reviewer MINOR-1): a read or tester present refused as not
+                // supported in the active session means the ECU fell back to the default
+                // session (a short reset, S3 expiry) without 3 s of silence. Ask for the
+                // session again (retried below, D-020); its confirmation re-arms the
+                // unverified DIDs, which would otherwise all be stopped by NRC 0x31.
+                if (_sessionConfirmed &&
+                    (nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
+                     nrc == UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION) &&
+                    (echoedSid == UDS_SID_READ_DATA_BY_IDENTIFIER || echoedSid == VEHICLE_CL250_TESTER_PRESENT_SID)) {
+                    _sessionConfirmed = false;
+                    Serial.println("[UDS] Extended session lost (NRC 0x7E/0x7F) -- requesting it again.");
+                }
                 // Any other NRC definitively resolves this request (not a timeout, not
                 // success) -- don't leave the state machine WAITING on a rejected DID.
                 if (forPendingRead) {
@@ -694,6 +756,17 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                     // (_pendingDidIndex -1). Bookkeeping only, like the round-trip record.
                     if (_pendingDidIndex >= 0 && !_pendingRttSkip) {
                         vsigRecordNrc(state.vehicleSignals.dids[_pendingDidIndex], nrc);
+                        // D-068 item 2: requestOutOfRange = the ECU does not serve this DID.
+                        // Same quiet-window rule: an NRC carries no DID.
+                        // Two separate reads (safety-reviewer MAJOR-2): requests go to both
+                        // IDs, so one 0x31 may be the other ID's, or trail an earlier answer.
+                        DidSlot& slot = _dids[_pendingDidIndex];
+                        if (nrc == UDS_NRC_REQUEST_OUT_OF_RANGE && !slot.verified && !slot.answered &&
+                            ++slot.nrc31Count >= kNrc31ToStop) {
+                            slot.unsupported = true;
+                            Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x31) -- not asked again until the session is confirmed again (D-068).\n",
+                                _pendingDid);
+                        }
                     }
                     recordRoundTrip(now);
                     _udsState = UdsRequestState::COMPLETE;
@@ -762,6 +835,9 @@ void HondaCANModule::scanStep(unsigned long now) {
         _scanPhase = ScanPhase::DONE;
         for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
             _dids[i].lastRequestMs = now; // the DID schedule starts after the scan
+        }
+        if (_sessionConfirmed) {
+            armUnverifiedReads(now); // D-068: their first read is due at once, as without a scan
         }
         return;
     }
@@ -853,6 +929,13 @@ void HondaCANModule::onFirstFrame(const CanFrame& f, unsigned long now) {
                f.data[2] == (uint8_t)(UDS_SID_READ_DATA_BY_IDENTIFIER + UDS_POSITIVE_RESPONSE_OFFSET) &&
                (uint16_t)((f.data[3] << 8) | f.data[4]) == _pendingDid) {
         // yaml: a segmented DID answer that got no FC is not a DID timeout (no sample either).
+        // D-068 (safety-reviewer MINOR-2): every table DID fits a Single Frame, so an
+        // unverified DID answered this way is never decoded; stop it, or its read would hold
+        // every request for the quiet time each period.
+        DidSlot& slot = _dids[_pendingDidIndex];
+        if (!slot.verified && !slot.answered) {
+            slot.unsupported = true;
+        }
         _udsState = UdsRequestState::COMPLETE;
     }
 }

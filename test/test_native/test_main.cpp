@@ -714,9 +714,11 @@ void test_vsig_block_layout_matches_the_schema(void) {
     const uint8_t rpm[2] = {0x46, 0x50};
     vsigRecordPositive(store.dids[0], rpm, 2, 9000u);
     vsigRecordNrc(store.dids[1], 0x31);
-    uint8_t out[VSIG_BLOCK_MAX_BYTES];
+    uint8_t out[VSIG_BLOCK_MAX_BYTES + 1]; // + 1: the byte after a full block is checked
     memset(out, 0xEE, sizeof(out));
-    const uint8_t n = VEHICLE_CL250_DID_COUNT;
+    // D-068: the table (40 DIDs) is longer than one block at the requested MTU.
+    const uint8_t n = VEHICLE_CL250_DID_COUNT < BLE_VSIG_MAX_RECORDS_PER_BLOCK
+        ? (uint8_t)VEHICLE_CL250_DID_COUNT : (uint8_t)BLE_VSIG_MAX_RECORDS_PER_BLOCK;
     size_t len = packVehicleSignalBlock(store, 0, n, 7, 9040u, out, sizeof(out));
     TEST_ASSERT_EQUAL_UINT32(BLE_VSIG_HEADER_BYTES + n * BLE_VSIG_RECORD_BYTES, len);
     TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_BLOCK_VERSION, out[0]);
@@ -763,11 +765,17 @@ void test_vsig_block_refuses_bad_ranges_and_small_buffers(void) {
 
 void test_vsig_period_plan_pages_through_the_table(void) {
     const uint8_t total = VEHICLE_CL250_DID_COUNT;
-    // Full MTU: the whole table in one block, the next period starts at 0 again.
+    // Full MTU: consecutive blocks from 0 cover the whole table in one period (D-068: 40
+    // DIDs = 19 + 19 + 2 at 19 records per block), the next period starts at 0 again.
+    TEST_ASSERT_TRUE(total <= BLE_VSIG_MAX_BLOCKS_PER_PERIOD * BLE_VSIG_MAX_RECORDS_PER_BLOCK);
     VsigPeriodPlan p = planVehicleSignalPeriod(0, BLE_VSIG_MAX_RECORDS_PER_BLOCK);
-    TEST_ASSERT_EQUAL_UINT8(1, p.blocks);
-    TEST_ASSERT_EQUAL_UINT8(0, p.first[0]);
-    TEST_ASSERT_EQUAL_UINT8(total, p.count[0]);
+    TEST_ASSERT_EQUAL_UINT8((total + BLE_VSIG_MAX_RECORDS_PER_BLOCK - 1) / BLE_VSIG_MAX_RECORDS_PER_BLOCK, p.blocks);
+    uint16_t covered = 0;
+    for (uint8_t b = 0; b < p.blocks; b++) {
+        TEST_ASSERT_EQUAL_UINT8(covered, p.first[b]);
+        covered += p.count[b];
+    }
+    TEST_ASSERT_EQUAL_UINT16(total, covered);
     TEST_ASSERT_EQUAL_UINT8(0, p.next);
     // Default MTU: one record per block, at most 3 blocks, the next period continues.
     p = planVehicleSignalPeriod(0, 1);
@@ -776,17 +784,22 @@ void test_vsig_period_plan_pages_through_the_table(void) {
         TEST_ASSERT_EQUAL_UINT8(b, p.first[b]);
         TEST_ASSERT_EQUAL_UINT8(1, p.count[b]);
     }
-    // Starting mid-table: the block ends at the table end, the next one starts at 0, and no
-    // record is sent twice in one period.
+    // Starting mid-table: the first block ends at the table end, the next ones start at 0,
+    // and no record is sent twice in one period.
     p = planVehicleSignalPeriod((uint8_t)(total - 1), BLE_VSIG_MAX_RECORDS_PER_BLOCK);
-    TEST_ASSERT_EQUAL_UINT8(total > 1 ? 2 : 1, p.blocks);
     TEST_ASSERT_EQUAL_UINT8(total - 1, p.first[0]);
     TEST_ASSERT_EQUAL_UINT8(1, p.count[0]);
-    if (total > 1) {
-        TEST_ASSERT_EQUAL_UINT8(0, p.first[1]);
-        TEST_ASSERT_EQUAL_UINT8(total - 1, p.count[1]);
+    uint8_t once[VEHICLE_CL250_DID_COUNT] = {};
+    covered = 0;
+    for (uint8_t b = 0; b < p.blocks; b++) {
+        for (uint8_t k = 0; k < p.count[b]; k++) once[(p.first[b] + k) % total]++;
+        covered += p.count[b];
     }
-    TEST_ASSERT_EQUAL_UINT8(total - 1, p.next);
+    for (uint8_t i = 0; i < total; i++) TEST_ASSERT_TRUE(once[i] <= 1);
+    // One record, then up to (blocks - 1) full blocks from 0 (40 DIDs: 1 + 19 + 19 = 39).
+    const uint16_t room = 1u + (BLE_VSIG_MAX_BLOCKS_PER_PERIOD - 1u) * BLE_VSIG_MAX_RECORDS_PER_BLOCK;
+    TEST_ASSERT_EQUAL_UINT16(total < room ? total : room, covered);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((total - 1u + covered) % total), p.next);
     // Every DID is covered within ceil(total / 3) periods at the default MTU.
     uint8_t seen[VEHICLE_CL250_DID_COUNT] = {};
     uint8_t next = 0;

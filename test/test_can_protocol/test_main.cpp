@@ -1938,6 +1938,352 @@ void test_tester_stats_do_not_change_what_is_sent(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// D-068 item 2: unverified DIDs are read once per confirmed session, then only if served
+// ---------------------------------------------------------------------------
+
+// What the simulated ECU does with a DID read.
+enum class EcuReply : uint8_t { ANSWER, NRC_OUT_OF_RANGE, SILENT, PENDING, NRC_THEN_ANSWER };
+typedef EcuReply (*EcuBehaviour)(uint16_t did);
+
+static EcuReply ecuAnswersAll(uint16_t) { return EcuReply::ANSWER; }
+
+// First unverified DID of the table (D-068 appends them after the verified ones).
+static uint8_t firstUnverifiedIdx() {
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (!vehicle_cl250_dids[i].verified) return i;
+    }
+    TEST_FAIL_MESSAGE("no unverified DID in the table");
+    return 0;
+}
+
+static CanFrame makeAnswerFor(uint16_t did) {
+    const vehicle_cl250_did_t* e = vehicle_cl250_find(did);
+    return makePositiveResponse(did, 0x46, 0x50, (uint8_t)(4u + e->length));
+}
+
+// Steps 1 ms at a time up to relative time `until`; a DID read is answered on the next pass
+// as `ecu` says. Returns the largest gap between two requests of `watch` (0 = no watch).
+static unsigned long runEcu(HondaCANModule& module, MockCanBus& bus, SystemState& state,
+                            unsigned long& t, unsigned long until, EcuBehaviour ecu,
+                            uint16_t watch = 0) {
+    unsigned long lastWatch = 0, maxGap = 0;
+    while (t < until) {
+        const size_t before = bus.txLog.size();
+        t++;
+        setClock(t);
+        module.update(state);
+        uint16_t did = 0;
+        if (!newDidRequest(bus, before, did)) continue;
+        if (did == watch) {
+            if (lastWatch != 0 && t - lastWatch > maxGap) maxGap = t - lastWatch;
+            lastWatch = t;
+        }
+        switch (ecu(did)) {
+            case EcuReply::ANSWER: bus.injectRxFrame(makeAnswerFor(did)); break;
+            case EcuReply::NRC_OUT_OF_RANGE:
+                bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_REQUEST_OUT_OF_RANGE));
+                break;
+            case EcuReply::SILENT: break;
+            case EcuReply::PENDING: // NRC 0x78, then nothing
+                bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_RESPONSE_PENDING));
+                break;
+            case EcuReply::NRC_THEN_ANSWER: // the two response IDs disagree (D-068 MAJOR-2)
+                bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_REQUEST_OUT_OF_RANGE));
+                bus.injectRxFrame(makeAnswerFor(did));
+                break;
+        }
+    }
+    return maxGap;
+}
+
+// The ECU confirms the session; the pass that takes the 0x50 already sends the first
+// unverified read, which `ecu` answers like every later one.
+static void confirmSession(HondaCANModule& module, MockCanBus& bus, SystemState& state, unsigned long& t,
+                           EcuBehaviour ecu) {
+    bus.injectRxFrame(makeSessionConfirm());
+    runEcu(module, bus, state, t, t + 1, ecu);
+}
+
+void test_d068_table_puts_unverified_dids_after_the_verified_ones(void) {
+    const uint8_t first = firstUnverifiedIdx();
+    TEST_ASSERT_TRUE(first > VEHICLE_CL250_IDX_BATTERY_VOLTAGE);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_EQUAL(i < first, vehicle_cl250_dids[i].verified);
+    }
+}
+
+void test_d068_unverified_dids_wait_for_the_session_then_are_read_at_once(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    // No 0x50 yet: only the verified DIDs are read.
+    runEcu(module, bus, state, t, 3000, ecuAnswersAll);
+    TEST_ASSERT_TRUE(bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 0);
+    for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_EQUAL(0, bus.countDidRequests(vehicle_cl250_dids[i].did));
+    }
+    // Confirmed: every unverified DID is read within the first second, long before its
+    // period, and exactly once (each request goes out on two IDs).
+    bus.clearTxLog();
+    confirmSession(module, bus, state, t, ecuAnswersAll);
+    runEcu(module, bus, state, t, t + 1000, ecuAnswersAll);
+    for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_TRUE(vehicle_cl250_dids[i].poll_period_ms > 1000);
+        TEST_ASSERT_EQUAL(2, bus.countDidRequests(vehicle_cl250_dids[i].did));
+        TEST_ASSERT_TRUE(state.vehicleSignals.dids[i].hasValue);
+        TEST_ASSERT_FALSE(module.didStopped(i));
+    }
+}
+
+static uint16_t gStopDid = 0;
+static EcuReply ecuRefusesStopDid(uint16_t did) {
+    return did == gStopDid ? EcuReply::NRC_OUT_OF_RANGE : EcuReply::ANSWER;
+}
+static EcuReply ecuSilentOnStopDid(uint16_t did) {
+    return did == gStopDid ? EcuReply::SILENT : EcuReply::ANSWER;
+}
+static EcuReply ecuSilent(uint16_t) { return EcuReply::SILENT; }
+
+void test_d068_nrc31_stops_an_unverified_did_until_the_session_is_confirmed_again(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuRefusesStopDid);
+    runEcu(module, bus, state, t, 20000, ecuRefusesStopDid);
+    // Refused on two separate reads (two IDs each), then never asked again.
+    TEST_ASSERT_EQUAL(2 * kNrc31ToStop, bus.countDidRequests(gStopDid));
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    const VehicleSignalRecord& r = state.vehicleSignals.dids[idx];
+    TEST_ASSERT_TRUE(r.lastWasNrc); // the block shows NRC 0x31, not "skipped"
+    TEST_ASSERT_EQUAL_HEX8(UDS_NRC_REQUEST_OUT_OF_RANGE, r.nrc);
+    TEST_ASSERT_FALSE(r.skipped);
+    // The next unverified DID, answered, keeps its period.
+    TEST_ASSERT_TRUE(bus.countDidRequests(vehicle_cl250_dids[idx + 1].did) >= 2 * 5);
+
+    // The ECU goes away (no answer for longer than the absent timeout), then comes back:
+    // the confirmed session asks the stopped DID again.
+    runEcu(module, bus, state, t, t + VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS + 500, ecuSilent);
+    TEST_ASSERT_FALSE(state.engine.ecuPresent);
+    confirmSession(module, bus, state, t, ecuAnswersAll);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    runEcu(module, bus, state, t, t + 1000, ecuAnswersAll);
+    TEST_ASSERT_EQUAL(2 * kNrc31ToStop + 2, bus.countDidRequests(gStopDid));
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[idx].lastWasNrc);
+}
+
+void test_d068_never_answered_unverified_did_stops_after_max_timeouts(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuSilentOnStopDid);
+    runEcu(module, bus, state, t, 60000, ecuSilentOnStopDid);
+    TEST_ASSERT_EQUAL(2 * VEHICLE_CL250_MAX_CONSECUTIVE_TIMEOUTS, bus.countDidRequests(gStopDid));
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].skipped); // shown as skipped
+    TEST_ASSERT_FALSE(state.vehicleSignals.dids[idx].lastWasNrc);
+}
+
+static int gStopDidAnswers = 0;
+static EcuReply ecuAnswersStopDidOnce(uint16_t did) {
+    if (did != gStopDid) return EcuReply::ANSWER;
+    return gStopDidAnswers++ == 0 ? EcuReply::ANSWER : EcuReply::SILENT;
+}
+
+void test_d068_an_answered_unverified_did_keeps_the_skip_and_retry(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gStopDidAnswers = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuAnswersStopDidOnce);
+    // One answer, then silence: served once, so the D-050..D-053 skip and retry, not a stop.
+    runEcu(module, bus, state, t, 60000, ecuAnswersStopDidOnce);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) > (int)(2 * (1 + VEHICLE_CL250_MAX_CONSECUTIVE_TIMEOUTS)));
+}
+
+static EcuReply ecuRefusesRpm(uint16_t did) {
+    return did == VEHICLE_CL250_DID_ENGINE_SPEED ? EcuReply::NRC_OUT_OF_RANGE : EcuReply::ANSWER;
+}
+
+void test_d068_nrc31_never_stops_a_verified_did(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuRefusesRpm);
+    runEcu(module, bus, state, t, 2000, ecuRefusesRpm);
+    const int before = bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED);
+    runEcu(module, bus, state, t, 4000, ecuRefusesRpm);
+    TEST_ASSERT_FALSE(module.didStopped(kRpmIdx));
+    TEST_ASSERT_TRUE(bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > before);
+}
+
+static EcuReply ecuServesOnlyVerified(uint16_t did) {
+    return vehicle_cl250_find(did)->verified ? EcuReply::ANSWER : EcuReply::SILENT;
+}
+
+void test_d068_verified_dids_stay_fresh_while_every_unverified_did_times_out(void) {
+    // D-068 item 1: every unverified read times out (the worst case of an ECU that ignores
+    // unknown DIDs), yet RPM and speed wait for at most the one read in flight: request gap
+    // <= period + base timeout + one step, plus one round trip for speed (RPM is ahead).
+    const unsigned long base = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS;
+    const unsigned long step = VEHICLE_CL250_CLIENT_STEP_MAX_MS;
+    const unsigned long rtt = VEHICLE_CL250_ASSUMED_ROUND_TRIP_MS;
+    struct Case { uint16_t did; uint8_t idx; unsigned long extra; };
+    const Case cases[] = {
+        {VEHICLE_CL250_DID_ENGINE_SPEED, VEHICLE_CL250_IDX_ENGINE_SPEED, 0},
+        {VEHICLE_CL250_DID_VEHICLE_SPEED, VEHICLE_CL250_IDX_VEHICLE_SPEED, rtt},
+    };
+    for (const Case& c : cases) {
+        MockCanBus bus;
+        MockTesterLatchStore latchStore;
+        HondaCANModule module(bus, latchStore);
+        SystemState state;
+        startPolling(module, state);
+        unsigned long t = 0;
+        confirmSession(module, bus, state, t, ecuServesOnlyVerified);
+        const unsigned long gap = runEcu(module, bus, state, t, 30000, ecuServesOnlyVerified, c.did);
+        TEST_ASSERT_TRUE(gap > 0);
+        TEST_ASSERT_TRUE(gap <= vehicle_cl250_dids[c.idx].poll_period_ms + base + step + c.extra);
+        TEST_ASSERT_TRUE(gap <= vehicle_cl250_dids[c.idx].stale_after_ms);
+    }
+    // Throttle, coolant and battery: within their stale_after_ms as well.
+    for (uint8_t idx = VEHICLE_CL250_IDX_THROTTLE_POS; idx < firstUnverifiedIdx(); idx++) {
+        MockCanBus bus;
+        MockTesterLatchStore latchStore;
+        HondaCANModule module(bus, latchStore);
+        SystemState state;
+        startPolling(module, state);
+        unsigned long t = 0;
+        confirmSession(module, bus, state, t, ecuServesOnlyVerified);
+        const unsigned long gap = runEcu(module, bus, state, t, 30000, ecuServesOnlyVerified, vehicle_cl250_dids[idx].did);
+        TEST_ASSERT_TRUE(gap > 0);
+        TEST_ASSERT_TRUE(gap <= vehicle_cl250_dids[idx].stale_after_ms);
+    }
+}
+
+static EcuReply ecuUnverifiedPending(uint16_t did) {
+    return vehicle_cl250_find(did)->verified ? EcuReply::ANSWER : EcuReply::PENDING;
+}
+
+void test_d068_an_unverified_did_gets_no_0x78_extension(void) {
+    // Safety-reviewer MAJOR-1: with the 0x78 extension an unverified read could hold the
+    // slot for up to RESPONSE_TIMEOUT_MAX_MS; without it, RPM keeps its fault-mode gap.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuUnverifiedPending);
+    const unsigned long gap = runEcu(module, bus, state, t, 20000, ecuUnverifiedPending,
+                                     VEHICLE_CL250_DID_ENGINE_SPEED);
+    TEST_ASSERT_TRUE(gap <= kRpmDueMs + VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + VEHICLE_CL250_CLIENT_STEP_MAX_MS);
+    // A 0x78 is no answer: each such DID is stopped after its timeouts.
+    TEST_ASSERT_TRUE(module.didStopped(firstUnverifiedIdx()));
+}
+
+static EcuReply ecuRefusesStopDidOnce(uint16_t did) {
+    if (did != gStopDid) return EcuReply::ANSWER;
+    return gStopDidAnswers++ == 0 ? EcuReply::NRC_OUT_OF_RANGE : EcuReply::ANSWER;
+}
+
+void test_d068_one_nrc31_does_not_stop_an_unverified_did(void) {
+    // Safety-reviewer MAJOR-2: one 0x31 may be the other response ID's or trail an earlier
+    // answer; it takes two separate reads.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gStopDidAnswers = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuRefusesStopDidOnce);
+    runEcu(module, bus, state, t, 10000, ecuRefusesStopDidOnce);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].hasValue);
+}
+
+static EcuReply ecuStopDidNrcThenAnswer(uint16_t did) {
+    return did == gStopDid ? EcuReply::NRC_THEN_ANSWER : EcuReply::ANSWER;
+}
+
+void test_d068_a_positive_answer_undoes_an_nrc31_stop(void) {
+    // Safety-reviewer MAJOR-2 (a): both IDs answer, one with 0x31 first. The validated
+    // positive echo proves the DID is served, so it is never left stopped.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuStopDidNrcThenAnswer);
+    runEcu(module, bus, state, t, 20000, ecuStopDidNrcThenAnswer);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].hasValue);
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) >= 2 * 5); // keeps its period
+}
+
+static int countSessionRequests(const MockCanBus& bus) {
+    int n = 0;
+    for (const CanFrame& f : bus.txLog) {
+        if (f.dlc >= 3 && f.data[1] == VEHICLE_CL250_SESSION_SID) n++;
+    }
+    return n;
+}
+
+void test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids(void) {
+    // Safety-reviewer MINOR-1: the ECU drops to the default session (short reset, S3) and
+    // refuses reads with 0x7F; the tester asks for the session again and its confirmation
+    // re-arms the unverified DIDs that the 0x31s of the default session stopped.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuRefusesStopDid);
+    runEcu(module, bus, state, t, 6000, ecuRefusesStopDid);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    bus.clearTxLog();
+    // One read refused as not supported in the active session.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION));
+    runEcu(module, bus, state, t, t + VEHICLE_CL250_SESSION_RETRY_INTERVAL_MS + 100, ecuAnswersAll);
+    TEST_ASSERT_TRUE(countSessionRequests(bus) >= 2); // 0x10 0x03 again, on both IDs
+    TEST_ASSERT_TRUE(state.engine.ecuPresent);        // no 3 s silence was needed
+    confirmSession(module, bus, state, t, ecuAnswersAll);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    runEcu(module, bus, state, t, t + 1000, ecuAnswersAll);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].hasValue);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -2003,5 +2349,16 @@ int main(int, char**) {
     RUN_TEST(test_vehicle_signals_nrc_cleared_by_a_timeout_and_by_the_latch);
     RUN_TEST(test_vehicle_signals_quiet_window_nrc_then_answer_stays_valid);
     RUN_TEST(test_tester_stats_do_not_change_what_is_sent);
+    RUN_TEST(test_d068_table_puts_unverified_dids_after_the_verified_ones);
+    RUN_TEST(test_d068_unverified_dids_wait_for_the_session_then_are_read_at_once);
+    RUN_TEST(test_d068_nrc31_stops_an_unverified_did_until_the_session_is_confirmed_again);
+    RUN_TEST(test_d068_never_answered_unverified_did_stops_after_max_timeouts);
+    RUN_TEST(test_d068_an_answered_unverified_did_keeps_the_skip_and_retry);
+    RUN_TEST(test_d068_nrc31_never_stops_a_verified_did);
+    RUN_TEST(test_d068_verified_dids_stay_fresh_while_every_unverified_did_times_out);
+    RUN_TEST(test_d068_an_unverified_did_gets_no_0x78_extension);
+    RUN_TEST(test_d068_one_nrc31_does_not_stop_an_unverified_did);
+    RUN_TEST(test_d068_a_positive_answer_undoes_an_nrc31_stop);
+    RUN_TEST(test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids);
     return UNITY_END();
 }
