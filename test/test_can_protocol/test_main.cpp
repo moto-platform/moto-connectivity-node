@@ -2533,7 +2533,7 @@ void test_d069_long_gap_rearm_all_due_together(void) {
     // given DID).
     const unsigned long slotMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + VEHICLE_CL250_CLIENT_STEP_MAX_MS;
     const unsigned long answerDelayMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS / 2;
-    const unsigned long slowDelayMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS - 10;
+    const unsigned long slowDelayMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS - VEHICLE_CL250_CLIENT_STEP_MAX_MS;
     unsigned long unverified = 0;
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         if (!vehicle_cl250_dids[i].verified) unverified++;
