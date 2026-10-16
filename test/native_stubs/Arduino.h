@@ -17,6 +17,7 @@
 #include <cstring>
 #include <algorithm>
 #include <string>
+#include <vector>
 
 // SystemState.h's isStale() calls millis(). Tests control the fake clock directly
 // instead of sleeping in real time, so results are deterministic.
@@ -78,9 +79,10 @@ struct NativeSerialStub {
         written.append(reinterpret_cast<const char*>(data), len);
         return len;
     }
-    // Optional log counting for tests: printf lines containing watchA / watchB are counted.
+    // Optional log counting for tests: printf lines containing watchA / watchB are counted and kept.
     std::string watchA, watchB;
     int hitsA = 0, hitsB = 0;
+    std::vector<std::string> linesA, linesB; // the counted lines themselves
     void printf(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
@@ -88,8 +90,8 @@ struct NativeSerialStub {
         std::vsnprintf(line, sizeof(line), fmt, args);
         va_end(args);
         std::fputs(line, stdout);
-        if (!watchA.empty() && std::strstr(line, watchA.c_str())) hitsA++;
-        if (!watchB.empty() && std::strstr(line, watchB.c_str())) hitsB++;
+        if (!watchA.empty() && std::strstr(line, watchA.c_str())) { hitsA++; linesA.push_back(line); }
+        if (!watchB.empty() && std::strstr(line, watchB.c_str())) { hitsB++; linesB.push_back(line); }
     }
 };
 // static (not C++17 `inline` variable) so this header stays valid under -std=c++11.

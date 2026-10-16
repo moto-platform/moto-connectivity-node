@@ -90,6 +90,10 @@ void scanSerialLine(const char* line) {
 #endif
 } // namespace
 
+uint8_t HondaCANModule::maxTimeoutLogLinesPerWindow() {
+    return kMaxTimeoutLogLinesPerWindow;
+}
+
 HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
     : _bus(bus), _latchStore(latchStore)
 #if CONN_DISCOVERY_PROBE
@@ -527,6 +531,7 @@ void HondaCANModule::poll(SystemState& state) {
         _udsState = UdsRequestState::IDLE;
     }
 #endif
+    bool timeoutThisPass = false;
     if (_udsState == UdsRequestState::TIMEOUT) {
         DidSlot& slot = _dids[_pendingDidIndex];
         slot.consecutiveTimeouts++;
@@ -538,19 +543,24 @@ void HondaCANModule::poll(SystemState& state) {
         // early (see recordRoundTrip()); statistics only, the schedule is unchanged.
         _rttQuietUntilMs = now + kResponsePendingMaxMs;
         // Log only (the counters and the stop rule here do not depend on it): a bounded
-        // number of lines per window, then one summary of what was left out.
+        // number of lines per window. What was left out is folded into the first line of
+        // the next window, so a timeout never prints more than this one line.
+        timeoutThisPass = true;
+        uint16_t foldedSuppressed = 0;
         if (now - _timeoutLogWindowStartMs >= kTimeoutLogWindowMs) {
-            if (_timeoutLogsSuppressed > 0) {
-                Serial.printf("[UDS WARNING] %u DID timeout warnings suppressed in the last window\n",
-                    (unsigned)_timeoutLogsSuppressed);
-            }
+            foldedSuppressed = _timeoutLogsSuppressed;
             _timeoutLogWindowStartMs = now;
             _timeoutLogBudget = kMaxTimeoutLogLinesPerWindow;
             _timeoutLogsSuppressed = 0;
         }
         if (takeLogSlot(_timeoutLogBudget)) {
-            Serial.printf("[UDS WARNING] Timeout waiting for DID 0x%04X (consecutive=%u/%u)\n",
-                _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts);
+            if (foldedSuppressed > 0) {
+                Serial.printf("[UDS WARNING] Timeout waiting for DID 0x%04X (consecutive=%u/%u) (+%u suppressed in the last window)\n",
+                    _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts, (unsigned)foldedSuppressed);
+            } else {
+                Serial.printf("[UDS WARNING] Timeout waiting for DID 0x%04X (consecutive=%u/%u)\n",
+                    _pendingDid, slot.consecutiveTimeouts, kMaxConsecutiveTimeouts);
+            }
         } else if (_timeoutLogsSuppressed < 0xFFFFu) {
             _timeoutLogsSuppressed++; // saturating, never wraps
         }
@@ -582,6 +592,15 @@ void HondaCANModule::poll(SystemState& state) {
         _pendingScanIndex = -1;
 #endif
         _udsState = UdsRequestState::IDLE;
+    }
+
+    // Log only: when timeouts stop, the last window's suppressed count is reported once on a
+    // later pass (never in a pass that already printed a timeout line).
+    if (!timeoutThisPass && _timeoutLogsSuppressed > 0 &&
+        now - _timeoutLogWindowStartMs >= kTimeoutLogWindowMs) {
+        Serial.printf("[UDS WARNING] %u DID timeout warnings suppressed in the last window\n",
+            (unsigned)_timeoutLogsSuppressed);
+        _timeoutLogsSuppressed = 0;
     }
 }
 

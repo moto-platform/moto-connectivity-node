@@ -71,6 +71,8 @@ public:
     uint32_t unansweredDidCount() const { return _unansweredDidCount; }
     // D-058: step gap and per-DID round-trip statistics since boot (BLE v4). Read-only.
     const TesterStats& testerStats() const { return _tester.stats(); }
+    // Log policy of the DID timeout warning: lines per time window (tests assert the bound).
+    static uint8_t maxTimeoutLogLinesPerWindow();
     // D-068 item 2: true while the tester no longer asks for this DID (table index) in this
     // session: an unverified DID the ECU refused with NRC 0x31 or never answered.
     bool didStopped(uint8_t index) const {

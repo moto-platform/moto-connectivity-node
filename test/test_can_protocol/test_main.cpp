@@ -5,6 +5,8 @@
 #include "../../src/IsoTpCan.h"
 #include "uds_iso14229.h" // generated (gen/c/conn/, D-040)
 #include <vector>
+#include <cstring>
+#include <cstdlib>
 
 // [env:native] sets test_build_src = no (most of src/ needs ESP32-only libraries
 // that don't exist on the host), so this suite pulls in the one real implementation
@@ -2432,6 +2434,61 @@ static std::vector<uint16_t> didReadFrames(const MockCanBus& bus) {
     return dids;
 }
 
+// What runEcuDelayed() observed.
+struct DelayedRun {
+    unsigned long maxWatchGap = 0;    // largest gap between two requests of the watched DID
+    int watchRequests = 0;            // requests of the watched DID
+    int overlaps = 0;                 // requests sent while another one was still pending
+    int maxFramesPerPass = 0;         // read frames of one update() (2 = one request, both IDs)
+    int mixedPasses = 0;              // passes whose read frames were for more than one DID
+};
+
+// Like runEcu, but every read is answered (positive, ecu() must say ANSWER) only `delayMs`
+// after its request (the two slow DIDs `slowDelayMs`), so a request stays pending across
+// many passes.
+static DelayedRun runEcuDelayed(HondaCANModule& module, MockCanBus& bus, SystemState& state,
+                                unsigned long& t, unsigned long until, EcuBehaviour ecu,
+                                unsigned long delayMs, uint16_t watch, uint16_t slowDid1 = 0,
+                                uint16_t slowDid2 = 0, unsigned long slowDelayMs = 0) {
+    DelayedRun r;
+    bool pending = false;
+    uint16_t pendingDid = 0;
+    unsigned long dueAt = 0, lastWatch = 0;
+    while (t < until) {
+        t++;
+        setClock(t);
+        if (pending && t >= dueAt) {
+            bus.injectRxFrame(makeAnswerFor(pendingDid));
+            pending = false;
+        }
+        const size_t before = bus.txLog.size();
+        module.update(state);
+        int frames = 0;
+        uint16_t did = 0;
+        for (size_t i = before; i < bus.txLog.size(); i++) {
+            const CanFrame& f = bus.txLog[i];
+            if (f.dlc < 4 || f.data[1] != UDS_SID_READ_DATA_BY_IDENTIFIER) continue;
+            const uint16_t d = (uint16_t)((f.data[2] << 8) | f.data[3]);
+            if (frames > 0 && d != did) r.mixedPasses++;
+            did = d;
+            frames++;
+        }
+        if (frames > r.maxFramesPerPass) r.maxFramesPerPass = frames;
+        if (frames == 0) continue;
+        if (pending) r.overlaps++;
+        TEST_ASSERT_TRUE(ecu(did) == EcuReply::ANSWER);
+        pending = true;
+        pendingDid = did;
+        dueAt = t + ((did == slowDid1 || did == slowDid2) ? slowDelayMs : delayMs);
+        if (did == watch) {
+            r.watchRequests++;
+            if (lastWatch != 0 && t - lastWatch > r.maxWatchGap) r.maxWatchGap = t - lastWatch;
+            lastWatch = t;
+        }
+    }
+    return r;
+}
+
 void test_d069_long_gap_rearm_all_due_together(void) {
     // conn#18 MINOR-3. Two stopped DIDs of different tiers; a long gap since their last request
     // (engine off for 60 s); at the engine start both are due at the same moment. The per-DID
@@ -2466,37 +2523,51 @@ void test_d069_long_gap_rearm_all_due_together(void) {
     // Engine start: the RPM samples re-arm every stopped DID; all of them are overdue.
     bus.clearTxLog();
     gEngineRunning = true;
+    // Answers come half a response timeout late, the re-armed DIDs' just inside it, so every
+    // request stays pending for many passes and the RPM read is stressed. (Answers just
+    // inside the timeout for all DIDs would overload the verified 110 ms reads alone and
+    // starve the unverified ones: that is the scheduler's priority, not tested here.)
     // Bound: the start needs kEngineStartSamples (2) RPM reads, each at most one RPM period
-    // plus one request slot (response timeout base + client step) apart; then every DID of the
-    // table is served at most once ahead of any given one, one after another, plus one more
-    // slot per verified DID for the reads that fall due again in the meantime.
+    // plus one slot (response timeout base + client step) apart; then every unverified DID
+    // takes at most one slot, and so does each verified DID (one read of each ahead of any
+    // given DID).
     const unsigned long slotMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + VEHICLE_CL250_CLIENT_STEP_MAX_MS;
+    const unsigned long answerDelayMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS / 2;
+    const unsigned long slowDelayMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS - 10;
     unsigned long unverified = 0;
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         if (!vehicle_cl250_dids[i].verified) unverified++;
     }
     const unsigned long verifiedCount = VEHICLE_CL250_DID_COUNT - unverified;
     const unsigned long burstBoundMs = 2 * (kRpmDueMs + slotMs) + (unverified + verifiedCount) * slotMs;
-    const unsigned long maxRpmGap = runEcu(module, bus, state, t, t + burstBoundMs,
-                                           ecuTwoServedOnlyWithEngineRunning, VEHICLE_CL250_DID_ENGINE_SPEED);
+    const uint32_t timeoutsBefore = module.unansweredDidCount();
+    const DelayedRun burst = runEcuDelayed(module, bus, state, t, t + burstBoundMs,
+                                           ecuTwoServedOnlyWithEngineRunning, answerDelayMs,
+                                           VEHICLE_CL250_DID_ENGINE_SPEED, gStopDid, gLongGapDid2,
+                                           slowDelayMs);
     TEST_ASSERT_FALSE(module.didStopped(idxA));
     TEST_ASSERT_FALSE(module.didStopped(idxB));
-    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) >= 2);       // (i) both asked again ...
-    TEST_ASSERT_TRUE(bus.countDidRequests(gLongGapDid2) >= 2);   // ... within the bound
     TEST_ASSERT_TRUE(state.vehicleSignals.dids[idxA].hasValue);
     TEST_ASSERT_TRUE(state.vehicleSignals.dids[idxB].hasValue);
-    TEST_ASSERT_TRUE(maxRpmGap <= kRpmDueMs + slotMs);           // (iv) RPM keeps its rate
-
-    // (ii) One request outstanding at a time: the mock answers the pass after a request, so a
-    // second request before that answer would show as a different DID inside a frame pair.
-    const std::vector<uint16_t> frames = didReadFrames(bus);
-    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)(frames.size() % 2));
-    for (size_t i = 0; i + 1 < frames.size(); i += 2) {
-        TEST_ASSERT_EQUAL_UINT16(frames[i], frames[i + 1]);
-    }
+    // (i) both asked again within the bound; the 10000 ms DID exactly once, the 2000 ms DID
+    // at most once per its period (plus the first request).
+    TEST_ASSERT_EQUAL_INT(2, bus.countDidRequests(gLongGapDid2));
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) >= 2);
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) / 2 <=
+                     (int)(burstBoundMs / vehicle_cl250_dids[idxA].poll_period_ms + 1));
+    // (iv) RPM keeps its rate: asked at least twice (no vacuous gap) and never later than a
+    // period plus one slot.
+    TEST_ASSERT_TRUE(burst.watchRequests >= 2);
+    TEST_ASSERT_TRUE(burst.maxWatchGap <= kRpmDueMs + slotMs);
+    // (ii) One request outstanding at a time: at most one new request (two frames, one DID)
+    // per update(), none while another one waits for its answer, and no timeout meanwhile.
+    TEST_ASSERT_EQUAL_INT(0, burst.overlaps);
+    TEST_ASSERT_EQUAL_INT(0, burst.mixedPasses);
+    TEST_ASSERT_TRUE(burst.maxFramesPerPass <= 2);
+    TEST_ASSERT_EQUAL_UINT32(timeoutsBefore, module.unansweredDidCount());
 
     // (iii) After the burst each is asked at most once per its period: over three periods of
-    // the slowest one, a DID of period P gets at most 3 * (window / (3 * P)) + 1 requests.
+    // it, at most 3 + 1 requests.
     const unsigned long periodA = vehicle_cl250_dids[idxA].poll_period_ms;
     const unsigned long periodB = vehicle_cl250_dids[idxB].poll_period_ms;
     bus.clearTxLog();
@@ -2523,23 +2594,36 @@ void test_timeout_warnings_are_rate_limited(void) {
     Serial.watchA = "Timeout waiting for DID";
     Serial.watchB = "DID timeout warnings suppressed";
     Serial.hitsA = Serial.hitsB = 0;
+    Serial.linesA.clear();
+    Serial.linesB.clear();
     unsigned long t = 0;
     confirmSession(module, bus, state, t, ecuUnverifiedSilent);
     const unsigned long durationMs = 60000;
     runEcu(module, bus, state, t, durationMs, ecuUnverifiedSilent);
+    // Timeouts have stopped (every silent DID is stopped); the last window's count is
+    // reported once on a later pass.
+    runEcu(module, bus, state, t, t + 3000, ecuUnverifiedSilent);
     const int printed = Serial.hitsA;
-    const int summaries = Serial.hitsB;
+    const int flushes = Serial.hitsB;
+    unsigned long suppressed = 0;
+    for (const std::string& line : Serial.linesA) {
+        const char* p = std::strstr(line.c_str(), "(+");
+        if (p) suppressed += std::strtoul(p + 2, nullptr, 10); // folded into the next window's line
+    }
+    for (const std::string& line : Serial.linesB) {
+        suppressed += std::strtoul(line.c_str() + std::strlen("[UDS WARNING] "), nullptr, 10);
+    }
     Serial.watchA.clear();
     Serial.watchB.clear();
 
     // The window opens at a timeout, so at most durationMs / window + 1 windows were used.
     const int windows = (int)(durationMs / 1000) + 1;
     TEST_ASSERT_TRUE(printed > 0);
-    TEST_ASSERT_TRUE(printed <= windows * 4); // kMaxTimeoutLogLinesPerWindow
-    TEST_ASSERT_TRUE(summaries > 0);
-    TEST_ASSERT_TRUE(summaries <= windows);
-    // Timeouts that happened are not the lines printed: the counter kept all of them.
-    TEST_ASSERT_TRUE((int)module.unansweredDidCount() > printed);
+    TEST_ASSERT_TRUE(printed <= windows * (int)HondaCANModule::maxTimeoutLogLinesPerWindow());
+    TEST_ASSERT_TRUE(suppressed > 0);
+    TEST_ASSERT_TRUE(flushes >= 1 && flushes <= windows); // at most one summary per window
+    // Every timeout is accounted for, in a printed line or a suppressed count.
+    TEST_ASSERT_EQUAL_UINT32(module.unansweredDidCount(), (uint32_t)printed + suppressed);
     // The stop rule ran as without the limit: every silent unverified DID ended up stopped
     // (the verified ones answer, so the ECU stays present).
     for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
