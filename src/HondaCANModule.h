@@ -118,6 +118,12 @@ private:
     uint32_t _nrcCount = 0;
     uint32_t _unansweredDidCount = 0;
 
+    // Rate limit of the DID timeout warning (log only): lines left in the current window,
+    // the window start and the lines left out since.
+    uint8_t _timeoutLogBudget = 0;
+    unsigned long _timeoutLogWindowStartMs = 0;
+    uint16_t _timeoutLogsSuppressed = 0;
+
     // D-058: step gap (taken at every update() entry) and per-DID round trips. Counters only;
     // they never influence request timing, order, the gate or the latch.
     TesterStatsTracker _tester;

@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 #include <algorithm>
 #include <string>
 
@@ -77,11 +78,18 @@ struct NativeSerialStub {
         written.append(reinterpret_cast<const char*>(data), len);
         return len;
     }
+    // Optional log counting for tests: printf lines containing watchA / watchB are counted.
+    std::string watchA, watchB;
+    int hitsA = 0, hitsB = 0;
     void printf(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
-        std::vprintf(fmt, args);
+        char line[256];
+        std::vsnprintf(line, sizeof(line), fmt, args);
         va_end(args);
+        std::fputs(line, stdout);
+        if (!watchA.empty() && std::strstr(line, watchA.c_str())) hitsA++;
+        if (!watchB.empty() && std::strstr(line, watchB.c_str())) hitsB++;
     }
 };
 // static (not C++17 `inline` variable) so this header stays valid under -std=c++11.

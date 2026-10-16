@@ -2410,6 +2410,143 @@ void test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids(void) {
     TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].hasValue);
 }
 
+static uint16_t gLongGapDid2 = 0;
+static EcuReply ecuTwoServedOnlyWithEngineRunning(uint16_t did) {
+    if (did == VEHICLE_CL250_DID_ENGINE_SPEED) {
+        return gEngineRunning ? EcuReply::ANSWER : EcuReply::ANSWER_ZERO;
+    }
+    if (did == gStopDid || did == gLongGapDid2) {
+        return gEngineRunning ? EcuReply::ANSWER : EcuReply::NRC_OUT_OF_RANGE;
+    }
+    return EcuReply::ANSWER;
+}
+
+// Frames of DID reads in txLog order (each request goes out as two frames, one per ID).
+static std::vector<uint16_t> didReadFrames(const MockCanBus& bus) {
+    std::vector<uint16_t> dids;
+    for (const CanFrame& f : bus.txLog) {
+        if (f.dlc >= 4 && f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER) {
+            dids.push_back((uint16_t)((f.data[2] << 8) | f.data[3]));
+        }
+    }
+    return dids;
+}
+
+void test_d069_long_gap_rearm_all_due_together(void) {
+    // conn#18 MINOR-3. Two stopped DIDs of different tiers; a long gap since their last request
+    // (engine off for 60 s); at the engine start both are due at the same moment. The per-DID
+    // rate and the one-request-at-a-time rule still hold, and the RPM read is not starved.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idxA = firstUnverifiedIdx();
+    uint8_t idxB = idxA;
+    for (uint8_t i = idxA; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (!vehicle_cl250_dids[i].verified &&
+            vehicle_cl250_dids[i].poll_period_ms > vehicle_cl250_dids[idxB].poll_period_ms) {
+            idxB = i; // slowest tier of the table
+        }
+    }
+    TEST_ASSERT_TRUE(vehicle_cl250_dids[idxB].poll_period_ms > vehicle_cl250_dids[idxA].poll_period_ms);
+    gStopDid = vehicle_cl250_dids[idxA].did;
+    gLongGapDid2 = vehicle_cl250_dids[idxB].did;
+    gEngineRunning = false;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuTwoServedOnlyWithEngineRunning);
+    while (!module.didStopped(idxA) || !module.didStopped(idxB)) {
+        runEcu(module, bus, state, t, t + 100, ecuTwoServedOnlyWithEngineRunning);
+        TEST_ASSERT_TRUE_MESSAGE(t < 30000, "the DIDs were never stopped");
+    }
+    runEcu(module, bus, state, t, t + 60000, ecuTwoServedOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(idxA));
+    TEST_ASSERT_TRUE(module.didStopped(idxB));
+
+    // Engine start: the RPM samples re-arm every stopped DID; all of them are overdue.
+    bus.clearTxLog();
+    gEngineRunning = true;
+    // Bound: the start needs kEngineStartSamples (2) RPM reads, each at most one RPM period
+    // plus one request slot (response timeout base + client step) apart; then every DID of the
+    // table is served at most once ahead of any given one, one after another, plus one more
+    // slot per verified DID for the reads that fall due again in the meantime.
+    const unsigned long slotMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + VEHICLE_CL250_CLIENT_STEP_MAX_MS;
+    unsigned long unverified = 0;
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (!vehicle_cl250_dids[i].verified) unverified++;
+    }
+    const unsigned long verifiedCount = VEHICLE_CL250_DID_COUNT - unverified;
+    const unsigned long burstBoundMs = 2 * (kRpmDueMs + slotMs) + (unverified + verifiedCount) * slotMs;
+    const unsigned long maxRpmGap = runEcu(module, bus, state, t, t + burstBoundMs,
+                                           ecuTwoServedOnlyWithEngineRunning, VEHICLE_CL250_DID_ENGINE_SPEED);
+    TEST_ASSERT_FALSE(module.didStopped(idxA));
+    TEST_ASSERT_FALSE(module.didStopped(idxB));
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) >= 2);       // (i) both asked again ...
+    TEST_ASSERT_TRUE(bus.countDidRequests(gLongGapDid2) >= 2);   // ... within the bound
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idxA].hasValue);
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idxB].hasValue);
+    TEST_ASSERT_TRUE(maxRpmGap <= kRpmDueMs + slotMs);           // (iv) RPM keeps its rate
+
+    // (ii) One request outstanding at a time: the mock answers the pass after a request, so a
+    // second request before that answer would show as a different DID inside a frame pair.
+    const std::vector<uint16_t> frames = didReadFrames(bus);
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)(frames.size() % 2));
+    for (size_t i = 0; i + 1 < frames.size(); i += 2) {
+        TEST_ASSERT_EQUAL_UINT16(frames[i], frames[i + 1]);
+    }
+
+    // (iii) After the burst each is asked at most once per its period: over three periods of
+    // the slowest one, a DID of period P gets at most 3 * (window / (3 * P)) + 1 requests.
+    const unsigned long periodA = vehicle_cl250_dids[idxA].poll_period_ms;
+    const unsigned long periodB = vehicle_cl250_dids[idxB].poll_period_ms;
+    bus.clearTxLog();
+    runEcu(module, bus, state, t, t + 3 * periodA, ecuTwoServedOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) / 2 <= 3 + 1);
+    bus.clearTxLog();
+    runEcu(module, bus, state, t, t + 3 * periodB, ecuTwoServedOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(bus.countDidRequests(gLongGapDid2) / 2 <= 3 + 1);
+    gLongGapDid2 = 0;
+}
+
+static EcuReply ecuUnverifiedSilent(uint16_t did) {
+    return vehicle_cl250_find(did)->verified ? EcuReply::ANSWER : EcuReply::SILENT;
+}
+
+void test_timeout_warnings_are_rate_limited(void) {
+    // conn#18 follow-up: at most one timeout happens per pass, so the DID timeout warning is
+    // bounded per time window. The counters and the stop rule do not depend on the logging.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    Serial.watchA = "Timeout waiting for DID";
+    Serial.watchB = "DID timeout warnings suppressed";
+    Serial.hitsA = Serial.hitsB = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuUnverifiedSilent);
+    const unsigned long durationMs = 60000;
+    runEcu(module, bus, state, t, durationMs, ecuUnverifiedSilent);
+    const int printed = Serial.hitsA;
+    const int summaries = Serial.hitsB;
+    Serial.watchA.clear();
+    Serial.watchB.clear();
+
+    // The window opens at a timeout, so at most durationMs / window + 1 windows were used.
+    const int windows = (int)(durationMs / 1000) + 1;
+    TEST_ASSERT_TRUE(printed > 0);
+    TEST_ASSERT_TRUE(printed <= windows * 4); // kMaxTimeoutLogLinesPerWindow
+    TEST_ASSERT_TRUE(summaries > 0);
+    TEST_ASSERT_TRUE(summaries <= windows);
+    // Timeouts that happened are not the lines printed: the counter kept all of them.
+    TEST_ASSERT_TRUE((int)module.unansweredDidCount() > printed);
+    // The stop rule ran as without the limit: every silent unverified DID ended up stopped
+    // (the verified ones answer, so the ECU stays present).
+    for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_TRUE(module.didStopped(i));
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -2489,5 +2626,7 @@ int main(int, char**) {
     RUN_TEST(test_d069_engine_start_rearms_the_stopped_dids_once);
     RUN_TEST(test_d069_engine_start_rearm_keeps_the_tier_slot);
     RUN_TEST(test_d069_an_nrc_on_rpm_breaks_the_engine_start_run);
+    RUN_TEST(test_d069_long_gap_rearm_all_due_together);
+    RUN_TEST(test_timeout_warnings_are_rate_limited);
     return UNITY_END();
 }
