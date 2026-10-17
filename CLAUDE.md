@@ -17,11 +17,15 @@ Firmware running on **ESP32-S3**. Its role is narrow and clear: Wi-Fi/BLE connec
 - Uses Espressif's **official ESP-SR** framework (WakeNet + MultiNet). **Do not train your own model or build a TinyML pipeline from scratch** — MultiNet works with up to 300 words without retraining.
 - Trigger: push-to-talk (handlebar button), NOT a wake word — a deliberate choice to avoid false triggers from wind noise. If a suggestion comes in to switch to a wake word because it "would be cooler," reject it; the rationale stays in a code comment.
 
-## Bridge (to the H7)
+## Two units (D-073)
 
-Simple messaging with `moto-rt-core` (STM32H7) over SPI/UART (future target: SOME/IP). The message format is not yet finalized (Q-004; proposal: COBS + CRC16 + msg-id, defined in moto-vehicle-defs) — leave a placeholder/TODO here; the real format will be settled once both repos design it together.
+This repo builds two ESP32-S3 images as separate build environments: the **bike** unit (today the temporary vehicle-bus tester; later the platform bus ↔ BLE bridge to the phone and the helmet) and the **helmet** unit (visor HUD, helmet microphone, push-to-talk, ESP-SR voice, voice prompts; no CAN). HUD warnings are informational only; the safety outputs are the wired LED ring and mirror LEDs (D-041, D-072). The helmet env does not exist yet; its BLE frame is defined in moto-vehicle-defs `ble/` first.
 
-Target state: connected to the platform CAN via TWAI (classic CAN, 500 kbps): receives the io-node's park-mode alarm and relays it over Wi-Fi, publishes its own heartbeat, not connected to the vehicle bus. Until rt-core takes over, the single TWAI is on the vehicle bus instead (temporary tester, see below), so no heartbeat is sent yet.
+## Bridge (to rt-core)
+
+Simple messaging with `moto-rt-core` (STM32H755 Cortex-M7, D-072) over SPI/UART (future target: SOME/IP). The message format is not yet finalized (Q-004; proposal: COBS + CRC16 + msg-id, defined in moto-vehicle-defs) — leave a placeholder/TODO here; the real format will be settled once both repos design it together.
+
+Target state: connected to the platform CAN via TWAI (classic CAN, 500 kbps): receives rt-core's park-mode alarm (io-node is retired, D-072) and relays it over Wi-Fi, publishes its own heartbeat, not connected to the vehicle bus. Until rt-core takes over, the single TWAI is on the vehicle bus instead (temporary tester, see below), so no heartbeat is sent yet.
 
 ## Dependencies
 

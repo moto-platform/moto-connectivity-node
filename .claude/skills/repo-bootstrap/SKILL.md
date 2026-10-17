@@ -24,7 +24,7 @@ Read the target repo's `CLAUDE.md` first; its scope and module list drive the sk
 - CI: `.github/workflows/ci.yml` with `submodules: recursive` checkout, build + L0 tests + static analysis, and a step that fails unless the defs pin is a semver release tag `vX.Y.Z` (fetch the tags first, the checkout is shallow; copy the step from moto-rt-core `ci.yml`).
 - Keep the skeleton minimal: empty module folders get a short `README.md` stating responsibility; no speculative code.
 
-## Type: STM32 firmware (rt-core, safety-node, io-node, hil-bench/simulator)
+## Type: STM32 firmware (rt-core = STM32H755 Cortex-M7, safety-node = its Cortex-M4 (D-072), hil-bench/simulator)
 
 ```
 CMakeLists.txt              # add_subdirectory for cubemx, src; option(BUILD_HOST_TESTS)
@@ -41,7 +41,7 @@ external/moto-vehicle-defs/ # submodule; include gen/c/<node>/ only
 ```
 - Compile flags: `-Wall -Wextra -Werror -Wshadow -Wconversion`, no heap on safety nodes (`-Wl,--wrap=malloc` to catch use, or no heap region).
 - CI: arm-none-eabi-gcc build of all presets + host tests + cppcheck. Renode (L1) is added once a firmware image boots.
-- If the chip/board is not decided yet (e.g. G0 variant), ask; do not guess the `.ioc`.
+- If the chip/board is not decided yet, ask; do not guess the `.ioc`. rt-core and safety-node share one dual-core NUCLEO-H755ZI-Q project (CM7/CM4 parts, D-072); each repo builds only its own core's image.
 
 ## Type: ESP-IDF (connectivity-node)
 
