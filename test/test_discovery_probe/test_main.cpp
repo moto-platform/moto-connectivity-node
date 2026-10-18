@@ -1132,7 +1132,8 @@ void test_d075_a_0x7f_reconfirmation_does_not_repeat_the_first_frame_hold(void) 
 // Returns the passes at which `ffDid` was requested afterwards via `rpmReads`.
 static void stepAnswering(HondaCANModule& module, MockCanBus& bus, SystemState& state, unsigned long& t,
                           unsigned long until, uint16_t ffDid, bool& ffSent, std::vector<unsigned long>* reads,
-                          uint16_t watch) {
+                          uint16_t watch, int ffAfter = 0) {
+    int ffReads = 0;
     size_t seen = bus.txLog.size();
     while (t < until) {
         setClock(t += 1);
@@ -1142,7 +1143,7 @@ static void stepAnswering(HondaCANModule& module, MockCanBus& bus, SystemState& 
             if (req.size() != 3 || req[0] != UDS_SID_READ_DATA_BY_IDENTIFIER) continue;
             const uint16_t did = (uint16_t)((req[1] << 8) | req[2]);
             if (did == watch && reads != nullptr) reads->push_back(t);
-            if (did == ffDid && !ffSent) {
+            if (did == ffDid && !ffSent && ffReads++ >= ffAfter) {
                 ffSent = true;
                 bus.injectRxFrame(firstFrame({0x62, req[1], req[2], 1, 2, 3, 4, 5, 6, 7}));
                 continue;
@@ -1209,6 +1210,35 @@ void test_d075_a_first_frame_for_a_verified_did_skips_it_instead_of_repeating_th
     TEST_ASSERT_EQUAL(readsAtFf, reads.size()); // hold (2000 ms), then skip (5000 ms)
     stepAnswering(module, bus, state, t, ffAt + 7000, VEHICLE_CL250_DID_ENGINE_SPEED, ff, &reads, VEHICLE_CL250_DID_ENGINE_SPEED);
     TEST_ASSERT_TRUE(reads.size() > readsAtFf); // asked again after the skip
+}
+
+void test_d075_a_first_frame_for_an_answered_unverified_did_skips_it_instead_of_stopping(void) {
+    // Review test gap 3: an unverified DID that answered in the epoch is never stopped by a
+    // First Frame without an FC; it gets the skip cool-down (like a verified DID).
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = startScan(module, bus, state);
+    runScan(module, bus, state, t, defaultEcu);
+    uint8_t idx = 0;
+    while (vehicle_cl250_dids[idx].verified) idx++;
+    const uint16_t did = vehicle_cl250_dids[idx].did;
+    bus.clearTxLog();
+    bool ff = false;
+    std::vector<unsigned long> reads;
+    // First read answered, the second (one tier period later) gets the First Frame.
+    stepAnswering(module, bus, state, t, t + 2600, did, ff, &reads, did, 1);
+    TEST_ASSERT_TRUE(ff);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL_UINT8(0, module.didStopReason(idx));
+    const size_t readsAtFf = reads.size();
+    const unsigned long ffAt = t;
+    stepAnswering(module, bus, state, t, ffAt + 4000, did, ff, &reads, did, 1);
+    TEST_ASSERT_EQUAL(readsAtFf, reads.size()); // hold, then skip
+    stepAnswering(module, bus, state, t, ffAt + 9000, did, ff, &reads, did, 1);
+    TEST_ASSERT_TRUE(reads.size() > readsAtFf); // asked again after the skip
+    TEST_ASSERT_FALSE(module.didStopped(idx));
 }
 
 // Every request is refused with NRC 0x31 (requestOutOfRange), the NRC that stops an
@@ -1321,6 +1351,7 @@ int main(int, char**) {
     RUN_TEST(test_d075_a_0x7f_reconfirmation_does_not_repeat_the_first_frame_hold);
     RUN_TEST(test_d075_scan_end_arm_is_the_deferred_first_arm_after_a_mid_scan_0x7f);
     RUN_TEST(test_d075_a_first_frame_for_a_verified_did_skips_it_instead_of_repeating_the_hold);
+    RUN_TEST(test_d075_a_first_frame_for_an_answered_unverified_did_skips_it_instead_of_stopping);
     RUN_TEST(test_e18_an_nrc_to_a_scan_entry_never_touches_a_did_record);
     RUN_TEST(test_e18_nrc_0x78_and_0x31_to_a_did_shaped_scan_entry_never_touch_a_did_record);
     return UNITY_END();
