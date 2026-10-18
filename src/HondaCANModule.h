@@ -158,6 +158,11 @@ private:
         bool unsupported;             // stopped until the next stop epoch (D-075)
         StopReason stopReason;        // set with `unsupported`, NONE otherwise
         uint8_t stopNrcCount;           // NRC 0x31/0x7E/0x7F reads since the last positive answer
+        // D-075 item 1 (f), provisional: NRC 0x7E/0x7F refusals of an unverified DID in this
+        // stop epoch, answered or not. A positive answer does not reset it; the epoch start
+        // and the D-069 re-ask do. nrc31Seen: a 0x31 was counted (it fixes the stop reason).
+        uint8_t sessionNrcCount;
+        bool nrc31Seen;
     };
 
     // Same order as the generated table (table order, not the D-043 poll priority):

@@ -112,6 +112,8 @@ HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
         _dids[i].unsupported = false;
         _dids[i].stopReason = StopReason::NONE;
         _dids[i].stopNrcCount = 0;
+        _dids[i].sessionNrcCount = 0;
+        _dids[i].nrc31Seen = false;
     }
 }
 
@@ -127,6 +129,8 @@ void HondaCANModule::rearmStoppedReads() {
         slot.unsupported = false;
         slot.stopReason = StopReason::NONE;
         slot.stopNrcCount = 0;
+        slot.sessionNrcCount = 0;
+        slot.nrc31Seen = false;
         slot.consecutiveTimeouts = 0;
     }
 }
@@ -159,6 +163,8 @@ void HondaCANModule::armUnverifiedReads(unsigned long now) {
         slot.unsupported = false;
         slot.stopReason = StopReason::NONE;
         slot.stopNrcCount = 0;
+        slot.sessionNrcCount = 0;
+        slot.nrc31Seen = false;
         slot.consecutiveTimeouts = 0;
         slot.skipUntilMs = 0;
         slot.lastRequestMs = now - slot.cadenceMs; // due at once (unsigned, wrap-safe)
@@ -873,16 +879,32 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                         // DID without a positive answer in this epoch counts like 0x31.
                         const bool sessionNrc = nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
                             nrc == UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION;
-                        const bool countsToStop = nrc == UDS_NRC_REQUEST_OUT_OF_RANGE || sessionNrc;
-                        const bool counted = countsToStop && !slot.verified && !slot.answered;
-                        if (counted && sessionNrc) {
-                            // D-075 item 1 (amended, provisional) (a): only this case asks for
-                            // the session at the next step instead of after kSessionRetryMs.
+                        const bool nrc31 = nrc == UDS_NRC_REQUEST_OUT_OF_RANGE;
+                        const bool counted = (nrc31 || sessionNrc) && !slot.verified && !slot.answered;
+                        // D-075 item 1 (f), provisional: a session NRC is also counted, in its
+                        // own counter, for an unverified DID that answered in this epoch
+                        // (a positive answer does not reset it). Verified DIDs: never.
+                        const bool countedF = sessionNrc && !slot.verified;
+                        if (countedF) {
+                            // D-075 item 1 (amended, provisional) (a), (f): only a counted
+                            // refusal asks for the session at the next step instead of after
+                            // kSessionRetryMs.
                             _sessionRetryNow = true;
                         }
+                        if (counted && nrc31) {
+                            slot.nrc31Seen = true;
+                        }
+                        bool stop = false;
                         if (counted && ++slot.stopNrcCount >= kStopNrcReads) {
+                            stop = true;
+                        }
+                        if (countedF && ++slot.sessionNrcCount >= kStopNrcReads) {
+                            stop = true;
+                        }
+                        if (stop) {
                             slot.unsupported = true;
-                            slot.stopReason = sessionNrc ? StopReason::NRC_7E_7F : StopReason::NRC_31;
+                            // Precedence: once a 0x31 was counted, the reason stays NRC_31.
+                            slot.stopReason = slot.nrc31Seen ? StopReason::NRC_31 : StopReason::NRC_7E_7F;
                             Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x%02X) -- not asked again in this stop epoch (D-075).\n",
                                 _pendingDid, nrc);
                         }

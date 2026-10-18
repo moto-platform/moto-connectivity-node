@@ -2736,7 +2736,7 @@ void test_d075_one_0x31_and_one_0x7f_stop_an_unverified_did(void) {
     runEcuAutoSession(module, bus, state, t, 10000, ecuNrc31Then7f);
     TEST_ASSERT_TRUE(module.didStopped(idx));
     TEST_ASSERT_EQUAL(2 * kStopNrcReads, bus.countDidRequests(gStopDid));
-    TEST_ASSERT_EQUAL_UINT8(2 /* NRC_7E_7F: the stopping read */, module.didStopReason(idx));
+    TEST_ASSERT_EQUAL_UINT8(1 /* NRC_31: once a 0x31 was counted it stays the reason (item 1 (f)) */, module.didStopReason(idx));
 }
 
 static int gAnsweredReads = 0;
@@ -2745,7 +2745,9 @@ static EcuReply ecuAnswerOnceThen7f(uint16_t did) {
     return gAnsweredReads++ == 0 ? EcuReply::ANSWER : EcuReply::NRC_SESSION_7F;
 }
 
-void test_d075_an_answered_unverified_did_with_0x7f_twice_is_not_stopped(void) {
+void test_d075_an_answered_unverified_did_with_0x7f_twice_is_stopped(void) {
+    // D-075 item 1 (f), provisional: an unverified DID that answered once and then refuses
+    // with 0x7F is stopped by the separate per-epoch counter after two refusals.
     MockCanBus bus;
     MockTesterLatchStore latchStore;
     HondaCANModule module(bus, latchStore);
@@ -2757,8 +2759,80 @@ void test_d075_an_answered_unverified_did_with_0x7f_twice_is_not_stopped(void) {
     unsigned long t = 0;
     confirmSession(module, bus, state, t, ecuAnswerOnceThen7f);
     runEcuAutoSession(module, bus, state, t, 20000, ecuAnswerOnceThen7f);
-    TEST_ASSERT_FALSE(module.didStopped(idx));
-    TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) > 2 * (1 + kStopNrcReads));
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL_UINT8(2 /* NRC_7E_7F */, module.didStopReason(idx));
+    TEST_ASSERT_EQUAL(2 * (1 + kStopNrcReads), bus.countDidRequests(gStopDid));
+}
+
+static int gPositiveBetweenReads = 0;
+static EcuReply ecu7fAnswer7f(uint16_t did) {
+    if (did != gStopDid) return EcuReply::ANSWER;
+    const int n = gPositiveBetweenReads++;
+    return n == 1 ? EcuReply::ANSWER : EcuReply::NRC_SESSION_7F;
+}
+
+void test_d075_a_positive_answer_between_two_0x7f_does_not_reset_the_f_counter(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gPositiveBetweenReads = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecu7fAnswer7f);
+    runEcuAutoSession(module, bus, state, t, 20000, ecu7fAnswer7f);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL_UINT8(2 /* NRC_7E_7F */, module.didStopReason(idx));
+    TEST_ASSERT_EQUAL(2 * 3, bus.countDidRequests(gStopDid)); // 0x7F, answer, 0x7F
+}
+
+static uint16_t gStopDidB = 0;
+static int gReadsA = 0, gReadsB = 0;
+static EcuReply ecuTwoAnsweredThenAlways7f(uint16_t did) {
+    if (did == gStopDid) return gReadsA++ == 0 ? EcuReply::ANSWER : EcuReply::NRC_SESSION_7F;
+    if (did == gStopDidB) return gReadsB++ == 0 ? EcuReply::ANSWER : EcuReply::NRC_SESSION_7F;
+    return EcuReply::ANSWER;
+}
+
+void test_d075_two_answered_dids_that_later_refuse_are_stopped_and_bounded_over_120_s(void) {
+    // D-075 item 1 (f): two answered unverified DIDs that later always answer 0x7F. Both are
+    // stopped after two refusals each; the session losses stay at 2 per DID (plus the
+    // start); the verified RPM and speed keep their bounds once the stops are in.
+    const unsigned long base = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS;
+    const unsigned long step = VEHICLE_CL250_CLIENT_STEP_MAX_MS;
+    const unsigned long rtt = VEHICLE_CL250_ASSUMED_ROUND_TRIP_MS;
+    struct Case { uint16_t did; uint8_t idx; unsigned long extra; };
+    const Case cases[] = {
+        {VEHICLE_CL250_DID_ENGINE_SPEED, VEHICLE_CL250_IDX_ENGINE_SPEED, 0},
+        {VEHICLE_CL250_DID_VEHICLE_SPEED, VEHICLE_CL250_IDX_VEHICLE_SPEED, rtt},
+    };
+    for (const Case& c : cases) {
+        MockCanBus bus;
+        MockTesterLatchStore latchStore;
+        HondaCANModule module(bus, latchStore);
+        SystemState state;
+        startPolling(module, state);
+        const uint8_t a = firstUnverifiedIdx();
+        gStopDid = vehicle_cl250_dids[a].did;
+        gStopDidB = vehicle_cl250_dids[a + 1].did;
+        gReadsA = gReadsB = 0;
+        unsigned long t = 0;
+        confirmSession(module, bus, state, t, ecuTwoAnsweredThenAlways7f);
+        runEcuAutoSession(module, bus, state, t, 12000, ecuTwoAnsweredThenAlways7f);
+        TEST_ASSERT_TRUE(module.didStopped(a));
+        TEST_ASSERT_TRUE(module.didStopped(a + 1));
+        const int sessions = countSessionRequests(bus);
+        TEST_ASSERT_TRUE(sessions <= 2 * (1 + 2 * kStopNrcReads));
+        const unsigned long gap = runEcuAutoSession(module, bus, state, t, 120000, ecuTwoAnsweredThenAlways7f, c.did);
+        TEST_ASSERT_EQUAL(sessions, countSessionRequests(bus)); // no further session loss
+        TEST_ASSERT_EQUAL(2 * (1 + kStopNrcReads), bus.countDidRequests(gStopDid));
+        TEST_ASSERT_EQUAL(2 * (1 + kStopNrcReads), bus.countDidRequests(gStopDidB));
+        TEST_ASSERT_TRUE(gap > 0);
+        TEST_ASSERT_TRUE(gap <= vehicle_cl250_dids[c.idx].poll_period_ms + base + step + c.extra);
+        TEST_ASSERT_TRUE(gap <= vehicle_cl250_dids[c.idx].stale_after_ms);
+    }
 }
 
 void test_d075_0x7f_to_tester_present_requests_the_session_but_never_counts(void) {
@@ -3326,7 +3400,9 @@ int main(int, char**) {
     RUN_TEST(test_d075_combined_fault_rpm_0x78_storm_with_silent_unverified_dids_goes_stale);
     RUN_TEST(test_d075_0x7f_in_the_post_timeout_quiet_window_does_not_count);
     RUN_TEST(test_d075_one_0x31_and_one_0x7f_stop_an_unverified_did);
-    RUN_TEST(test_d075_an_answered_unverified_did_with_0x7f_twice_is_not_stopped);
+    RUN_TEST(test_d075_an_answered_unverified_did_with_0x7f_twice_is_stopped);
+    RUN_TEST(test_d075_a_positive_answer_between_two_0x7f_does_not_reset_the_f_counter);
+    RUN_TEST(test_d075_two_answered_dids_that_later_refuse_are_stopped_and_bounded_over_120_s);
     RUN_TEST(test_d075_0x7f_to_tester_present_requests_the_session_but_never_counts);
     RUN_TEST(test_d075_zero_seen_survives_a_0x7f_so_the_engine_start_reask_fires_once);
     RUN_TEST(test_d075_verified_gaps_hold_during_a_30_s_0x7f_loop);
