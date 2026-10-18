@@ -2394,7 +2394,7 @@ void test_d069_engine_start_rearm_keeps_the_tier_slot(void) {
     TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) > requests);
 }
 
-void test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids(void) {
+void test_d075_session_lost_without_ecu_absence_keeps_the_stopped_dids(void) {
     // D-075 (provisional) item 1 replaces the D-068 MINOR-1 re-arm: the ECU drops to the
     // default session (short reset, S3) and refuses a read with 0x7F; the tester asks for
     // the session again, but the confirmation stays in the same stop epoch, so the DID the
@@ -3011,7 +3011,7 @@ int main(int, char**) {
     RUN_TEST(test_d068_an_unverified_did_gets_no_0x78_extension);
     RUN_TEST(test_d068_one_nrc31_does_not_stop_an_unverified_did);
     RUN_TEST(test_d068_a_positive_answer_undoes_an_nrc31_stop);
-    RUN_TEST(test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids);
+    RUN_TEST(test_d075_session_lost_without_ecu_absence_keeps_the_stopped_dids);
     RUN_TEST(test_d075_nrc_0x7f_on_every_read_stops_an_unverified_did_after_two_reads);
     RUN_TEST(test_d075_nrc_0x7e_on_every_read_stops_an_unverified_did_after_two_reads);
     RUN_TEST(test_d075_reconfirmation_after_0x7f_keeps_the_tier_rate_of_the_other_dids);
