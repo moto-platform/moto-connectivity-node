@@ -4,7 +4,7 @@
 
 <!-- Source of truth: moto-workspace/PLATFORM-RULES.md. Copies in each repo's .claude/ are written by scripts/sync_claude.py — edit only the source. -->
 
-SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
+SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). **Scope (D-078):** for now only a test prototype is built and tested on the CL250; the scale is widened into a commercial multi-vehicle product later, so keep vehicle facts in per-vehicle defs files and never delete a catalog DID because the CL250 does not serve it. Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
 
 ## Where things are
 
@@ -22,9 +22,9 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 | `moto-io-node` | — | — | **Retired by D-072** (no code); its functions moved to safety-node and rt-core |
 | `moto-connectivity-node` | ESP32-S3 | C, ESP-IDF | Wi-Fi/BLE + voice (ESP-SR); telemetry here is TEMPORARY |
 | `moto-linux-node` | Raspberry Pi 5 | Python/C++ | Kuksa, CAN→VSS, lane keeping (classic CV), anomaly model, HMI, OTA |
-| `moto-mcp` | Raspberry Pi 5 | Python | Standalone open-source MCP server (read-only tools) |
+| `moto-mcp` | Raspberry Pi 5 + remote server (D-077) | Python | Standalone open-source MCP server (read-only tools) |
 | `moto-hil-bench` | STM32F4 + i7 host | C + Python | Restbus HIL bench, scenario engine, CI runner |
-| `moto-server` | Server | Python (FastAPI) | Ingestion, storage, MDF4/Parquet, OTA packages |
+| `moto-server` | Raspi (edge) + remote, VPS-ready (D-077) | Python (FastAPI) | Ingestion, storage, MDF4/Parquet, OTA packages |
 | `moto-ml` | Offline | Python | Training only |
 | `moto-mobile` | Phone | Flutter (D-022) | Loosely coupled companion |
 | `moto-workspace` | — | — | Manifest, setup script, shared Claude agents/skills (source of truth) |
@@ -38,7 +38,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 4. **Critical work never depends on a slow channel.** µs-critical → MCU + CAN. ms → Raspi. Latency-tolerant → phone/server.
 5. **No dynamic memory on MCUs** (strictly none on safety paths, avoided elsewhere). No string/DBC/VSS parsing on MCUs.
 6. **The immobilizer acts on the starter-relay coil circuit only.** Default state unlocked, hidden bypass, 10 s timeout to unlock.
-7. **The LLM never does its own math, and raw GPS never goes to the cloud.**
+7. **The LLM never does its own math.** Position (lat/lon/height) may go only to the user's own servers and to the LLM through moto-mcp, and is never committed (provisional relaxation, D-076; revisited by Q-035).
 8. After any change to a safety-critical module (cornering/, safety-node, immobilizer, blind spot, watchdog/heartbeat, anomaly-safety-net, E2E, bootloader, and on the STM32H755 the inter-core mailbox, MPU/clock/reset/option-byte init and both linker scripts, D-072), run `safety-reviewer` before committing.
 
 ## Conventions

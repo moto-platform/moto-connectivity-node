@@ -26,7 +26,7 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 - **moto-connectivity-node** — red: `src/HondaCANModule*`, `src/DiscoveryScan*`, `src/IsoTp*`, `src/TesterLatch*`, `src/CanCapture*`, `src/hal/Twai*`, `src/hal/RtcTesterLatchStore*`, `platformio.ini`; yellow: `src/Gps*`; everything else: **yellow**
 - **moto-hil-bench** — red: `*fault*`; everything else: **yellow**
 - **moto-linux-node** — red: `*ota*`; everything else: **yellow**
-- **moto-server** — red: `*ota*`; everything else: **green**
+- **moto-server** — red: `*ota*`; yellow: `*gps*`, `*position*`; everything else: **green**
 - **moto-mobile** — yellow: `lib/services/session_upload*`, `lib/services/upload_client*`; everything else: **green**
 - **moto-mcp** — everything: **yellow**
 - **moto-ml** — everything: **green**
@@ -38,7 +38,7 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 - **No hand-written signal facts.** CAN IDs, DIDs, signal names, scales, units, VSS paths and BLE layouts come only from the generated `gen/` code or the definition files of moto-vehicle-defs. Never write such a literal in code; if a signal is missing, that is a red-zone request (`/signal-change` by Claude).
 - **Nothing new on the vehicle bus.** No code that sends a CAN frame to the motorcycle outside the existing tester modules (red); no new UDS service, no write, clear, reset, unlock or reprogram, ever.
 - **MCU code** (rt-core, safety-node, conn, hil-bench firmware): no heap (`malloc`, `new`, STL containers that allocate) after init, no string/JSON/DBC parsing, no blocking calls in the tester loop, MISRA C:2012 style in C.
-- **Privacy:** never commit keys, passwords, real ride data, VINs, or GPS positions; latitude/longitude never leave the GPS node. The repos are public.
+- **Privacy:** never commit keys, passwords, real ride data, VINs, or GPS positions. Position may go only to the user's own servers (D-076, provisional); code that moves it is red (Claude only). The repos are public.
 - **Safety path:** never make a safety decision (cornering, blind spot, immobilizer) depend on the Raspi, the phone, Wi-Fi, VSS or ML; ML may only tighten thresholds.
 - **No new dependency** in firmware or in `pyproject.toml` / `pubspec.yaml` without asking the user.
 - **Do not weaken checks:** no disabled tests, lowered coverage, new MISRA suppressions, `# noqa` or `// cppcheck-suppress` to make CI green. Fix the code or log the problem.
@@ -73,7 +73,7 @@ Red-zone edits; signal, UDS, BLE and limit changes (`/signal-change`) and every 
 
 <!-- Source of truth: moto-workspace/PLATFORM-RULES.md. Copies in each repo's .claude/ are written by scripts/sync_claude.py — edit only the source. -->
 
-SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
+SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). **Scope (D-078):** for now only a test prototype is built and tested on the CL250; the scale is widened into a commercial multi-vehicle product later, so keep vehicle facts in per-vehicle defs files and never delete a catalog DID because the CL250 does not serve it. Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
 
 ### Where things are
 
@@ -91,9 +91,9 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 | `moto-io-node` | — | — | **Retired by D-072** (no code); its functions moved to safety-node and rt-core |
 | `moto-connectivity-node` | ESP32-S3 | C, ESP-IDF | Wi-Fi/BLE + voice (ESP-SR); telemetry here is TEMPORARY |
 | `moto-linux-node` | Raspberry Pi 5 | Python/C++ | Kuksa, CAN→VSS, lane keeping (classic CV), anomaly model, HMI, OTA |
-| `moto-mcp` | Raspberry Pi 5 | Python | Standalone open-source MCP server (read-only tools) |
+| `moto-mcp` | Raspberry Pi 5 + remote server (D-077) | Python | Standalone open-source MCP server (read-only tools) |
 | `moto-hil-bench` | STM32F4 + i7 host | C + Python | Restbus HIL bench, scenario engine, CI runner |
-| `moto-server` | Server | Python (FastAPI) | Ingestion, storage, MDF4/Parquet, OTA packages |
+| `moto-server` | Raspi (edge) + remote, VPS-ready (D-077) | Python (FastAPI) | Ingestion, storage, MDF4/Parquet, OTA packages |
 | `moto-ml` | Offline | Python | Training only |
 | `moto-mobile` | Phone | Flutter (D-022) | Loosely coupled companion |
 | `moto-workspace` | — | — | Manifest, setup script, shared Claude agents/skills (source of truth) |
@@ -107,7 +107,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 4. **Critical work never depends on a slow channel.** µs-critical → MCU + CAN. ms → Raspi. Latency-tolerant → phone/server.
 5. **No dynamic memory on MCUs** (strictly none on safety paths, avoided elsewhere). No string/DBC/VSS parsing on MCUs.
 6. **The immobilizer acts on the starter-relay coil circuit only.** Default state unlocked, hidden bypass, 10 s timeout to unlock.
-7. **The LLM never does its own math, and raw GPS never goes to the cloud.**
+7. **The LLM never does its own math.** Position (lat/lon/height) may go only to the user's own servers and to the LLM through moto-mcp, and is never committed (provisional relaxation, D-076; revisited by Q-035).
 8. After any change to a safety-critical module (cornering/, safety-node, immobilizer, blind spot, watchdog/heartbeat, anomaly-safety-net, E2E, bootloader, and on the STM32H755 the inter-core mailbox, MPU/clock/reset/option-byte init and both linker scripts, D-072), run `safety-reviewer` before committing.
 
 ### Conventions
