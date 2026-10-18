@@ -1074,6 +1074,55 @@ void test_d068_first_frame_answer_stops_an_unverified_did(void) {
     TEST_ASSERT_EQUAL(requests, bus.countDidRequests(did));
 }
 
+void test_d075_a_0x7f_reconfirmation_does_not_repeat_the_first_frame_hold(void) {
+    // D-075 (provisional) item 3: the quiet time after a First Frame without an FC stays
+    // (ISO 15765-2 N_Bs). The FF-stopped DID stays stopped for the epoch, so a session
+    // re-confirmation after NRC 0x7E/0x7F brings no second hold for it.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = startScan(module, bus, state);
+    runScan(module, bus, state, t, defaultEcu);
+    uint8_t idx = 0;
+    while (vehicle_cl250_dids[idx].verified) idx++;
+    const uint16_t did = vehicle_cl250_dids[idx].did;
+    bus.clearTxLog();
+    while (bus.countDidRequests(did) == 0) {
+        setClock(t += 1);
+        module.update(state);
+    }
+    bus.injectRxFrame(firstFrame({0x62, (uint8_t)(did >> 8), (uint8_t)(did & 0xFF), 1, 2, 3, 4, 5, 6, 7}));
+    setClock(t += 1);
+    module.update(state);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    const int requests = bus.countDidRequests(did);
+    // Past the hold, the ECU falls back to the default session (0x7F to a read), the
+    // session is requested again and confirmed. Its answers (here the repeated 0x50) keep
+    // the ECU present, so this stays in the same epoch.
+    const CanFrame session = singleFrame({VEHICLE_CL250_SESSION_POSITIVE_SID, VEHICLE_CL250_SESSION_SUBFUNCTION,
+                                          0x00, 0x32, 0x01, 0xF4});
+    for (int i = 0; i < 10; i++) {
+        bus.injectRxFrame(session);
+        for (int j = 0; j < 10; j++) {
+            setClock(t += 50);
+            module.update(state);
+        }
+    }
+    bus.injectRxFrame(singleFrame({0x7F, UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION}));
+    for (int i = 0; i < 16; i++) {
+        bus.injectRxFrame(session);
+        for (int j = 0; j < 10; j++) {
+            setClock(t += 50);
+            module.update(state);
+        }
+    }
+    TEST_ASSERT_TRUE(state.engine.ecuPresent);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL(requests, bus.countDidRequests(did));
+    TEST_ASSERT_EQUAL(0, countFc(bus));
+}
+
 // Every request is refused with NRC 0x31 (requestOutOfRange), the NRC that stops an
 // unverified DID (D-068) when it answers a DID read.
 static Bytes allNrc31Ecu(const Bytes& req) {
@@ -1181,6 +1230,7 @@ int main(int, char**) {
     RUN_TEST(test_nrc_0x78_then_a_segmented_answer);
     RUN_TEST(test_supported_ids_do_not_wrap_at_the_end_of_a_range);
     RUN_TEST(test_d068_first_frame_answer_stops_an_unverified_did);
+    RUN_TEST(test_d075_a_0x7f_reconfirmation_does_not_repeat_the_first_frame_hold);
     RUN_TEST(test_e18_an_nrc_to_a_scan_entry_never_touches_a_did_record);
     RUN_TEST(test_e18_nrc_0x78_and_0x31_to_a_did_shaped_scan_entry_never_touch_a_did_record);
     return UNITY_END();
