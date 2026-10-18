@@ -2702,7 +2702,9 @@ void test_d075_0x7f_in_the_post_timeout_quiet_window_does_not_count(void) {
     // Read 1 (outside any window) counts 1; read 2 falls in the quiet window after an RPM
     // timeout and does not count (so it does not stop the DID); read 3 counts 2 and stops.
     // Item 1 (amended) (c): the window case still drops the session, re-requested at the
-    // 2000 ms retry interval, so the re-requests stay bounded by one per tier period.
+    // 2000 ms retry interval, so the re-requests stay bounded by one per tier period. That
+    // timing is checked by test_d075_a_0x7f_in_the_quiet_window_keeps_the_2000_ms_retry:
+    // here read 2 comes more than 2000 ms after the last session request.
     MockCanBus bus;
     MockTesterLatchStore latchStore;
     HondaCANModule module(bus, latchStore);
@@ -3109,6 +3111,68 @@ void test_d075_an_ignored_fast_session_request_falls_back_to_2000_ms(void) {
 
 void test_d075_a_refused_fast_session_request_falls_back_to_2000_ms(void) {
     checkFastRequestFallsBackToTheRetryInterval(true);
+}
+
+// Review test gap 2 (conn#25): the first unverified read times out (the quiet window opens)
+// or is answered; the next unverified read is refused with 0x7F.
+static bool gQwTimeout = false, gQwFirstDone = false;
+static uint16_t gQwRefusedDid = 0;
+static unsigned long gQwRefusedAt = 0;
+static EcuReply ecuQuietWindowRefusal(uint16_t did) {
+    if (did == gStopDid && !gQwFirstDone) {
+        gQwFirstDone = true;
+        return gQwTimeout ? EcuReply::SILENT : EcuReply::ANSWER;
+    }
+    if (gQwFirstDone && gQwRefusedDid == 0 && !vehicle_cl250_find(did)->verified) {
+        gQwRefusedDid = did;
+        gQwRefusedAt = gTestNow;
+        return EcuReply::NRC_SESSION_7F;
+    }
+    return EcuReply::ANSWER;
+}
+
+static void checkQuietWindowRefusalKeepsTheRetryInterval(bool inQuietWindow) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state); // the session request goes out at 0
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gQwTimeout = inQuietWindow;
+    gQwFirstDone = false;
+    gQwRefusedDid = 0;
+    gQwRefusedAt = 0;
+    unsigned long t = 0;
+    bus.clearTxLog();
+    confirmSession(module, bus, state, t, ecuQuietWindowRefusal); // first unverified read out
+    const unsigned long at = firstSessionRequestAfter(module, bus, state, t, 2600, ecuQuietWindowRefusal);
+    TEST_ASSERT_EQUAL_HEX16(vehicle_cl250_dids[idx + 1].did, gQwRefusedDid);
+    // The refusal comes well under 2000 ms after the last session request, so the two
+    // paths give clearly different times.
+    TEST_ASSERT_TRUE(gQwRefusedAt < VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 100);
+    TEST_ASSERT_TRUE(at != 0);
+    const uint8_t refusedIdx = idx + 1;
+    if (inQuietWindow) {
+        // Not attributed (it may be the timed-out read's), so not counted, and the session
+        // is asked for again 2000 ms after the last request, not at the next step.
+        TEST_ASSERT_TRUE(at >= VEHICLE_CL250_SESSION_RETRY_INTERVAL_MS);
+        TEST_ASSERT_FALSE(state.vehicleSignals.dids[refusedIdx].lastWasNrc);
+    } else {
+        // Counted (item 1 (amended) (a)): the 0x10 03 goes out at the next step.
+        TEST_ASSERT_TRUE(at < gQwRefusedAt + 20);
+        TEST_ASSERT_TRUE(state.vehicleSignals.dids[refusedIdx].lastWasNrc);
+    }
+    TEST_ASSERT_FALSE(module.didStopped(refusedIdx));
+    TEST_ASSERT_EQUAL_UINT8(0, module.didStopReason(refusedIdx));
+}
+
+void test_d075_a_0x7f_in_the_quiet_window_keeps_the_2000_ms_retry(void) {
+    checkQuietWindowRefusalKeepsTheRetryInterval(true);
+}
+
+void test_d075_the_same_0x7f_outside_the_quiet_window_requests_the_session_at_once(void) {
+    checkQuietWindowRefusalKeepsTheRetryInterval(false);
 }
 
 static uint16_t gLongGapDid2 = 0;
@@ -3523,6 +3587,8 @@ int main(int, char**) {
     RUN_TEST(test_d075_the_f_counter_saturates_instead_of_wrapping);
     RUN_TEST(test_d075_an_ignored_fast_session_request_falls_back_to_2000_ms);
     RUN_TEST(test_d075_a_refused_fast_session_request_falls_back_to_2000_ms);
+    RUN_TEST(test_d075_a_0x7f_in_the_quiet_window_keeps_the_2000_ms_retry);
+    RUN_TEST(test_d075_the_same_0x7f_outside_the_quiet_window_requests_the_session_at_once);
     RUN_TEST(test_d075_combined_fault_rpm_0x78_storm_with_silent_unverified_dids_goes_stale);
     RUN_TEST(test_d075_0x7f_in_the_post_timeout_quiet_window_does_not_count);
     RUN_TEST(test_d075_one_0x31_and_one_0x7f_stop_an_unverified_did);
