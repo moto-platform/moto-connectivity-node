@@ -120,17 +120,22 @@ HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
 void HondaCANModule::rearmStoppedReads() {
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         DidSlot& slot = _dids[i];
-        if (slot.verified || !slot.unsupported) {
+        if (slot.verified) {
             continue;
         }
         // D-069 item 3: the stop rule starts again from zero. lastRequestMs is kept, so the
         // DID is due one cadence after its last request (never above its tier rate, D-068
-        // budget unchanged).
-        slot.unsupported = false;
-        slot.stopReason = StopReason::NONE;
+        // budget unchanged). The NRC counts of every unverified DID, stopped or not, are
+        // cleared (rt-core#42 safety review round 3 MINOR-1): a count left from before the
+        // engine start would stop it on one refusal.
         slot.stopNrcCount = 0;
         slot.sessionNrcCount = 0;
         slot.nrc31Seen = false;
+        if (!slot.unsupported) {
+            continue;
+        }
+        slot.unsupported = false;
+        slot.stopReason = StopReason::NONE;
         slot.consecutiveTimeouts = 0;
     }
 }

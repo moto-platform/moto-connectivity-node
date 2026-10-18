@@ -2908,6 +2908,51 @@ void test_d075_zero_seen_survives_a_0x7f_so_the_engine_start_reask_fires_once(vo
     gAlwaysRefusedDid = 0;
 }
 
+static int gReaskPhase = 0;
+static EcuReply ecuReaskCounts(uint16_t did) {
+    if (did == VEHICLE_CL250_DID_ENGINE_SPEED) {
+        return gEngineRunning ? EcuReply::ANSWER : EcuReply::ANSWER_ZERO;
+    }
+    if (did != gStopDid) return EcuReply::ANSWER;
+    switch (gReaskPhase) {
+        case 0: gReaskPhase = 1; return EcuReply::ANSWER;           // answered in the epoch
+        case 1: gReaskPhase = 2; return EcuReply::NRC_SESSION_7F;   // (f) count 1, not stopped
+        case 2: return EcuReply::ANSWER;
+        default: return EcuReply::NRC_SESSION_7F;
+    }
+}
+
+void test_d075_the_reask_clears_the_counts_of_a_did_that_is_not_stopped(void) {
+    // rt-core#42 safety review round 3 MINOR-1: before the fix the re-ask cleared only the
+    // stopped DIDs, so an answered DID with one counted 0x7F was stopped by one refusal
+    // after the engine start. Now it needs two again.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gAlwaysRefusedDid = 0;
+    gEngineRunning = false;
+    gReaskPhase = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuReaskCounts);
+    runEcuAutoSession(module, bus, state, t, 3 * vehicle_cl250_dids[idx].poll_period_ms + 1000, ecuReaskCounts);
+    TEST_ASSERT_EQUAL(2, gReaskPhase);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    gEngineRunning = true; // two RPM samples above 0 after a 0: the re-ask
+    runEcuAutoSession(module, bus, state, t, t + 1000, ecuReaskCounts);
+    gReaskPhase = 3;
+    const int before = bus.countDidRequests(gStopDid);
+    runEcuAutoSession(module, bus, state, t, t + 3 * vehicle_cl250_dids[idx].poll_period_ms + 2000, ecuReaskCounts);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL_UINT8(2 /* NRC_7E_7F */, module.didStopReason(idx));
+    TEST_ASSERT_EQUAL(before + 2 * kStopNrcReads, bus.countDidRequests(gStopDid));
+    gEngineRunning = false;
+    gStopDid = 0;
+}
+
 static EcuReply ecuAllUnverified7f(uint16_t did) {
     return vehicle_cl250_find(did)->verified ? EcuReply::ANSWER : EcuReply::NRC_SESSION_7F;
 }
@@ -3531,6 +3576,7 @@ int main(int, char**) {
     RUN_TEST(test_d075_two_answered_dids_that_later_refuse_are_stopped_and_bounded_over_120_s);
     RUN_TEST(test_d075_0x7f_to_tester_present_requests_the_session_but_never_counts);
     RUN_TEST(test_d075_zero_seen_survives_a_0x7f_so_the_engine_start_reask_fires_once);
+    RUN_TEST(test_d075_the_reask_clears_the_counts_of_a_did_that_is_not_stopped);
     RUN_TEST(test_d075_verified_gaps_hold_during_a_30_s_0x7f_loop);
     RUN_TEST(test_d075_a_counted_0x7f_requests_the_session_at_the_next_step);
     RUN_TEST(test_d075_a_0x7f_for_a_verified_read_keeps_the_session_retry_interval);
