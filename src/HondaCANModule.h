@@ -92,6 +92,7 @@ public:
 #ifdef CONN_NATIVE_TEST
     // Test hook: drives the real TX gate with an arbitrary request (never built on target).
     bool testSendFrame(uint32_t id, const uint8_t* request, uint8_t len) { return sendFrame(id, request, len); }
+    void testSetSessionNrcCount(uint8_t index, uint8_t value) { _dids[index].sessionNrcCount = value; }
 #if CONN_DISCOVERY_PROBE
     DiscoveryScan& testScan() { return _scan; }
 #endif
@@ -145,11 +146,13 @@ private:
     enum class StopReason : uint8_t { NONE, NRC_31, NRC_7E_7F, TIMEOUTS, FIRST_FRAME };
 
     struct DidSlot {
-        uint16_t did;
+        // Ordered to keep the slot at 24 B on the ESP32 (three words, then the halfword and
+        // the single bytes); see the static_assert below.
         unsigned long cadenceMs;      // desired re-request interval for this DID
         unsigned long lastRequestMs;
-        uint8_t consecutiveTimeouts;
         unsigned long skipUntilMs;    // temporarily skipped after repeated timeouts
+        uint16_t did;
+        uint8_t consecutiveTimeouts;
         // D-068 item 2, only for a DID whose support is not verified (yaml `verified: false`):
         // read once when a stop epoch starts, then not asked again until the next epoch if
         // the ECU refuses it (NRC 0x31, 0x7E/0x7F) or never answers it (D-075).
@@ -157,13 +160,17 @@ private:
         bool answered;                // a positive answer since the stop epoch started
         bool unsupported;             // stopped until the next stop epoch (D-075)
         StopReason stopReason;        // set with `unsupported`, NONE otherwise
-        uint8_t stopNrcCount;           // NRC 0x31/0x7E/0x7F reads since the last positive answer
+        uint8_t stopNrcCount;         // NRC 0x31/0x7E/0x7F reads since the last positive answer
         // D-075 item 1 (f), provisional: NRC 0x7E/0x7F refusals of an unverified DID in this
-        // stop epoch, answered or not. A positive answer does not reset it; the epoch start
-        // and the D-069 re-ask do. nrc31Seen: a 0x31 was counted (it fixes the stop reason).
+        // stop epoch, answered or not, saturating. A positive answer does not reset it; the
+        // epoch start and the D-069 re-ask do. nrc31Seen: a 0x31 was counted since the last
+        // positive answer (it fixes the stop reason).
         uint8_t sessionNrcCount;
         bool nrc31Seen;
     };
+    static_assert(sizeof(unsigned long) != 4 || sizeof(DidSlot) <= 24,
+                  "DidSlot must stay at 24 bytes on the 32-bit target (D-075 item 1 (f) review MINOR-4)");
+
 
     // Same order as the generated table (table order, not the D-043 poll priority):
     // the unverified D-068 DIDs come after every verified one (codegen checks it), so they
@@ -196,8 +203,8 @@ private:
     // to a stop epoch. One starts at the tester's start and when the session is confirmed
     // after the ECU was lost, not after an NRC 0x7E/0x7F re-confirmation.
     bool _newStopEpoch = true;
-    // D-075 item 1 (amended, provisional): set when an NRC 0x7E/0x7F refusal of a never-answered
-    // unverified DID was counted toward its stop; the next step then requests the session
+    // D-075 item 1 (amended, (f), provisional): set when an NRC 0x7E/0x7F refusal of an
+    // unverified DID was counted (answered or not); the next step then requests the session
     // without waiting for kSessionRetryMs. Every other session loss keeps the retry interval.
     bool _sessionRetryNow = false;
     unsigned long _lastSessionAttemptMs = 0;

@@ -767,9 +767,14 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // D-068: the DID echo proves the ECU serves this DID, also for a late answer, so
             // an earlier stop (e.g. an NRC 0x31 from the other response ID) is undone.
             _dids[didIndex].answered = true;
-            _dids[didIndex].unsupported = false;
-            _dids[didIndex].stopReason = StopReason::NONE;
+            // D-075 item 1 (f), review MINOR-1: a late answer (the other response ID) does not
+            // undo a stop by the (f) counter; it undoes a 0x31 or timeout stop as before.
+            if (_dids[didIndex].sessionNrcCount < kStopNrcReads) {
+                _dids[didIndex].unsupported = false;
+                _dids[didIndex].stopReason = StopReason::NONE;
+            }
             _dids[didIndex].stopNrcCount = 0;
+            _dids[didIndex].nrc31Seen = false; // review MINOR-2: with stopNrcCount, as in rt-core
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
                 if (didIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
@@ -898,7 +903,12 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                         if (counted && ++slot.stopNrcCount >= kStopNrcReads) {
                             stop = true;
                         }
-                        if (countedF && ++slot.sessionNrcCount >= kStopNrcReads) {
+                        if (countedF) {
+                            if (slot.sessionNrcCount < UINT8_MAX) {
+                                slot.sessionNrcCount++; // saturates, never wraps (review MINOR-3)
+                            }
+                        }
+                        if (countedF && slot.sessionNrcCount >= kStopNrcReads) {
                             stop = true;
                         }
                         if (stop) {
