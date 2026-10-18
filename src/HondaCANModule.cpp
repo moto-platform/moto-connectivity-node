@@ -144,6 +144,9 @@ void HondaCANModule::watchEngineStart(float rpm) {
     }
 }
 
+// D-075 (provisional) item 1: starts a stop epoch. Called only at the first session
+// confirmation after the tester's start or after the ECU was lost, never for a
+// re-confirmation after NRC 0x7E/0x7F.
 void HondaCANModule::armUnverifiedReads(unsigned long now) {
     for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
         DidSlot& slot = _dids[i];
@@ -458,6 +461,7 @@ void HondaCANModule::poll(SystemState& state) {
     if (ecuPresentNow != _ecuPresent) {
         if (!ecuPresentNow) {
             _sessionConfirmed = false; // ECU lost (e.g. reset): request the session again
+            _newStopEpoch = true;      // D-075 item 1: its confirmation starts a new stop epoch
         }
         _ecuPresent = ecuPresentNow;
         Serial.printf("[UDS] ECU is now %s.\n", _ecuPresent ? "PRESENT" : "NOT DETECTED");
@@ -573,7 +577,7 @@ void HondaCANModule::poll(SystemState& state) {
             if (!slot.verified && !slot.answered) {
                 // D-068 item 2: never answered in this session: probably not served at all.
                 slot.unsupported = true;
-                Serial.printf("[UDS] DID 0x%04X never answered -- not asked again until the session is confirmed again (D-068).\n",
+                Serial.printf("[UDS] DID 0x%04X never answered -- not asked again until the next stop epoch (D-068, D-075).\n",
                     _pendingDid);
             } else {
                 slot.skipUntilMs = now + kDidSkipCooldownMs;
@@ -775,7 +779,14 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // G2.3 -- Positive response to DiagnosticSessionControl (0x10).
             if (!_sessionConfirmed) {
                 _sessionConfirmed = true;
-                armUnverifiedReads(now); // D-068 item 2: read every unverified DID once now
+                // D-075 (provisional) item 1: only the first confirmation of a stop epoch
+                // (tester start, ECU lost) arms everything at once. A re-confirmation after
+                // NRC 0x7E/0x7F stays in the epoch: stops, answered flags, the engine-start
+                // flag and every lastRequestMs are kept.
+                if (_newStopEpoch) {
+                    _newStopEpoch = false;
+                    armUnverifiedReads(now); // D-068 item 2: read every unverified DID once now
+                }
                 Serial.println("[UDS SUCCESS] Extended diagnostic session (0x10 0x03) confirmed by ECU.");
             }
             _lastGoodResponseMs = now;
@@ -831,7 +842,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                     (nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
                      nrc == UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION) &&
                     (echoedSid == UDS_SID_READ_DATA_BY_IDENTIFIER || echoedSid == VEHICLE_CL250_TESTER_PRESENT_SID)) {
-                    _sessionConfirmed = false;
+                    _sessionConfirmed = false; // same stop epoch (D-075 item 1): no re-arm on confirm
                     Serial.println("[UDS] Extended session lost (NRC 0x7E/0x7F) -- requesting it again.");
                 }
                 // Any other NRC definitively resolves this request (not a timeout, not
@@ -848,11 +859,16 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                         // Two separate reads (safety-reviewer MAJOR-2): requests go to both
                         // IDs, so one 0x31 may be the other ID's, or trail an earlier answer.
                         DidSlot& slot = _dids[_pendingDidIndex];
-                        if (nrc == UDS_NRC_REQUEST_OUT_OF_RANGE && !slot.verified && !slot.answered &&
+                        // D-075 (provisional) item 1: NRC 0x7E/0x7F to a read of an unverified
+                        // DID without a positive answer in this epoch counts like 0x31.
+                        const bool countsToStop = nrc == UDS_NRC_REQUEST_OUT_OF_RANGE ||
+                            nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
+                            nrc == UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION;
+                        if (countsToStop && !slot.verified && !slot.answered &&
                             ++slot.nrc31Count >= kNrc31ToStop) {
                             slot.unsupported = true;
-                            Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x31) -- not asked again until the session is confirmed again (D-068).\n",
-                                _pendingDid);
+                            Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x%02X) -- not asked again in this stop epoch (D-075).\n",
+                                _pendingDid, nrc);
                         }
                     }
                     if (_pendingDidIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {

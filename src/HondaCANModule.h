@@ -74,7 +74,7 @@ public:
     // Log policy of the DID timeout warning: lines per time window (tests assert the bound).
     static uint8_t maxTimeoutLogLinesPerWindow();
     // D-068 item 2: true while the tester no longer asks for this DID (table index) in this
-    // session: an unverified DID the ECU refused with NRC 0x31 or never answered.
+    // stop epoch: an unverified DID the ECU refused with NRC 0x31 / 0x7E / 0x7F or never answered.
     bool didStopped(uint8_t index) const {
         return index < VEHICLE_CL250_DID_COUNT && _dids[index].unsupported;
     }
@@ -148,8 +148,8 @@ private:
         // confirmation if the ECU refuses it (NRC 0x31) or never answers it.
         bool verified;                // vehicle_cl250_did_t.verified
         bool answered;                // a positive answer since the session was confirmed
-        bool unsupported;             // stopped until the session is confirmed again
-        uint8_t nrc31Count;           // NRC 0x31 reads since the last positive answer
+        bool unsupported;             // stopped until the next stop epoch (D-075)
+        uint8_t nrc31Count;           // NRC 0x31/0x7E/0x7F reads since the last positive answer
     };
 
     // Same order as the generated table (table order, not the D-043 poll priority):
@@ -179,6 +179,10 @@ private:
     // VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS, exposed via state.engine.ecuPresent.
     // ------------------------------------------------------------------
     bool _sessionConfirmed = false;
+    // D-075 (provisional) item 1: the D-068 stop state and the D-069 engine-start flag belong
+    // to a stop epoch. One starts at the tester's start and when the session is confirmed
+    // after the ECU was lost, not after an NRC 0x7E/0x7F re-confirmation.
+    bool _newStopEpoch = true;
     unsigned long _lastSessionAttemptMs = 0;
 
     unsigned long _lastGoodResponseMs = 0;
@@ -216,8 +220,9 @@ private:
 
     void storeValue(SystemState& state, uint8_t didIndex, float value, unsigned long now);
 
-    // D-068 item 2: the session was (re)confirmed. Every unverified DID is due at once and
-    // asked again, whatever the last session found.
+    // D-068 item 2 / D-075 item 1: a new stop epoch begins (first confirmation after the start
+    // or after the ECU was lost). Every unverified DID is due at once and asked again,
+    // whatever the last epoch found.
     void armUnverifiedReads(unsigned long now);
     // D-069 item 3: every unverified DID stopped since the session confirmation becomes
     // pollable again, due one cadence after its last request (lastRequestMs kept).

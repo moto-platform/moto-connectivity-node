@@ -1947,7 +1947,8 @@ void test_tester_stats_do_not_change_what_is_sent(void) {
 // ---------------------------------------------------------------------------
 
 // What the simulated ECU does with a DID read.
-enum class EcuReply : uint8_t { ANSWER, NRC_OUT_OF_RANGE, SILENT, PENDING, NRC_THEN_ANSWER, ANSWER_ZERO };
+enum class EcuReply : uint8_t { ANSWER, NRC_OUT_OF_RANGE, SILENT, PENDING, NRC_THEN_ANSWER, ANSWER_ZERO,
+                                NRC_SESSION_7F, NRC_SESSION_7E };
 typedef EcuReply (*EcuBehaviour)(uint16_t did);
 
 static EcuReply ecuAnswersAll(uint16_t) { return EcuReply::ANSWER; }
@@ -1989,6 +1990,12 @@ static unsigned long runEcu(HondaCANModule& module, MockCanBus& bus, SystemState
                 bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_REQUEST_OUT_OF_RANGE));
                 break;
             case EcuReply::SILENT: break;
+            case EcuReply::NRC_SESSION_7F: // D-075: the ECU is in the default session
+                bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION));
+                break;
+            case EcuReply::NRC_SESSION_7E:
+                bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION));
+                break;
             case EcuReply::ANSWER_ZERO: // raw 0 (e.g. engine speed with the engine off)
                 bus.injectRxFrame(makePositiveResponse(did, 0x00, 0x00, (uint8_t)(4u + vehicle_cl250_find(did)->length)));
                 break;
@@ -2387,10 +2394,11 @@ void test_d069_engine_start_rearm_keeps_the_tier_slot(void) {
     TEST_ASSERT_TRUE(bus.countDidRequests(gStopDid) > requests);
 }
 
-void test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids(void) {
-    // Safety-reviewer MINOR-1: the ECU drops to the default session (short reset, S3) and
-    // refuses reads with 0x7F; the tester asks for the session again and its confirmation
-    // re-arms the unverified DIDs that the 0x31s of the default session stopped.
+void test_d075_session_lost_without_ecu_absence_keeps_the_stopped_dids(void) {
+    // D-075 (provisional) item 1 replaces the D-068 MINOR-1 re-arm: the ECU drops to the
+    // default session (short reset, S3) and refuses a read with 0x7F; the tester asks for
+    // the session again, but the confirmation stays in the same stop epoch, so the DID the
+    // 0x31s stopped stays stopped.
     MockCanBus bus;
     MockTesterLatchStore latchStore;
     HondaCANModule module(bus, latchStore);
@@ -2409,9 +2417,199 @@ void test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids(void) {
     TEST_ASSERT_TRUE(countSessionRequests(bus) >= 2); // 0x10 0x03 again, on both IDs
     TEST_ASSERT_TRUE(state.engine.ecuPresent);        // no 3 s silence was needed
     confirmSession(module, bus, state, t, ecuAnswersAll);
+    TEST_ASSERT_TRUE(module.didStopped(idx));         // same epoch: still stopped
+    const int before = bus.countDidRequests(gStopDid);
+    runEcu(module, bus, state, t, t + 3000, ecuAnswersAll);
+    TEST_ASSERT_EQUAL(before, bus.countDidRequests(gStopDid));
+}
+
+// ---------------------------------------------------------------------------
+// D-075 (provisional) item 1: stop epochs
+// ---------------------------------------------------------------------------
+
+static EcuReply ecuDefaultSession7fOnStopDid(uint16_t did) {
+    return did == gStopDid ? EcuReply::NRC_SESSION_7F : EcuReply::ANSWER;
+}
+static EcuReply ecuDefaultSession7eOnStopDid(uint16_t did) {
+    return did == gStopDid ? EcuReply::NRC_SESSION_7E : EcuReply::ANSWER;
+}
+
+// Like runEcu, but the ECU confirms every session request it sees (one pass later).
+static void runEcuAutoSession(HondaCANModule& module, MockCanBus& bus, SystemState& state,
+                              unsigned long& t, unsigned long until, EcuBehaviour ecu) {
+    while (t < until) {
+        const size_t before = bus.txLog.size();
+        runEcu(module, bus, state, t, t + 1, ecu);
+        for (size_t i = before; i < bus.txLog.size(); i++) {
+            const CanFrame& f = bus.txLog[i];
+            if (f.dlc >= 3 && f.data[1] == VEHICLE_CL250_SESSION_SID) {
+                bus.injectRxFrame(makeSessionConfirm());
+                break;
+            }
+        }
+    }
+}
+
+static void check_0x7f_on_every_read_stops_after_two_reads(EcuBehaviour ecu) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecu);
+    runEcuAutoSession(module, bus, state, t, 30000, ecu);
+    // Two separate reads (two IDs each), then stopped for the epoch.
+    TEST_ASSERT_EQUAL(2 * kNrc31ToStop, bus.countDidRequests(gStopDid));
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].lastWasNrc);
+    // At most two session re-requests for it (each goes out on both IDs), plus the
+    // initial one of the start.
+    TEST_ASSERT_TRUE(countSessionRequests(bus) <= 2 * (1 + kNrc31ToStop) + 2);
+    // Later confirmations of the same epoch do not bring it back.
+    const int sessions = countSessionRequests(bus);
+    runEcuAutoSession(module, bus, state, t, t + 30000, ecu);
+    TEST_ASSERT_EQUAL(2 * kNrc31ToStop, bus.countDidRequests(gStopDid));
+    TEST_ASSERT_EQUAL(sessions, countSessionRequests(bus));
+    // The other unverified DIDs kept their tier rate across the re-confirmations.
+    const uint8_t other = idx + 1;
+    TEST_ASSERT_FALSE(module.didStopped(other));
+    TEST_ASSERT_TRUE(vehicle_cl250_dids[other].poll_period_ms > 1000);
+    const int expectedMax = (int)(2 * (1 + 60000 / vehicle_cl250_dids[other].poll_period_ms)) + 2;
+    TEST_ASSERT_TRUE(bus.countDidRequests(vehicle_cl250_dids[other].did) <= expectedMax);
+}
+
+void test_d075_nrc_0x7f_on_every_read_stops_an_unverified_did_after_two_reads(void) {
+    check_0x7f_on_every_read_stops_after_two_reads(ecuDefaultSession7fOnStopDid);
+}
+
+void test_d075_nrc_0x7e_on_every_read_stops_an_unverified_did_after_two_reads(void) {
+    check_0x7f_on_every_read_stops_after_two_reads(ecuDefaultSession7eOnStopDid);
+}
+
+void test_d075_reconfirmation_after_0x7f_keeps_the_tier_rate_of_the_other_dids(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t stopIdx = firstUnverifiedIdx();
+    const uint8_t other = stopIdx + 1;
+    gStopDid = vehicle_cl250_dids[stopIdx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuAnswersAll);
+    runEcu(module, bus, state, t, t + 1000, ecuAnswersAll);
+    TEST_ASSERT_TRUE(vehicle_cl250_dids[other].poll_period_ms > 1000);
+    const int others = bus.countDidRequests(vehicle_cl250_dids[other].did);
+    TEST_ASSERT_EQUAL(2, others);
+    // The ECU falls back to the default session: one 0x7F, session asked again and
+    // confirmed. None of the other unverified DIDs is read before its period is over.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION));
+    runEcuAutoSession(module, bus, state, t, t + 2000, ecuAnswersAll);
+    TEST_ASSERT_TRUE(countSessionRequests(bus) >= 2);
+    for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (vehicle_cl250_dids[i].poll_period_ms > 3000) {
+            TEST_ASSERT_EQUAL(2, bus.countDidRequests(vehicle_cl250_dids[i].did));
+        }
+    }
+}
+
+void test_d075_ecu_lost_starts_a_new_epoch_and_clears_the_stops(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuDefaultSession7fOnStopDid);
+    runEcuAutoSession(module, bus, state, t, 10000, ecuDefaultSession7fOnStopDid);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    // ECU lost (silence beyond the absent timeout), then back and confirmed.
+    runEcu(module, bus, state, t, t + VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS + 500, ecuSilent);
+    TEST_ASSERT_FALSE(state.engine.ecuPresent);
+    bus.clearTxLog();
+    confirmSession(module, bus, state, t, ecuAnswersAll);
     TEST_ASSERT_FALSE(module.didStopped(idx));
     runEcu(module, bus, state, t, t + 1000, ecuAnswersAll);
+    // New epoch: every unverified DID was due at once, exactly one read each.
+    for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_EQUAL(2, bus.countDidRequests(vehicle_cl250_dids[i].did));
+    }
+}
+
+void test_d075_engine_start_flag_survives_a_0x7f_reconfirmation(void) {
+    // D-069 item 3 once per epoch: a 0x7E/0x7F re-confirmation must not give a second
+    // engine-start re-ask.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t refusedIdx = firstUnverifiedIdx();
+    gStopDid = 0;
+    gAlwaysRefusedDid = vehicle_cl250_dids[refusedIdx].did;
+    gEngineRunning = false;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuServesStopDidOnlyWithEngineRunning);
+    runEcu(module, bus, state, t, 8000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx));
+    gEngineRunning = true; // first engine start: the one re-ask of the epoch
+    runEcu(module, bus, state, t, t + 5000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx)); // asked again, refused twice, stopped again
+    // The ECU falls back to the default session; the session is confirmed again.
+    bus.injectRxFrame(makeNegativeResponse(UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION));
+    runEcuAutoSession(module, bus, state, t, t + 1000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx));
+    // Stall and restart: the flag was kept, so no second re-ask in this epoch.
+    const int refusedRequests = bus.countDidRequests(gAlwaysRefusedDid);
+    gEngineRunning = false;
+    runEcuAutoSession(module, bus, state, t, t + 2000, ecuServesStopDidOnlyWithEngineRunning);
+    gEngineRunning = true;
+    runEcuAutoSession(module, bus, state, t, t + 5000, ecuServesStopDidOnlyWithEngineRunning);
+    TEST_ASSERT_TRUE(module.didStopped(refusedIdx));
+    TEST_ASSERT_EQUAL_INT(refusedRequests, bus.countDidRequests(gAlwaysRefusedDid));
+    gAlwaysRefusedDid = 0;
+}
+
+static int gStopDidReads = 0;
+static EcuReply ecuSessionNrcThenAnswerStopDid(uint16_t did) {
+    if (did != gStopDid) return EcuReply::ANSWER;
+    return gStopDidReads++ == 0 ? EcuReply::NRC_SESSION_7F : EcuReply::ANSWER;
+}
+
+void test_d075_a_positive_answer_undoes_a_0x7f_stop_count(void) {
+    // One 0x7F read, then positive: never stopped, the count starts again.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gStopDidReads = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuSessionNrcThenAnswerStopDid);
+    runEcuAutoSession(module, bus, state, t, 20000, ecuSessionNrcThenAnswerStopDid);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
     TEST_ASSERT_TRUE(state.vehicleSignals.dids[idx].hasValue);
+}
+
+void test_d075_0x7f_never_stops_a_verified_did(void) {
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    gStopDid = VEHICLE_CL250_DID_ENGINE_SPEED;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuDefaultSession7fOnStopDid);
+    runEcuAutoSession(module, bus, state, t, 10000, ecuDefaultSession7fOnStopDid);
+    TEST_ASSERT_FALSE(module.didStopped(VEHICLE_CL250_IDX_ENGINE_SPEED));
+    TEST_ASSERT_TRUE(bus.countDidRequests(VEHICLE_CL250_DID_ENGINE_SPEED) > 2 * kNrc31ToStop);
 }
 
 static uint16_t gLongGapDid2 = 0;
@@ -2813,7 +3011,14 @@ int main(int, char**) {
     RUN_TEST(test_d068_an_unverified_did_gets_no_0x78_extension);
     RUN_TEST(test_d068_one_nrc31_does_not_stop_an_unverified_did);
     RUN_TEST(test_d068_a_positive_answer_undoes_an_nrc31_stop);
-    RUN_TEST(test_d068_session_lost_without_ecu_absence_rearms_the_stopped_dids);
+    RUN_TEST(test_d075_session_lost_without_ecu_absence_keeps_the_stopped_dids);
+    RUN_TEST(test_d075_nrc_0x7f_on_every_read_stops_an_unverified_did_after_two_reads);
+    RUN_TEST(test_d075_nrc_0x7e_on_every_read_stops_an_unverified_did_after_two_reads);
+    RUN_TEST(test_d075_reconfirmation_after_0x7f_keeps_the_tier_rate_of_the_other_dids);
+    RUN_TEST(test_d075_ecu_lost_starts_a_new_epoch_and_clears_the_stops);
+    RUN_TEST(test_d075_engine_start_flag_survives_a_0x7f_reconfirmation);
+    RUN_TEST(test_d075_a_positive_answer_undoes_a_0x7f_stop_count);
+    RUN_TEST(test_d075_0x7f_never_stops_a_verified_did);
     RUN_TEST(test_d069_engine_start_rearms_the_stopped_dids_once);
     RUN_TEST(test_d069_engine_start_rearm_keeps_the_tier_slot);
     RUN_TEST(test_d069_an_nrc_on_rpm_breaks_the_engine_start_run);
