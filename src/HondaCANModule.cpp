@@ -21,7 +21,7 @@ const uint32_t kMaxBusOffEvents = 5;
 
 // D-068 item 2 (safety-reviewer MAJOR-2): NRC 0x31 on this many separate reads, with no
 // positive answer between them, stops an unverified DID. Local policy of this tester.
-const uint8_t kNrc31ToStop = 2;
+const uint8_t kStopNrcReads = 2;
 
 // Local policy of this TEMPORARY tester (Q-018): listen-only for this long after begin()
 // before the first request, so a tester that is already polling the ECU is seen before
@@ -110,7 +110,10 @@ HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
         _dids[i].verified = vehicle_cl250_dids[i].verified;
         _dids[i].answered = false;
         _dids[i].unsupported = false;
-        _dids[i].nrc31Count = 0;
+        _dids[i].stopReason = StopReason::NONE;
+        _dids[i].stopNrcCount = 0;
+        _dids[i].sessionNrcCount = 0;
+        _dids[i].nrc31Seen = false;
     }
 }
 
@@ -124,7 +127,10 @@ void HondaCANModule::rearmStoppedReads() {
         // DID is due one cadence after its last request (never above its tier rate, D-068
         // budget unchanged).
         slot.unsupported = false;
-        slot.nrc31Count = 0;
+        slot.stopReason = StopReason::NONE;
+        slot.stopNrcCount = 0;
+        slot.sessionNrcCount = 0;
+        slot.nrc31Seen = false;
         slot.consecutiveTimeouts = 0;
     }
 }
@@ -139,7 +145,7 @@ void HondaCANModule::watchEngineStart(float rpm) {
         return;
     }
     if (++_rpmRunSamples >= kEngineStartSamples) {
-        _engineStartRearmed = true; // once per confirmed session, not on every stall/restart
+        _engineStartRearmed = true; // once per stop epoch, not on every stall/restart
         rearmStoppedReads();
     }
 }
@@ -155,12 +161,16 @@ void HondaCANModule::armUnverifiedReads(unsigned long now) {
         }
         slot.answered = false;
         slot.unsupported = false;
-        slot.nrc31Count = 0;
+        slot.stopReason = StopReason::NONE;
+        slot.stopNrcCount = 0;
+        slot.sessionNrcCount = 0;
+        slot.nrc31Seen = false;
         slot.consecutiveTimeouts = 0;
         slot.skipUntilMs = 0;
         slot.lastRequestMs = now - slot.cadenceMs; // due at once (unsigned, wrap-safe)
     }
-    // D-069 item 3: a new confirmed session may re-arm once more at its first engine start.
+    // D-069 item 3: a new stop epoch may re-arm once more at its first engine start
+    // (_rpmZeroSeen and the sample run belong to the epoch too, D-075 item 1 (b)).
     _engineStartRearmed = false;
     _rpmZeroSeen = false;
     _rpmRunSamples = 0;
@@ -447,8 +457,10 @@ void HondaCANModule::poll(SystemState& state) {
     }
 
     // 2b. G2.3 -- Retry the extended diagnostic session until a positive 0x50 confirms it.
-    if (!txHold && auxAllowed && !_sessionConfirmed && (now - _lastSessionAttemptMs >= kSessionRetryMs)) {
+    if (!txHold && auxAllowed && !_sessionConfirmed &&
+        (_sessionRetryNow || now - _lastSessionAttemptMs >= kSessionRetryMs)) {
         _lastSessionAttemptMs = now;
+        _sessionRetryNow = false;
         Serial.println("[UDS] Extended session (0x10 0x03) not yet confirmed -- retrying...");
         sendRequest(kSessionRequest, sizeof(kSessionRequest));
         auxSent = true;
@@ -575,8 +587,9 @@ void HondaCANModule::poll(SystemState& state) {
         if (slot.consecutiveTimeouts >= kMaxConsecutiveTimeouts) {
             slot.consecutiveTimeouts = 0;
             if (!slot.verified && !slot.answered) {
-                // D-068 item 2: never answered in this session: probably not served at all.
+                // D-068 item 2: never answered in this stop epoch: probably not served at all.
                 slot.unsupported = true;
+                slot.stopReason = StopReason::TIMEOUTS;
                 Serial.printf("[UDS] DID 0x%04X never answered -- not asked again until the next stop epoch (D-068, D-075).\n",
                     _pendingDid);
             } else {
@@ -755,7 +768,8 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // an earlier stop (e.g. an NRC 0x31 from the other response ID) is undone.
             _dids[didIndex].answered = true;
             _dids[didIndex].unsupported = false;
-            _dids[didIndex].nrc31Count = 0;
+            _dids[didIndex].stopReason = StopReason::NONE;
+            _dids[didIndex].stopNrcCount = 0;
             // G2.2 -- resolve the state machine only if this is the DID we're waiting on.
             if (_udsState == UdsRequestState::WAITING && echoedDid == _pendingDid) {
                 if (didIndex == VEHICLE_CL250_IDX_ENGINE_SPEED) {
@@ -779,6 +793,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             // G2.3 -- Positive response to DiagnosticSessionControl (0x10).
             if (!_sessionConfirmed) {
                 _sessionConfirmed = true;
+                _sessionRetryNow = false;
                 // D-075 (provisional) item 1: only the first confirmation of a stop epoch
                 // (tester start, ECU lost) arms everything at once. A re-confirmation after
                 // NRC 0x7E/0x7F stays in the epoch: stops, answered flags, the engine-start
@@ -836,8 +851,9 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                 // D-068 (safety-reviewer MINOR-1): a read or tester present refused as not
                 // supported in the active session means the ECU fell back to the default
                 // session (a short reset, S3 expiry) without 3 s of silence. Ask for the
-                // session again (retried below, D-020); its confirmation re-arms the
-                // unverified DIDs, which would otherwise all be stopped by NRC 0x31.
+                // session again (retried below, D-020). D-075 item 1: its confirmation stays
+                // in the same stop epoch and re-arms nothing; the refusal of a never-answered
+                // unverified DID counts toward its stop (below).
                 if (_sessionConfirmed &&
                     (nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
                      nrc == UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION) &&
@@ -861,12 +877,34 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
                         DidSlot& slot = _dids[_pendingDidIndex];
                         // D-075 (provisional) item 1: NRC 0x7E/0x7F to a read of an unverified
                         // DID without a positive answer in this epoch counts like 0x31.
-                        const bool countsToStop = nrc == UDS_NRC_REQUEST_OUT_OF_RANGE ||
-                            nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
+                        const bool sessionNrc = nrc == UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION ||
                             nrc == UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_ACTIVE_SESSION;
-                        if (countsToStop && !slot.verified && !slot.answered &&
-                            ++slot.nrc31Count >= kNrc31ToStop) {
+                        const bool nrc31 = nrc == UDS_NRC_REQUEST_OUT_OF_RANGE;
+                        const bool counted = (nrc31 || sessionNrc) && !slot.verified && !slot.answered;
+                        // D-075 item 1 (f), provisional: a session NRC is also counted, in its
+                        // own counter, for an unverified DID that answered in this epoch
+                        // (a positive answer does not reset it). Verified DIDs: never.
+                        const bool countedF = sessionNrc && !slot.verified;
+                        if (countedF) {
+                            // D-075 item 1 (amended, provisional) (a), (f): only a counted
+                            // refusal asks for the session at the next step instead of after
+                            // kSessionRetryMs.
+                            _sessionRetryNow = true;
+                        }
+                        if (counted && nrc31) {
+                            slot.nrc31Seen = true;
+                        }
+                        bool stop = false;
+                        if (counted && ++slot.stopNrcCount >= kStopNrcReads) {
+                            stop = true;
+                        }
+                        if (countedF && ++slot.sessionNrcCount >= kStopNrcReads) {
+                            stop = true;
+                        }
+                        if (stop) {
                             slot.unsupported = true;
+                            // Precedence: once a 0x31 was counted, the reason stays NRC_31.
+                            slot.stopReason = slot.nrc31Seen ? StopReason::NRC_31 : StopReason::NRC_7E_7F;
                             Serial.printf("[UDS] DID 0x%04X not supported (NRC 0x%02X) -- not asked again in this stop epoch (D-075).\n",
                                 _pendingDid, nrc);
                         }
@@ -942,8 +980,14 @@ void HondaCANModule::scanStep(unsigned long now) {
         for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
             _dids[i].lastRequestMs = now; // the DID schedule starts after the scan
         }
+        // D-075 item 1: the scan-end arm is the epoch's deferred first arm (the scan ran
+        // before the DID polling). Without a confirmed session the next confirmation is
+        // that first arm, also if the session was lost meanwhile.
         if (_sessionConfirmed) {
+            _newStopEpoch = false;
             armUnverifiedReads(now); // D-068: their first read is due at once, as without a scan
+        } else {
+            _newStopEpoch = true;
         }
         return;
     }
@@ -1041,6 +1085,11 @@ void HondaCANModule::onFirstFrame(const CanFrame& f, unsigned long now) {
         DidSlot& slot = _dids[_pendingDidIndex];
         if (!slot.verified && !slot.answered) {
             slot.unsupported = true;
+            slot.stopReason = StopReason::FIRST_FRAME;
+        } else {
+            // A verified or answered DID is never stopped: the D-050..D-053 skip, so the
+            // quiet time does not repeat every period (mirrors rt-core's stop_or_skip).
+            slot.skipUntilMs = now + kDidSkipCooldownMs;
         }
         _udsState = UdsRequestState::COMPLETE;
     }
