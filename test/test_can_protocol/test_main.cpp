@@ -2953,6 +2953,45 @@ void test_d075_the_reask_clears_the_counts_of_a_did_that_is_not_stopped(void) {
     gStopDid = 0;
 }
 
+static int gPrecedenceReads = 0;
+static EcuReply ecuReask31Then7f(uint16_t did) {
+    if (did == VEHICLE_CL250_DID_ENGINE_SPEED) {
+        return gEngineRunning ? EcuReply::ANSWER : EcuReply::ANSWER_ZERO;
+    }
+    if (did != gStopDid) return EcuReply::ANSWER;
+    return gPrecedenceReads++ == 0 ? EcuReply::NRC_OUT_OF_RANGE : EcuReply::NRC_SESSION_7F;
+}
+
+void test_d075_the_reask_keeps_the_stop_reason_precedence(void) {
+    // Safety review of conn#28, MINOR-B (rt-core parity): one 0x31 at key-on, the engine
+    // starts before the next read, then two 0x7F. The re-ask clears nrc31Seen with the
+    // counts, so the reason is NRC_7E_7F ("unknown"), not NRC_31 ("not served").
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    startPolling(module, state);
+    const uint8_t idx = firstUnverifiedIdx();
+    gStopDid = vehicle_cl250_dids[idx].did;
+    gAlwaysRefusedDid = 0;
+    gEngineRunning = false;
+    gPrecedenceReads = 0;
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecuReask31Then7f); // read 1: 0x31
+    runEcuAutoSession(module, bus, state, t, 200, ecuReask31Then7f); // RPM 0 seen
+    gEngineRunning = true; // the re-ask, before the next read of the DID
+    runEcuAutoSession(module, bus, state, t, 700, ecuReask31Then7f);
+    TEST_ASSERT_EQUAL(1, gPrecedenceReads);
+    TEST_ASSERT_FALSE(module.didStopped(idx));
+    const int before = bus.countDidRequests(gStopDid);
+    runEcuAutoSession(module, bus, state, t, t + 3 * vehicle_cl250_dids[idx].poll_period_ms + 2000, ecuReask31Then7f);
+    TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL_UINT8(2 /* NRC_7E_7F */, module.didStopReason(idx));
+    TEST_ASSERT_EQUAL(before + 2 * kStopNrcReads, bus.countDidRequests(gStopDid));
+    gEngineRunning = false;
+    gStopDid = 0;
+}
+
 static EcuReply ecuAllUnverified7f(uint16_t did) {
     return vehicle_cl250_find(did)->verified ? EcuReply::ANSWER : EcuReply::NRC_SESSION_7F;
 }
@@ -3577,6 +3616,7 @@ int main(int, char**) {
     RUN_TEST(test_d075_0x7f_to_tester_present_requests_the_session_but_never_counts);
     RUN_TEST(test_d075_zero_seen_survives_a_0x7f_so_the_engine_start_reask_fires_once);
     RUN_TEST(test_d075_the_reask_clears_the_counts_of_a_did_that_is_not_stopped);
+    RUN_TEST(test_d075_the_reask_keeps_the_stop_reason_precedence);
     RUN_TEST(test_d075_verified_gaps_hold_during_a_30_s_0x7f_loop);
     RUN_TEST(test_d075_a_counted_0x7f_requests_the_session_at_the_next_step);
     RUN_TEST(test_d075_a_0x7f_for_a_verified_read_keeps_the_session_retry_interval);
