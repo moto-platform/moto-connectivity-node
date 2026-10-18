@@ -22,17 +22,19 @@
 // exact same HondaCANModule.cpp/.h that runs on the ESP32 with a TwaiCanBus -- only
 // the injected ICanBus differs, so this suite exercises real, unmodified protocol code.
 
-void setUp(void) {}
+static unsigned long gT0; // the clock base; a test may move it to straddle the millis() wrap
+static const unsigned long kT0 = 5000 + kListenOnlyWindowMs + 10;
+
+void setUp(void) { gT0 = kT0; }
 void tearDown(void) {}
 
 // Q-018: begin() only starts the listen-only window, so a test's own timeline starts
 // when the window is over. setClock(t) is relative to that moment: setClock(0) is the
 // first normal-mode pass, which sends the session request (what begin() did before the
 // window existed).
-static const unsigned long kT0 = 5000 + kListenOnlyWindowMs + 10;
 
 static void setClock(unsigned long relativeMs) {
-    test_setMillis(kT0 + relativeMs);
+    test_setMillis(gT0 + relativeMs);
 }
 
 // Engine speed is the first table entry, so it is the first DID due after the session
@@ -40,10 +42,10 @@ static void setClock(unsigned long relativeMs) {
 static const unsigned long kRpmDueMs = vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].poll_period_ms;
 
 static bool startPolling(HondaCANModule& module, SystemState& state) {
-    test_setMillis(kT0 - kListenOnlyWindowMs - 10);
+    test_setMillis(gT0 - kListenOnlyWindowMs - 10);
     if (!module.begin()) return false;
     module.update(state); // first pass: the listen-only window starts
-    test_setMillis(kT0 - 10);
+    test_setMillis(gT0 - 10);
     module.update(state); // window over: normal mode
     setClock(0);
     module.update(state); // drain, then the session request
@@ -122,7 +124,7 @@ void test_rpm_decode_updates_state_and_ecu_presence(void) {
     module.update(state); // drains the response -> state.engine.rpm updated, WAITING -> COMPLETE -> IDLE
 
     TEST_ASSERT_EQUAL_FLOAT(4500.0f, state.engine.rpm);
-    TEST_ASSERT_EQUAL_UINT32(kT0 + 110, state.engine.rpmUpdatedMs);
+    TEST_ASSERT_EQUAL_UINT32(gT0 + 110, state.engine.rpmUpdatedMs);
 
     // Q-018: RX is drained at the start of update(), before ECU presence is derived,
     // so presence flips true in the same pass that recorded the response.
@@ -1675,7 +1677,7 @@ void test_vehicle_signals_keep_raw_bytes_of_the_validated_answer(void) {
     const VehicleSignalRecord& rpm = state.vehicleSignals.dids[kRpmIdx];
     TEST_ASSERT_TRUE(rpm.hasValue);
     TEST_ASSERT_EQUAL_HEX32(0x4650, rpm.raw); // the 2 data bytes, big-endian, unscaled
-    TEST_ASSERT_EQUAL_UINT32(kT0 + t, rpm.updatedMs);
+    TEST_ASSERT_EQUAL_UINT32(gT0 + t, rpm.updatedMs);
     TEST_ASSERT_FALSE(rpm.lastWasNrc);
 
     // A one-byte DID keeps one byte, the padding after it is not part of raw.
@@ -1783,7 +1785,7 @@ void test_vehicle_signals_nrc_cleared_by_a_timeout_and_by_the_latch(void) {
     TEST_ASSERT_FALSE(state.vehicleSignals.dids[kRpmIdx].lastWasNrc);
     TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_NEVER_RECEIVED,
                             vsigState(state.vehicleSignals.dids[kRpmIdx], vehicle_cl250_dids[kRpmIdx].stale_after_ms,
-                                      (uint32_t)(kT0 + t)));
+                                      (uint32_t)(gT0 + t)));
 
     // An NRC, then a foreign tester latches the poller off: no NRC and no skip stay current.
     // First leave the quiet window after the timeout (an NRC in it is not attributed),
@@ -1845,7 +1847,7 @@ void test_vehicle_signals_quiet_window_nrc_then_answer_stays_valid(void) {
     module.update(state);
     TEST_ASSERT_EQUAL_UINT8(BLE_VSIG_STATE_VALID,
                             vsigState(state.vehicleSignals.dids[kRpmIdx], vehicle_cl250_dids[kRpmIdx].stale_after_ms,
-                                      (uint32_t)(kT0 + t)));
+                                      (uint32_t)(gT0 + t)));
 }
 
 void test_tester_stats_do_not_change_what_is_sent(void) {
@@ -2631,6 +2633,111 @@ void test_timeout_warnings_are_rate_limited(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// E-19 (3): armUnverifiedReads() and the stop rule around the millis() wrap
+// ---------------------------------------------------------------------------
+// Everything below is unsigned-long arithmetic on a deadline kept as a timestamp, so a run
+// shifted across the wrap must behave exactly like the same run far from it. (The host's
+// unsigned long is 64-bit, the target's 32-bit; the arithmetic is the same, the wrap is
+// at 2^64 here.) The reference run uses the normal base; the shifted runs put the wrap
+// before, at and after the session confirmation (arming: lastRequestMs = now - cadence
+// underflows when now < cadence) and in the middle of the stop-rule sequences.
+
+struct WrapRun {
+    int requests1[VEHICLE_CL250_DID_COUNT]; // after the first stage
+    int requests2[VEHICLE_CL250_DID_COUNT]; // after the ECU absence and the second confirmation
+    bool stopped1[VEHICLE_CL250_DID_COUNT];
+    bool stopped2[VEHICLE_CL250_DID_COUNT];
+    bool hasValue2[VEHICLE_CL250_DID_COUNT];
+    int atOneSecond[VEHICLE_CL250_DID_COUNT]; // requests within 1 s of the first confirmation
+};
+
+// base = the clock value of setClock(0). Stage 1: confirm, run 60 s. Stage 2: the ECU is
+// silent for longer than the absent timeout, then the session is confirmed again (arming
+// again, with the stop flags set by stage 1) and the run goes on for 1 s.
+static WrapRun runWrapScenario(unsigned long base, EcuBehaviour ecu) {
+    gT0 = base;
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    WrapRun r;
+    startPolling(module, state);
+    unsigned long t = 0;
+    confirmSession(module, bus, state, t, ecu);
+    runEcu(module, bus, state, t, 1000, ecu);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        r.atOneSecond[i] = bus.countDidRequests(vehicle_cl250_dids[i].did);
+    }
+    runEcu(module, bus, state, t, 60000, ecu);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        r.requests1[i] = bus.countDidRequests(vehicle_cl250_dids[i].did);
+        r.stopped1[i] = module.didStopped(i);
+    }
+    runEcu(module, bus, state, t, t + VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS + 500, ecuSilent);
+    confirmSession(module, bus, state, t, ecuAnswersAll);
+    runEcu(module, bus, state, t, t + 1000, ecuAnswersAll);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        r.requests2[i] = bus.countDidRequests(vehicle_cl250_dids[i].did);
+        r.stopped2[i] = module.didStopped(i);
+        r.hasValue2[i] = state.vehicleSignals.dids[i].hasValue;
+    }
+    gT0 = kT0;
+    return r;
+}
+
+// Wrap 1500 ms after the confirmation, 21 ms before, exactly at, 49 ms after (arming with
+// now < cadence), and one inside the 60 s stage.
+static const long kWrapOffsets[] = {-1500, -21, -1, 49, -30000};
+
+static void assertWrapRunsMatch(EcuBehaviour ecu, const WrapRun& ref) {
+    for (size_t k = 0; k < sizeof(kWrapOffsets) / sizeof(kWrapOffsets[0]); k++) {
+        // base such that setClock(0) lies kWrapOffsets[k] ms from the wrap
+        const WrapRun w = runWrapScenario((unsigned long)0 + (unsigned long)kWrapOffsets[k], ecu);
+        for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+            TEST_ASSERT_EQUAL_MESSAGE(ref.atOneSecond[i], w.atOneSecond[i], "requests in the first second");
+            TEST_ASSERT_EQUAL_MESSAGE(ref.requests1[i], w.requests1[i], "requests after stage 1");
+            TEST_ASSERT_EQUAL_MESSAGE(ref.requests2[i], w.requests2[i], "requests after re-arming");
+            TEST_ASSERT_EQUAL_MESSAGE(ref.stopped1[i], w.stopped1[i], "stopped after stage 1");
+            TEST_ASSERT_EQUAL_MESSAGE(ref.stopped2[i], w.stopped2[i], "stopped after re-arming");
+            TEST_ASSERT_EQUAL_MESSAGE(ref.hasValue2[i], w.hasValue2[i], "value after re-arming");
+        }
+    }
+}
+
+void test_d068_arming_across_the_millis_wrap_reads_every_unverified_did_once(void) {
+    const WrapRun ref = runWrapScenario(kT0, ecuAnswersAll);
+    // The reference itself is the D-068 behaviour: all unverified DIDs read once (two IDs)
+    // within the first second, long before their period, then kept on their period.
+    for (uint8_t i = firstUnverifiedIdx(); i < VEHICLE_CL250_DID_COUNT; i++) {
+        TEST_ASSERT_TRUE(vehicle_cl250_dids[i].poll_period_ms > 1000);
+        TEST_ASSERT_EQUAL(2, ref.atOneSecond[i]);
+        TEST_ASSERT_FALSE(ref.stopped2[i]);
+        TEST_ASSERT_TRUE(ref.hasValue2[i]);
+    }
+    assertWrapRunsMatch(ecuAnswersAll, ref);
+}
+
+void test_d068_nrc31_stop_and_rearm_across_the_millis_wrap(void) {
+    gStopDid = vehicle_cl250_dids[firstUnverifiedIdx()].did;
+    const uint8_t idx = firstUnverifiedIdx();
+    const WrapRun ref = runWrapScenario(kT0, ecuRefusesStopDid);
+    TEST_ASSERT_EQUAL(2 * kNrc31ToStop, ref.requests1[idx]); // refused on two separate reads
+    TEST_ASSERT_TRUE(ref.stopped1[idx]);
+    TEST_ASSERT_FALSE(ref.stopped2[idx]); // the second confirmation armed it again
+    assertWrapRunsMatch(ecuRefusesStopDid, ref);
+}
+
+void test_d068_max_timeouts_stop_and_rearm_across_the_millis_wrap(void) {
+    gStopDid = vehicle_cl250_dids[firstUnverifiedIdx()].did;
+    const uint8_t idx = firstUnverifiedIdx();
+    const WrapRun ref = runWrapScenario(kT0, ecuSilentOnStopDid);
+    TEST_ASSERT_EQUAL(2 * VEHICLE_CL250_MAX_CONSECUTIVE_TIMEOUTS, ref.requests1[idx]);
+    TEST_ASSERT_TRUE(ref.stopped1[idx]);
+    TEST_ASSERT_FALSE(ref.stopped2[idx]);
+    assertWrapRunsMatch(ecuSilentOnStopDid, ref);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rpm_decode_updates_state_and_ecu_presence);
@@ -2711,6 +2818,9 @@ int main(int, char**) {
     RUN_TEST(test_d069_engine_start_rearm_keeps_the_tier_slot);
     RUN_TEST(test_d069_an_nrc_on_rpm_breaks_the_engine_start_run);
     RUN_TEST(test_d069_long_gap_rearm_all_due_together);
+    RUN_TEST(test_d068_arming_across_the_millis_wrap_reads_every_unverified_did_once);
+    RUN_TEST(test_d068_nrc31_stop_and_rearm_across_the_millis_wrap);
+    RUN_TEST(test_d068_max_timeouts_stop_and_rearm_across_the_millis_wrap);
     RUN_TEST(test_timeout_warnings_are_rate_limited);
     return UNITY_END();
 }

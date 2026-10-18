@@ -1074,6 +1074,75 @@ void test_d068_first_frame_answer_stops_an_unverified_did(void) {
     TEST_ASSERT_EQUAL(requests, bus.countDidRequests(did));
 }
 
+// Every request is refused with NRC 0x31 (requestOutOfRange), the NRC that stops an
+// unverified DID (D-068) when it answers a DID read.
+static Bytes allNrc31Ecu(const Bytes& req) {
+    return {0x7F, req[0], UDS_NRC_REQUEST_OUT_OF_RANGE};
+}
+
+static void assertNoDidRecordTouched(const HondaCANModule& module, const SystemState& state) {
+    const VehicleSignalRecord pristine;
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        const VehicleSignalRecord& r = state.vehicleSignals.dids[i];
+        TEST_ASSERT_EQUAL_UINT32(pristine.raw, r.raw);
+        TEST_ASSERT_EQUAL_UINT32(pristine.updatedMs, r.updatedMs);
+        TEST_ASSERT_FALSE(r.hasValue);
+        TEST_ASSERT_FALSE(r.lastWasNrc);
+        TEST_ASSERT_EQUAL_HEX8(pristine.nrc, r.nrc);
+        TEST_ASSERT_FALSE(r.skipped);
+        TEST_ASSERT_FALSE(module.didStopped(i));
+        TEST_ASSERT_EQUAL_UINT32(0, state.tester.rtt[i].count);
+        TEST_ASSERT_EQUAL_UINT16(0, state.tester.rtt[i].nrc78Count);
+        TEST_ASSERT_EQUAL_UINT16(TESTER_RTT_NONE_MS, state.tester.rtt[i].minMs);
+    }
+}
+
+void test_e18_an_nrc_to_a_scan_entry_never_touches_a_did_record(void) {
+    // D-066 item 4 / safety-reviewer rec. 3: a scan entry is no DID (_pendingDidIndex -1), so
+    // its NRC, even NRC 0x31 to a 22 F4 xx entry, must not reach the vehicle-signal block,
+    // the NRC 0x31 stop rule, the DID timeout count or the round-trip record.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = startScan(module, bus, state);
+    runScan(module, bus, state, t, allNrc31Ecu);
+    TEST_ASSERT_TRUE(module.discoveryScanDone());
+    // The scan really got the NRCs, including the 0x22 DID-shaped entry.
+    TEST_ASSERT_TRUE(module.testScan().status(kObdPids0) == DiscoveryScan::Status::NRC);
+    TEST_ASSERT_TRUE(module.testScan().status(kDid0) == DiscoveryScan::Status::NRC);
+    TEST_ASSERT_TRUE(countPrimaryRequests(bus, requestOf(kDid0)) > 0);
+    // Checked on the pass that ended the scan: no DID has been polled yet, so any change to
+    // a record could only come from the scan entries' NRCs.
+    assertNoDidRecordTouched(module, state);
+}
+
+void test_e18_nrc_0x78_and_0x31_to_a_did_shaped_scan_entry_never_touch_a_did_record(void) {
+    // NRC 0x78 is not taken by the scan's own handler: it goes through the generic NRC path
+    // (wait extension, round-trip and 0x78 bookkeeping, session-loss and stop rules), where
+    // _pendingDidIndex -1 must keep it away from every DID record.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = scanUpTo(module, bus, state, kDid0); // 22 F4 00 is in flight
+    for (int i = 0; i < 3; i++) { // repeated 0x78: the wait is extended, no DID is counted
+        bus.injectRxFrame(singleFrame({0x7F, 0x22, UDS_NRC_RESPONSE_PENDING}));
+        setClock(t += 5);
+        module.update(state);
+        assertNoDidRecordTouched(module, state);
+    }
+    TEST_ASSERT_TRUE(module.testScan().status(kDid0) == DiscoveryScan::Status::PENDING);
+    for (int i = 0; i < 2; i++) { // then the refusal, which the scan takes
+        bus.injectRxFrame(singleFrame({0x7F, 0x22, UDS_NRC_REQUEST_OUT_OF_RANGE}));
+        setClock(t += 5);
+        module.update(state);
+        assertNoDidRecordTouched(module, state);
+    }
+    TEST_ASSERT_TRUE(module.testScan().status(kDid0) == DiscoveryScan::Status::NRC);
+    assertNoDidRecordTouched(module, state);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_table_indexes_used_by_these_tests);
@@ -1112,5 +1181,7 @@ int main(int, char**) {
     RUN_TEST(test_nrc_0x78_then_a_segmented_answer);
     RUN_TEST(test_supported_ids_do_not_wrap_at_the_end_of_a_range);
     RUN_TEST(test_d068_first_frame_answer_stops_an_unverified_did);
+    RUN_TEST(test_e18_an_nrc_to_a_scan_entry_never_touches_a_did_record);
+    RUN_TEST(test_e18_nrc_0x78_and_0x31_to_a_did_shaped_scan_entry_never_touch_a_did_record);
     return UNITY_END();
 }
