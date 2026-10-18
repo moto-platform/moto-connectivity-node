@@ -75,6 +75,10 @@ public:
     static uint8_t maxTimeoutLogLinesPerWindow();
     // D-068 item 2: true while the tester no longer asks for this DID (table index) in this
     // stop epoch: an unverified DID the ECU refused with NRC 0x31 / 0x7E / 0x7F or never answered.
+    // D-075 item 1 (amended, provisional): why (NONE while not stopped).
+    uint8_t didStopReason(uint8_t index) const {
+        return index < VEHICLE_CL250_DID_COUNT ? (uint8_t)_dids[index].stopReason : 0;
+    }
     bool didStopped(uint8_t index) const {
         return index < VEHICLE_CL250_DID_COUNT && _dids[index].unsupported;
     }
@@ -137,6 +141,9 @@ private:
     // ------------------------------------------------------------------
     enum class UdsRequestState : uint8_t { IDLE, REQUEST_SENT, WAITING, COMPLETE, TIMEOUT };
 
+    // D-075 item 1 (amended, provisional): why a DID is stopped. Bookkeeping, no heap.
+    enum class StopReason : uint8_t { NONE, NRC_31, NRC_7E_7F, TIMEOUTS, FIRST_FRAME };
+
     struct DidSlot {
         uint16_t did;
         unsigned long cadenceMs;      // desired re-request interval for this DID
@@ -144,12 +151,13 @@ private:
         uint8_t consecutiveTimeouts;
         unsigned long skipUntilMs;    // temporarily skipped after repeated timeouts
         // D-068 item 2, only for a DID whose support is not verified (yaml `verified: false`):
-        // read once when the session is confirmed, then not asked again until the next
-        // confirmation if the ECU refuses it (NRC 0x31) or never answers it.
+        // read once when a stop epoch starts, then not asked again until the next epoch if
+        // the ECU refuses it (NRC 0x31, 0x7E/0x7F) or never answers it (D-075).
         bool verified;                // vehicle_cl250_did_t.verified
-        bool answered;                // a positive answer since the session was confirmed
+        bool answered;                // a positive answer since the stop epoch started
         bool unsupported;             // stopped until the next stop epoch (D-075)
-        uint8_t nrc31Count;           // NRC 0x31/0x7E/0x7F reads since the last positive answer
+        StopReason stopReason;        // set with `unsupported`, NONE otherwise
+        uint8_t stopNrcCount;           // NRC 0x31/0x7E/0x7F reads since the last positive answer
     };
 
     // Same order as the generated table (table order, not the D-043 poll priority):
@@ -183,6 +191,10 @@ private:
     // to a stop epoch. One starts at the tester's start and when the session is confirmed
     // after the ECU was lost, not after an NRC 0x7E/0x7F re-confirmation.
     bool _newStopEpoch = true;
+    // D-075 item 1 (amended, provisional): set when an NRC 0x7E/0x7F refusal of a never-answered
+    // unverified DID was counted toward its stop; the next step then requests the session
+    // without waiting for kSessionRetryMs. Every other session loss keeps the retry interval.
+    bool _sessionRetryNow = false;
     unsigned long _lastSessionAttemptMs = 0;
 
     unsigned long _lastGoodResponseMs = 0;
@@ -224,12 +236,12 @@ private:
     // or after the ECU was lost). Every unverified DID is due at once and asked again,
     // whatever the last epoch found.
     void armUnverifiedReads(unsigned long now);
-    // D-069 item 3: every unverified DID stopped since the session confirmation becomes
+    // D-069 item 3: every unverified DID stopped since the stop epoch started becomes
     // pollable again, due one cadence after its last request (lastRequestMs kept).
     void rearmStoppedReads();
-    // D-069 item 3: the first engine start of a confirmed session (kEngineStartSamples
+    // D-069 item 3: the first engine start of a stop epoch (kEngineStartSamples
     // consecutive answered RPM samples above 0 after a valid 0) re-arms once. The stop logs
-    // stay bounded: each DID logs its stop at most twice per confirmed session.
+    // stay bounded: each DID logs its stop at most twice per stop epoch.
     void watchEngineStart(float rpm);
     static constexpr uint8_t kEngineStartSamples = 2;
     bool _engineStartRearmed = false;

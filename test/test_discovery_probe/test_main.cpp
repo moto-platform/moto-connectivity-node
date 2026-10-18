@@ -176,6 +176,8 @@ struct ScanLog {
 // Runs the bus with a simulated ECU until the scan is done: new primary-ID requests are
 // answered on the next pass (session 0x10 0x03 is confirmed); a segmented answer's CFs
 // are queued only after the FC.CTS went out.
+static bool gHoldSession = false; // runScan() leaves session requests unanswered
+
 static void runScan(HondaCANModule& module, MockCanBus& bus, SystemState& state, unsigned long& t,
                     Responder ecu, ScanLog* log = nullptr, unsigned long maxMs = 120000) {
     size_t seen = 0;
@@ -194,6 +196,7 @@ static void runScan(HondaCANModule& module, MockCanBus& bus, SystemState& state,
             Bytes req = primaryRequest(f);
             if (req.empty() || req[0] == VEHICLE_CL250_TESTER_PRESENT_SID) continue;
             if (req[0] == VEHICLE_CL250_SESSION_SID) {
+                if (gHoldSession) continue; // D-075 tests: the ECU does not confirm
                 bus.injectRxFrame(singleFrame({VEHICLE_CL250_SESSION_POSITIVE_SID, VEHICLE_CL250_SESSION_SUBFUNCTION,
                                                0x00, 0x32, 0x01, 0xF4}));
                 continue;
@@ -1066,6 +1069,7 @@ void test_d068_first_frame_answer_stops_an_unverified_did(void) {
     module.update(state);
     TEST_ASSERT_EQUAL(0, countFc(bus));
     TEST_ASSERT_TRUE(module.didStopped(idx));
+    TEST_ASSERT_EQUAL_UINT8(4 /* FIRST_FRAME */, module.didStopReason(idx));
     const int requests = bus.countDidRequests(did);
     for (int i = 0; i < 300; i++) {
         setClock(t += 50);
@@ -1121,6 +1125,90 @@ void test_d075_a_0x7f_reconfirmation_does_not_repeat_the_first_frame_hold(void) 
     TEST_ASSERT_TRUE(module.didStopped(idx));
     TEST_ASSERT_EQUAL(requests, bus.countDidRequests(did));
     TEST_ASSERT_EQUAL(0, countFc(bus));
+}
+
+// Steps `until` (relative ms), answering every DID read (SID 0x22, three bytes) with a
+// zero value, except the first read of `ffDid`, which gets a First Frame (0 = none).
+// Returns the passes at which `ffDid` was requested afterwards via `rpmReads`.
+static void stepAnswering(HondaCANModule& module, MockCanBus& bus, SystemState& state, unsigned long& t,
+                          unsigned long until, uint16_t ffDid, bool& ffSent, std::vector<unsigned long>* reads,
+                          uint16_t watch) {
+    size_t seen = bus.txLog.size();
+    while (t < until) {
+        setClock(t += 1);
+        module.update(state);
+        for (; seen < bus.txLog.size(); seen++) {
+            Bytes req = primaryRequest(bus.txLog[seen]);
+            if (req.size() != 3 || req[0] != UDS_SID_READ_DATA_BY_IDENTIFIER) continue;
+            const uint16_t did = (uint16_t)((req[1] << 8) | req[2]);
+            if (did == watch && reads != nullptr) reads->push_back(t);
+            if (did == ffDid && !ffSent) {
+                ffSent = true;
+                bus.injectRxFrame(firstFrame({0x62, req[1], req[2], 1, 2, 3, 4, 5, 6, 7}));
+                continue;
+            }
+            const vehicle_cl250_did_t* e = vehicle_cl250_find(did);
+            if (e == nullptr) continue;
+            Bytes a = {0x62, req[1], req[2]};
+            for (uint8_t i = 0; i < e->length; i++) a.push_back(0);
+            bus.injectRxFrame(singleFrame(a));
+        }
+    }
+}
+
+void test_d075_scan_end_arm_is_the_deferred_first_arm_after_a_mid_scan_0x7f(void) {
+    // Safety-review MINOR-1: 0x7F mid-scan drops the session; the scan ends while it is not
+    // confirmed (no arm at scan end); the confirmation after the scan end is the epoch's
+    // first arm, so every unverified DID is requested once right after it.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = startScan(module, bus, state);
+    for (int i = 0; i < 10; i++) { // a few scan entries in
+        setClock(t += 5);
+        module.update(state);
+    }
+    bus.injectRxFrame(singleFrame({0x7F, UDS_SID_READ_DATA_BY_IDENTIFIER, UDS_NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION}));
+    gHoldSession = true;
+    runScan(module, bus, state, t, defaultEcu);
+    gHoldSession = false;
+    TEST_ASSERT_TRUE(module.discoveryScanDone());
+    bus.clearTxLog();
+    bus.injectRxFrame(singleFrame({VEHICLE_CL250_SESSION_POSITIVE_SID, VEHICLE_CL250_SESSION_SUBFUNCTION,
+                                   0x00, 0x32, 0x01, 0xF4}));
+    bool ff = false;
+    stepAnswering(module, bus, state, t, t + 1500, 0, ff, nullptr, 0);
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        if (vehicle_cl250_dids[i].verified) continue;
+        TEST_ASSERT_EQUAL(1, countPrimaryRequests(bus, {0x22, (uint8_t)(vehicle_cl250_dids[i].did >> 8),
+                                                         (uint8_t)(vehicle_cl250_dids[i].did & 0xFF)}));
+    }
+}
+
+void test_d075_a_first_frame_for_a_verified_did_skips_it_instead_of_repeating_the_hold(void) {
+    // Safety-review MINOR-2: a verified (or answered) DID is never stopped; its First Frame
+    // without an FC sets the D-050..D-053 skip, so the 2000 ms quiet time does not repeat
+    // every period.
+    MockCanBus bus;
+    MockTesterLatchStore latchStore;
+    HondaCANModule module(bus, latchStore);
+    SystemState state;
+    unsigned long t = startScan(module, bus, state);
+    runScan(module, bus, state, t, defaultEcu);
+    TEST_ASSERT_TRUE(module.discoveryScanDone());
+    bus.clearTxLog();
+    bool ff = false;
+    std::vector<unsigned long> reads;
+    stepAnswering(module, bus, state, t, t + 300, VEHICLE_CL250_DID_ENGINE_SPEED, ff, &reads, VEHICLE_CL250_DID_ENGINE_SPEED);
+    TEST_ASSERT_TRUE(ff);
+    TEST_ASSERT_FALSE(module.didStopped(VEHICLE_CL250_IDX_ENGINE_SPEED));
+    const size_t readsAtFf = reads.size();
+    const unsigned long ffAt = t;
+    stepAnswering(module, bus, state, t, ffAt + 4500, VEHICLE_CL250_DID_ENGINE_SPEED, ff, &reads, VEHICLE_CL250_DID_ENGINE_SPEED);
+    TEST_ASSERT_EQUAL(readsAtFf, reads.size()); // hold (2000 ms), then skip (5000 ms)
+    stepAnswering(module, bus, state, t, ffAt + 7000, VEHICLE_CL250_DID_ENGINE_SPEED, ff, &reads, VEHICLE_CL250_DID_ENGINE_SPEED);
+    TEST_ASSERT_TRUE(reads.size() > readsAtFf); // asked again after the skip
 }
 
 // Every request is refused with NRC 0x31 (requestOutOfRange), the NRC that stops an
@@ -1231,6 +1319,8 @@ int main(int, char**) {
     RUN_TEST(test_supported_ids_do_not_wrap_at_the_end_of_a_range);
     RUN_TEST(test_d068_first_frame_answer_stops_an_unverified_did);
     RUN_TEST(test_d075_a_0x7f_reconfirmation_does_not_repeat_the_first_frame_hold);
+    RUN_TEST(test_d075_scan_end_arm_is_the_deferred_first_arm_after_a_mid_scan_0x7f);
+    RUN_TEST(test_d075_a_first_frame_for_a_verified_did_skips_it_instead_of_repeating_the_hold);
     RUN_TEST(test_e18_an_nrc_to_a_scan_entry_never_touches_a_did_record);
     RUN_TEST(test_e18_nrc_0x78_and_0x31_to_a_did_shaped_scan_entry_never_touch_a_did_record);
     return UNITY_END();
