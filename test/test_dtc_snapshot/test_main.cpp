@@ -65,7 +65,9 @@ struct Ecu {
     Bytes extData;   // same
     uint16_t forceFfDl = 0; // != 0: a First Frame announcing this length (no CFs)
     bool corruptCf = false; // a sequence gap in the first CF
-    bool bothIds = false;     // 0x19 answers also come on the fallback response ID
+    bool bothIds = false;     // a 0x19 sent to the fallback request ID is answered there too
+    unsigned long fbDelayMs = 0;    // the fallback's answers come this much later
+    Bytes fbCount;                  // non-empty: the fallback answers the count with this
     unsigned long cfGapMs = 0;      // CF spacing after the FC (0 = all at once)
     unsigned long dtcLatencyMs = 0; // 0x19 answers come this much later
     bool lateFfAfter78 = false;     // COUNT: NRC 0x78, then a First Frame after the timeout
@@ -73,10 +75,11 @@ struct Ecu {
     unsigned long now = 0;
     // Frames due later: (time, frame).
     std::vector<std::pair<unsigned long, CanFrame>> timed;
-    std::vector<Bytes> dtcRequests; // every 0x19 request seen (payload without PCI)
+    std::vector<Bytes> dtcRequests; // every 0x19 request seen on the primary ID (payload without PCI)
+    size_t fallbackDtcRequests = 0; // 0x19 requests seen on the fallback ID
+    void onFallbackRequest(MockCanBus& bus, const CanFrame& f);
 
-    std::vector<CanFrame> pendingCfs; // sent after the FC
-    uint32_t pendingCfId = 0;
+    std::vector<CanFrame> pendingCfs[2]; // per addressing (0 primary, 1 fallback), sent after its FC
 
     void inject(MockCanBus& bus, const CanFrame& f, unsigned long delay) {
         if (delay == 0) {
@@ -124,28 +127,34 @@ struct Ecu {
         ff.data[1] = (uint8_t)(len & 0xFF);
         for (int i = 0; i < 6; i++) ff.data[2 + i] = msg[i];
         inject(bus, ff, delay);
-        if (forceFfDl || id != VEHICLE_CL250_RESPONSE_ID) return; // the other ID never gets an FC
-        pendingCfs.clear();
-        pendingCfId = id;
+        if (forceFfDl) return;
+        std::vector<CanFrame>& cfs = pendingCfs[id == VEHICLE_CL250_RESPONSE_ID ? 0 : 1];
+        cfs.clear();
         uint8_t sn = 1;
         for (size_t off = 6; off < msg.size(); off += 7) {
             CanFrame cf = frame();
             cf.data[0] = (uint8_t)(0x20 | ((corruptCf && sn == 1) ? 3 : sn));
             for (size_t k = 0; k < 7 && off + k < msg.size(); k++) cf.data[1 + k] = msg[off + k];
-            pendingCfs.push_back(cf);
+            cfs.push_back(cf);
             sn = (uint8_t)((sn + 1) & 0x0F);
         }
     }
 
     void onRequest(MockCanBus& bus, const CanFrame& f) {
-        if (f.id != VEHICLE_CL250_REQUEST_ID) return;
+        const bool fallback = (f.id == VEHICLE_CL250_FALLBACK_REQUEST_ID);
+        if (f.id != VEHICLE_CL250_REQUEST_ID && !fallback) return;
         if (memcmp(f.data, vehicle_cl250_fc_cts, 8) == 0) {
+            std::vector<CanFrame>& cfs = pendingCfs[fallback ? 1 : 0];
             unsigned long d = 0;
-            for (const CanFrame& cf : pendingCfs) {
+            for (const CanFrame& cf : cfs) {
                 d += cfGapMs;
                 inject(bus, cf, d);
             }
-            pendingCfs.clear();
+            cfs.clear();
+            return;
+        }
+        if (fallback) {
+            onFallbackRequest(bus, f);
             return;
         }
         if (silent) return;
@@ -188,10 +197,30 @@ struct Ecu {
             }
             if (a.empty()) return;
             answer(bus, a, dtcLatencyMs);
-            if (bothIds) answer(bus, a, dtcLatencyMs, VEHICLE_CL250_FALLBACK_RESPONSE_ID);
         }
     }
 };
+
+// The fallback addressing answers 0x19 like the primary (same stored DTCs), fbDelayMs later.
+void Ecu::onFallbackRequest(MockCanBus& bus, const CanFrame& f) {
+    if (!bothIds || silent) return;
+    const uint8_t len = f.data[0] & 0x0F;
+    Bytes req(&f.data[1], &f.data[1] + len);
+    if (req[0] != UDS_SID_READ_DTC_INFORMATION) return;
+    fallbackDtcRequests++;
+    Bytes a;
+    switch (req[1]) {
+        case UDS_READ_DTC_REPORT_NUMBER_OF_DTC_BY_STATUS_MASK: a = fbCount.empty() ? count : fbCount; break;
+        case UDS_READ_DTC_REPORT_DTC_BY_STATUS_MASK: a = list; break;
+        case UDS_READ_DTC_REPORT_DTC_SNAPSHOT_RECORD_BY_DTC_NUMBER: a = snapshot; break;
+        case UDS_READ_DTC_REPORT_DTC_EXT_DATA_RECORD_BY_DTC_NUMBER: a = extData; break;
+        default: break;
+    }
+    if (a.size() >= 5 && a[0] == 0x59 && (req[1] == 0x04 || req[1] == 0x06)) {
+        a[2] = req[2]; a[3] = req[3]; a[4] = req[4];
+    }
+    if (!a.empty()) answer(bus, a, fbDelayMs + 1, VEHICLE_CL250_FALLBACK_RESPONSE_ID);
+}
 
 struct Rig {
     MockCanBus bus;
@@ -565,22 +594,6 @@ void test_dtc_run_keeps_the_engine_speed_cadence(void) {
 }
 
 
-// Gaps between engine speed requests longer than its stale_after_ms (the D-068 item 1 bound).
-static size_t rpmGapsOverStale(const Rig& r) {
-    const unsigned long stale = vehicle_cl250_dids[VEHICLE_CL250_IDX_ENGINE_SPEED].stale_after_ms;
-    unsigned long last = 0;
-    size_t n = 0;
-    for (const auto& p : r.sent) {
-        const CanFrame& f = p.second;
-        if (f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER &&
-            (uint16_t)((f.data[2] << 8) | f.data[3]) == VEHICLE_CL250_DID_ENGINE_SPEED) {
-            if (last != 0 && p.first - last > stale) n++;
-            last = p.first;
-        }
-    }
-    return n;
-}
-
 static void dtcAnswers8(Ecu& e, size_t snapshotExtra) {
     e.count = countOf(8);
     e.list = listOf(8);
@@ -588,18 +601,85 @@ static void dtcAnswers8(Ecu& e, size_t snapshotExtra) {
     e.extData = recordOf(0x06, 20);
 }
 
-// MAJOR-1 (a): both response IDs answer every 0x19 segmented: one quiet time, then 0x19 is
-// off for the epoch (the reception in progress still completes and is logged).
-void test_both_ids_answering_segmented_cost_one_hold_per_epoch(void) {
+// Gaps between consecutive transmissions on the primary request ID longer than `ms`, from the
+// session request on: a quiet time (no request at all, tester present included) shows as a
+// gap >= 1500 ms, a long 0x19 slot as a gap > 300 ms (round-2 MINOR-1).
+static size_t gapsOver(const Rig& r, unsigned long ms) {
+    size_t n = 0;
+    for (size_t i = 1; i < r.sent.size(); i++) {
+        if (r.sent[i].first - r.sent[i - 1].first > ms) n++;
+    }
+    return n;
+}
+
+// Round-2 MAJOR-A/B: both addressings answer the count; the run is locked to the first
+// answering ID, the rest goes there only, so no quiet time and no halt at any delay.
+void test_both_ids_the_run_is_locked_to_the_first_answering_id(void) {
+    const unsigned long delays[] = {0, 3, 10, 30, 50};
+    for (unsigned long d : delays) {
+        g_lines.clear();
+        Rig r;
+        dtcAnswers8(r.ecu, 30);
+        r.ecu.bothIds = true;
+        r.ecu.fbDelayMs = d;
+        TEST_ASSERT_TRUE(r.start());
+        r.runFor(15000, 1);
+        TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NONE, r.module.dtcSnapshot().halt());
+        TEST_ASSERT_EQUAL_size_t(DtcSnapshot::kMaxRequestsPerRun, r.ecu.dtcRequests.size());
+        TEST_ASSERT_EQUAL_size_t(1, r.ecu.fallbackDtcRequests); // the count only
+        TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
+        TEST_ASSERT_EQUAL(1, countLines("ended: done (8 DTCs, 18 requests)"));
+        TEST_ASSERT_EQUAL(0, countLines("from 0x000007E8"));
+    }
+}
+
+// A node on the fallback addressing that refuses 0x19 first stops it for the epoch
+// (conservative, round-1 MINOR-3); one that answers after the ECU is ignored.
+void test_fallback_refusal_first_stops_later_is_ignored(void) {
+    {
+        Rig r;
+        r.ecu.bothIds = true;
+        r.ecu.count = countOf(1);
+        r.ecu.fbCount = {0x7F, UDS_SID_READ_DTC_INFORMATION, UDS_NRC_SERVICE_NOT_SUPPORTED};
+        r.ecu.dtcLatencyMs = 20; // the primary answers after the fallback
+        TEST_ASSERT_TRUE(r.start());
+        r.runFor(5000, 1);
+        TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NOT_SERVED, r.module.dtcSnapshot().halt());
+        TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
+    }
+    {
+        Rig r;
+        r.ecu.bothIds = true;
+        r.ecu.count = countOf(1);
+        r.ecu.list = listOf(1);
+        r.ecu.snapshot = recordOf(0x04, 0);
+        r.ecu.extData = recordOf(0x06, 0);
+        r.ecu.fbCount = {0x7F, UDS_SID_READ_DTC_INFORMATION, UDS_NRC_SERVICE_NOT_SUPPORTED};
+        r.ecu.fbDelayMs = 30;
+        TEST_ASSERT_TRUE(r.start());
+        r.runFor(5000, 1);
+        TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NONE, r.module.dtcSnapshot().halt());
+        TEST_ASSERT_EQUAL(1, countLines("ended: done (1 DTCs, 4 requests)"));
+    }
+}
+
+// Round-2 MAJOR-A: a late segmented 0x19 answer from the other addressing, while nothing is
+// in flight: one quiet time, then 0x19 is off for the epoch.
+void test_late_segmented_answer_from_the_other_id_costs_one_hold(void) {
     Rig r;
     dtcAnswers8(r.ecu, 30);
     r.ecu.bothIds = true;
+    r.ecu.fbCount = {0x59, 0x01, 0xFF, UDS_DTC_FORMAT_ISO_14229_1, 0x00, 0x08, 0, 0, 0, 0, 0, 0};
+    r.ecu.fbDelayMs = 30;
     TEST_ASSERT_TRUE(r.start());
-    r.runFor(20000, 1);
+    r.runFor(15000, 1);
     TEST_ASSERT_EQUAL(DtcSnapshot::Halt::BOTH_IDS, r.module.dtcSnapshot().halt());
-    TEST_ASSERT_EQUAL_size_t(2, r.ecu.dtcRequests.size()); // count, list (its answer logged)
-    TEST_ASSERT_EQUAL(1, countLines("0x19 0x02 answer, 35 bytes"));
-    TEST_ASSERT_TRUE(rpmGapsOverStale(r) <= 1);
+    TEST_ASSERT_EQUAL_size_t(1, gapsOver(r, 1500));
+    TEST_ASSERT_EQUAL(1, countLines("ended: an unexpected 0x19 answer"));
+    TEST_ASSERT_TRUE(r.ecu.dtcRequests.size() < DtcSnapshot::kMaxRequestsPerRun); // cut short
+    warmIdle(r.ecu);
+    r.runFor(VEHICLE_CL250_DTC_WARM_IDLE_MIN_DURATION_MS + 5000, 1);
+    TEST_ASSERT_EQUAL_size_t(1, gapsOver(r, 1500)); // the warm-idle run is refused
 }
 
 // MAJOR-2: CFs at N_Cr - 5 ms: the slow transaction completes once, then 0x19 is off.
@@ -611,7 +691,9 @@ void test_slow_segmented_answer_costs_one_long_slot_per_epoch(void) {
     r.runFor(30000, 1);
     TEST_ASSERT_EQUAL(DtcSnapshot::Halt::SLOW, r.module.dtcSnapshot().halt());
     TEST_ASSERT_EQUAL_size_t(2, r.ecu.dtcRequests.size());
-    TEST_ASSERT_TRUE(rpmGapsOverStale(r) <= 1);
+    TEST_ASSERT_EQUAL(1, countLines("0x19 0x02 answer, 35 bytes")); // logged before the halt
+    TEST_ASSERT_EQUAL_size_t(1, gapsOver(r, 300));                  // exactly one long slot
+    TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
 }
 
 // MAJOR-1 (b): NRC 0x78, then the late answer as a First Frame after the timeout: one quiet
@@ -626,7 +708,7 @@ void test_0x78_then_a_late_first_frame_costs_one_hold_per_epoch(void) {
     warmIdle(r.ecu);
     r.runFor(VEHICLE_CL250_DTC_WARM_IDLE_MIN_DURATION_MS + 5000, 1);
     TEST_ASSERT_EQUAL_size_t(1, r.ecu.dtcRequests.size());
-    TEST_ASSERT_TRUE(rpmGapsOverStale(r) <= 1);
+    TEST_ASSERT_EQUAL_size_t(1, gapsOver(r, 1500)); // exactly one quiet time
 }
 
 // A First Frame whose DTC echo is not the request's gets no FC.
@@ -640,7 +722,9 @@ void test_first_frame_with_another_dtc_echo_gets_no_fc(void) {
     r.runFor(6000, 1);
     TEST_ASSERT_EQUAL_size_t(0, r.fcCount());
     TEST_ASSERT_EQUAL_size_t(3, r.ecu.dtcRequests.size());
-    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NO_ANSWER, r.module.dtcSnapshot().halt());
+    // Round-2 MAJOR-A: the FF that got no FC costs the epoch's one quiet time and stops 0x19.
+    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::BOTH_IDS, r.module.dtcSnapshot().halt());
+    TEST_ASSERT_EQUAL_size_t(1, gapsOver(r, 1500));
 }
 
 // MINOR-2: no tester present or session request while a 0x19 waits for its answer.
@@ -663,6 +747,29 @@ void test_no_aux_request_while_a_dtc_request_is_in_flight(void) {
         }
     }
     TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NONE, r.module.dtcSnapshot().halt());
+}
+
+// Round-2 MINOR-3: a 0x19 never goes out in the pass that sent tester present or the session
+// retry (its answer could land in the 0x19 reception). Swept over answer delays so tester
+// present falls due right where a 0x19 is due.
+void test_no_dtc_request_in_a_pass_with_an_aux_request(void) {
+    for (unsigned long lat = 1; lat < VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS; lat += 2) {
+        Rig r;
+        dtcAnswers8(r.ecu, 0);
+        r.ecu.dtcLatencyMs = lat;
+        TEST_ASSERT_TRUE(r.start());
+        r.runFor(4000, 1);
+        for (size_t i = 0; i < r.sent.size(); i++) {
+            if (r.sent[i].second.data[1] != UDS_SID_READ_DTC_INFORMATION) continue;
+            for (size_t j = 0; j < r.sent.size(); j++) {
+                const uint8_t sid = r.sent[j].second.data[1];
+                if (r.sent[j].first == r.sent[i].first &&
+                    (sid == VEHICLE_CL250_TESTER_PRESENT_SID || sid == VEHICLE_CL250_SESSION_SID)) {
+                    TEST_FAIL_MESSAGE("tester present / session request in the pass of a 0x19");
+                }
+            }
+        }
+    }
 }
 
 // The pure state machine: request budget and the dump flush gate.
@@ -716,11 +823,14 @@ int main(int, char**) {
     RUN_TEST(test_cold_or_off_band_engine_never_starts_the_warm_idle_run);
     RUN_TEST(test_stale_values_do_not_hold_the_warm_idle_condition);
     RUN_TEST(test_dtc_run_keeps_the_engine_speed_cadence);
-    RUN_TEST(test_both_ids_answering_segmented_cost_one_hold_per_epoch);
+    RUN_TEST(test_both_ids_the_run_is_locked_to_the_first_answering_id);
+    RUN_TEST(test_fallback_refusal_first_stops_later_is_ignored);
+    RUN_TEST(test_late_segmented_answer_from_the_other_id_costs_one_hold);
     RUN_TEST(test_slow_segmented_answer_costs_one_long_slot_per_epoch);
     RUN_TEST(test_0x78_then_a_late_first_frame_costs_one_hold_per_epoch);
     RUN_TEST(test_first_frame_with_another_dtc_echo_gets_no_fc);
     RUN_TEST(test_no_aux_request_while_a_dtc_request_is_in_flight);
+    RUN_TEST(test_no_dtc_request_in_a_pass_with_an_aux_request);
     RUN_TEST(test_snapshot_state_machine_budget_and_dump_gate);
     return UNITY_END();
 }

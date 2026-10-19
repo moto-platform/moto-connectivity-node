@@ -163,6 +163,7 @@ public:
     }
 
     bool active() const { return _active; }
+    uint32_t receptionId() const { return _id; }
     bool complete() const { return _complete; }
     AbortReason abortReason() const { return _abortReason; }
     const uint8_t* payload() const { return _buffer; }

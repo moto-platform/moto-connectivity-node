@@ -192,13 +192,14 @@ public:
         settle();
     }
 
-    // The complete positive answer to the request in flight (matchesPositive() was true).
-    void onPositive(const uint8_t* msg, uint16_t len) {
+    // The complete positive answer to the request in flight (matchesPositive() was true),
+    // from response ID `fromId` (logged: the fallback addressing is unverified).
+    void onPositive(const uint8_t* msg, uint16_t len, uint32_t fromId = 0) {
         if (!_inFlight) {
             return;
         }
         _inFlight = false;
-        logAnswer(msg, len);
+        logAnswer(msg, len, fromId);
         advance(msg, len);
         settle();
     }
@@ -373,7 +374,7 @@ public:
             case Halt::SESSION_REFUSED: return "refused in the session twice";
             case Halt::NO_ANSWER: return "no answer";
             case Halt::SLOW: return "answer slower than its slot";
-            case Halt::BOTH_IDS: return "both response IDs answered segmented";
+            case Halt::BOTH_IDS: return "an unexpected 0x19 answer (other addressing or late)";
             default: return "none";
         }
     }
@@ -436,13 +437,14 @@ private:
         emitf("[DTC] D-080 no more 0x19 until the next stop epoch (%s)", haltText(h));
     }
 
-    void logAnswer(const uint8_t* msg, uint16_t len) {
+    void logAnswer(const uint8_t* msg, uint16_t len, uint32_t fromId) {
         if (_step == Step::SNAPSHOT || _step == Step::EXT_DATA) {
-            emitf("[DTC] D-080 run %u: 0x19 0x%02X DTC %02X%02X%02X answer, %u bytes", (unsigned)_runsStarted,
-                  subFunction(_step), _dtcs[_dtcIndex][0], _dtcs[_dtcIndex][1], _dtcs[_dtcIndex][2], (unsigned)len);
+            emitf("[DTC] D-080 run %u: 0x19 0x%02X DTC %02X%02X%02X answer, %u bytes from 0x%08lX", (unsigned)_runsStarted,
+                  subFunction(_step), _dtcs[_dtcIndex][0], _dtcs[_dtcIndex][1], _dtcs[_dtcIndex][2], (unsigned)len,
+                  (unsigned long)fromId);
         } else {
-            emitf("[DTC] D-080 run %u: 0x19 0x%02X answer, %u bytes", (unsigned)_runsStarted, subFunction(_step),
-                  (unsigned)len);
+            emitf("[DTC] D-080 run %u: 0x19 0x%02X answer, %u bytes from 0x%08lX", (unsigned)_runsStarted,
+                  subFunction(_step), (unsigned)len, (unsigned long)fromId);
         }
         if (len > sizeof(_dump)) {
             len = (uint16_t)sizeof(_dump); // never: answers are bounded by max_ff_dl

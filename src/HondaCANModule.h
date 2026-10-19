@@ -277,6 +277,15 @@ private:
     // ------------------------------------------------------------------
     DtcSnapshot _dtc;
     bool _pendingDtc = false;            // the request in flight is the DtcSnapshot's
+    // Round-2 MAJOR-A/B: the response ID that answered the run's count; the rest of the run
+    // goes to its paired request ID only and only its answers count.
+    bool _dtcLocked = false;
+    uint32_t _dtcResponseId = 0;
+    bool _dtcResponseExtended = false;
+    uint32_t _dtcRequestId = 0;
+    // True if a 0x19 answer frame may resolve the request (and locks the run to its ID).
+    bool acceptDtcAnswerFrom(const CanFrame& frame);
+    void lockDtcTo(const CanFrame& frame, uint32_t requestId);
     IsoTpReceiver _isoRx;
     bool _fcSentForPending = false;      // one FC per request (BS 0)
     // An accepted First Frame waits here until the drain is complete (Q-018: nothing is
