@@ -200,33 +200,40 @@ void test_multiframe_response_is_dropped_not_misparsed(void) {
     TEST_ASSERT_EQUAL_UINT32(0, state.engine.rpmUpdatedMs);
 }
 
-// D-059 item 3: segmented reception exists only in the probe env (test_discovery_probe).
-// In this build a First Frame, even a valid one answering the request in flight, never
-// gets a Flow Control: every transmitted frame stays a Single Frame.
-void test_first_frame_never_gets_a_flow_control_outside_the_probe(void) {
-    TEST_ASSERT_EQUAL(0, CONN_DISCOVERY_PROBE);
+// D-080: segmented reception now exists in the tester too, but only for the 0x19 request in
+// flight (test_dtc_snapshot). A First Frame answering a DID read never gets a Flow Control:
+// every transmitted frame stays a Single Frame, and the yaml quiet time follows each FF.
+void test_did_first_frame_never_gets_a_flow_control(void) {
     MockCanBus bus;
     MockTesterLatchStore latchStore;
     HondaCANModule module(bus, latchStore);
     SystemState state;
     startPolling(module, state);
-    for (unsigned long t = 1; t < 3000; t += 5) {
+    unsigned long lastFf = 0;
+    size_t ffs = 0;
+    for (unsigned long t = 1; t < 9000; t += 5) {
         setClock(t);
         size_t before = bus.txLog.size();
         module.update(state);
         for (size_t i = before; i < bus.txLog.size(); i++) {
             const CanFrame& f = bus.txLog[i];
             if (f.id == VEHICLE_CL250_REQUEST_ID && f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER) {
+                if (ffs > 0) {
+                    // yaml flow_control: no request at all within the quiet time after an FF.
+                    TEST_ASSERT_TRUE(t - lastFf >= VEHICLE_CL250_RESPONSE_TIMEOUT_MAX_MS);
+                }
                 CanFrame ff = makeMultiFrameFirstFrame();
                 ff.data[1] = 0x0A; // FF_DL 10
                 ff.data[2] = 0x62; // positive answer to the DID in flight
                 ff.data[3] = f.data[2];
                 ff.data[4] = f.data[3];
                 bus.injectRxFrame(ff);
+                lastFf = t + 5; // drained on the next pass
+                ffs++;
             }
         }
     }
-    TEST_ASSERT_TRUE(bus.txLog.size() > 10);
+    TEST_ASSERT_TRUE(ffs >= 3);
     for (const CanFrame& f : bus.txLog) {
         TEST_ASSERT_EQUAL_HEX8(0x0, f.data[0] & 0xF0); // Single Frames only, never an FC
     }
@@ -434,6 +441,8 @@ void test_frames_from_other_ids_are_ignored(void) {
 // Every frame this node may ever send, as [PCI + payload] (padding checked separately).
 static bool isAllowedEmittedFrame(const CanFrame& f) {
     if (f.dlc != VEHICLE_CL250_FRAME_DLC) return false;
+    // D-080 item 3: the one generated FC.CTS, byte for byte (only after a 0x19 First Frame).
+    if (memcmp(f.data, vehicle_cl250_fc_cts, VEHICLE_CL250_FRAME_DLC) == 0) return true;
     uint8_t len = f.data[0];
     if (len < 2 || len > 7) return false;
     for (uint8_t i = len + 1; i < 8; i++) {
@@ -445,6 +454,15 @@ static bool isAllowedEmittedFrame(const CanFrame& f) {
     if (len == 3 && f.data[1] == UDS_SID_READ_DATA_BY_IDENTIFIER) {
         uint16_t did = (uint16_t)((f.data[2] << 8) | f.data[3]);
         return vehicle_cl250_find(did) != nullptr;
+    }
+    // D-080: the four 0x19 reads with the generated mask and record numbers.
+    if (len == 3 && f.data[1] == UDS_SID_READ_DTC_INFORMATION && f.data[3] == VEHICLE_CL250_DTC_STATUS_MASK &&
+        (f.data[2] == UDS_READ_DTC_REPORT_NUMBER_OF_DTC_BY_STATUS_MASK || f.data[2] == UDS_READ_DTC_REPORT_DTC_BY_STATUS_MASK)) {
+        return true;
+    }
+    if (len == 6 && f.data[1] == UDS_SID_READ_DTC_INFORMATION) {
+        return (f.data[2] == UDS_READ_DTC_REPORT_DTC_SNAPSHOT_RECORD_BY_DTC_NUMBER && f.data[6] == VEHICLE_CL250_DTC_SNAPSHOT_RECORD) ||
+               (f.data[2] == UDS_READ_DTC_REPORT_DTC_EXT_DATA_RECORD_BY_DTC_NUMBER && f.data[6] == VEHICLE_CL250_DTC_EXT_DATA_RECORD);
     }
     return false;
 }
@@ -887,7 +905,7 @@ void test_rx_backlog_restarts_the_listen_window(void) {
     test_setMillis(0);
     module.begin();
     TEST_ASSERT_TRUE(runSilently(module, bus, state, 0, kListenOnlyWindowMs));
-    for (int i = 0; i < 100; i++) bus.injectRxFrame(makeNoise());
+    for (int i = 0; i < kMaxRxFramesPerPass + 10; i++) bus.injectRxFrame(makeNoise()); // more than one drain
     test_setMillis(kListenOnlyWindowMs); // would end the window, but the queue is not empty
     module.update(state);
     TEST_ASSERT_TRUE(module.listening());
@@ -3589,7 +3607,7 @@ int main(int, char**) {
     RUN_TEST(test_session_confirm_is_recognized);
     RUN_TEST(test_nrc_other_than_pending_resolves_request_without_corrupting_state);
     RUN_TEST(test_multiframe_response_is_dropped_not_misparsed);
-    RUN_TEST(test_first_frame_never_gets_a_flow_control_outside_the_probe);
+    RUN_TEST(test_did_first_frame_never_gets_a_flow_control);
     RUN_TEST(test_bus_off_triggers_recovery_with_backoff);
     RUN_TEST(test_bus_recovery_complete_restarts_driver);
     RUN_TEST(test_did_skipped_after_max_consecutive_timeouts_then_resumes);

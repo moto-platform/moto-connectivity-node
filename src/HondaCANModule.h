@@ -7,9 +7,10 @@
 #include "TesterStatsTracker.h"
 #include "hal/CanRxQueue.h" // also defaults CONN_DISCOVERY_PROBE to 0
 #include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+#include "DtcSnapshot.h"
+#include "IsoTpReceiver.h"
 #if CONN_DISCOVERY_PROBE
 #include "DiscoveryScan.h"
-#include "IsoTpReceiver.h"
 #endif
 
 /**
@@ -44,12 +45,16 @@
  *    response-timeout check, so a slow pass cannot count a queued answer as a timeout.
  *    If the bounded drain cannot empty the queue, the pass transmits nothing.
  *
+ * D-080: at the start of each stop epoch (key-on) the DtcSnapshot run reads the DTC count
+ * and, only if a DTC is present, the list, the freeze frames and the extended data (0x19),
+ * one request per step after every due DID. A segmented answer to the 0x19 request in
+ * flight gets the one generated FC.CTS through the frame gate; nothing else is sent while
+ * it is received. Any other First Frame gets no FC and starts the yaml quiet time.
+ *
  * D-059 item 3, only in the probe env (CONN_DISCOVERY_PROBE=1, esp32-s3-devkitc-1-probe):
  * after the listen window and the session start, the generated discovery_scan list runs
  * once (one request in flight, the yaml timeouts), then the DIDs are polled as usual. A
- * segmented answer to the in-flight scan request gets the one generated FC.CTS through the
- * frame gate; nothing else is sent while it is received. Other builds compile none of it
- * and keep dropping First/Consecutive Frames.
+ * segmented answer to the in-flight scan request gets the FC.CTS the same way.
  */
 class HondaCANModule : public IProducerModule {
 public:
@@ -82,17 +87,20 @@ public:
     bool didStopped(uint8_t index) const {
         return index < VEHICLE_CL250_DID_COUNT && _dids[index].unsupported;
     }
+    // True while a segmented answer is being received.
+    bool receivingSegmented() const { return _isoRx.active(); }
+    // D-080: the DTC freeze-frame reader (read-only view for tests and logs).
+    const DtcSnapshot& dtcSnapshot() const { return _dtc; }
 #if CONN_DISCOVERY_PROBE
     // D-059: true once the discovery scan ran through its list (normal polling from then on).
     bool discoveryScanDone() const { return _scanPhase == ScanPhase::DONE; }
-    // True while a segmented answer is being received.
-    bool receivingSegmented() const { return _isoRx.active(); }
 #endif
 
 #ifdef CONN_NATIVE_TEST
     // Test hook: drives the real TX gate with an arbitrary request (never built on target).
     bool testSendFrame(uint32_t id, const uint8_t* request, uint8_t len) { return sendFrame(id, request, len); }
     void testSetSessionNrcCount(uint8_t index, uint8_t value) { _dids[index].sessionNrcCount = value; }
+    DtcSnapshot& testDtc() { return _dtc; }
 #if CONN_DISCOVERY_PROBE
     DiscoveryScan& testScan() { return _scan; }
 #endif
@@ -264,24 +272,63 @@ private:
     // other than power-on, see ITesterLatchStore).
     void latchOff(TesterLatchReason reason, const char* why);
 
-#if CONN_DISCOVERY_PROBE
     // ------------------------------------------------------------------
-    // D-059 item 3 -- one-shot discovery scan and segmented reception (probe env only).
+    // D-080 -- DTC freeze frames, and the segmented reception of their answers (D-059 FC).
     // ------------------------------------------------------------------
-    enum class ScanPhase : uint8_t { WAIT_SESSION, RUNNING, DONE };
-    ScanPhase _scanPhase = ScanPhase::WAIT_SESSION;
-    DiscoveryScan _scan;
+    DtcSnapshot _dtc;
+    bool _pendingDtc = false;            // the request in flight is the DtcSnapshot's
     IsoTpReceiver _isoRx;
-    int8_t _pendingScanIndex = -1;       // scan entry in flight, -1 = none (or a DID)
     bool _fcSentForPending = false;      // one FC per request (BS 0)
     // An accepted First Frame waits here until the drain is complete (Q-018: nothing is
     // sent before the whole queue was checked for a foreign tester); then its FC goes out.
     bool _fcPending = false;
     CanFrame _fcPendingFrame;
     unsigned long _fcPendingMs = 0;
-    uint32_t _scanLostBaseline = 0;      // driver lost count when the scan request went out
-    unsigned long _firstSessionRequestMs = 0;
+    uint32_t _requestLostBaseline = 0;   // driver lost count when the 0x19/scan request went out
     unsigned long _txQuietUntilMs = 0;   // no request at all until then (yaml flow_control rule)
+
+    // D-080 item 1: the warm-idle trigger, the generated D-079 W3 conditions over the last
+    // valid, non-stale DID values (vehicle_cl250_dtc_warm_idle[]). Bookkeeping only.
+    float _didValue[VEHICLE_CL250_DID_COUNT] = {0.0f};
+    unsigned long _didValueMs[VEHICLE_CL250_DID_COUNT] = {0}; // 0 = no value in this epoch
+    unsigned long _warmIdleSinceMs = 0;                       // 0 = the conditions do not hold
+    bool warmIdleConditionsMet(unsigned long now) const;
+    void watchWarmIdle(unsigned long now);
+    // Sends the DtcSnapshot's next request (one in flight, no NRC 0x78 extension).
+    void sendDtcRequest(unsigned long now);
+    // A Single Frame answer (positive or NRC) to the 0x19 request in flight. False if it is
+    // not one (then the normal handling runs).
+    bool onDtcSingleFrame(const CanFrame& frame, unsigned long now);
+    // True while the request in flight may be answered with a segmented message (0x19, scan).
+    bool segmentedRequestPending() const;
+    // `logBudget`: the drain's per-pass log lines (a flood of First Frames, safety-reviewer
+    // MINOR-1 on conn D-080).
+    void onFirstFrame(const CanFrame& frame, unsigned long now, uint8_t& logBudget);
+    // MAJOR-2: a 0x19 transaction (request to last frame) longer than one unverified-read slot
+    // turns 0x19 off for the epoch, after its answer is logged.
+    void checkDtcSlot(unsigned long now);
+    void onConsecutiveFrame(const CanFrame& frame, unsigned long now);
+    // The reception completed or was aborted: resolve the 0x19 or scan request.
+    void endReception(unsigned long now);
+    // The segmented answer of the request in flight failed before or during its reception.
+    void failSegmented(const char* why, uint16_t received, uint16_t announced, unsigned long now);
+    // Sends the generated FC.CTS on the request ID paired with the First Frame's response
+    // ID, through the same checks as every request. False if refused or not sent.
+    bool sendFlowControl(const CanFrame& firstFrame);
+    // After a complete drain: sends the pending FC (or aborts the request) and starts the
+    // reception. Called only when the drain returned DRAINED.
+    void sendPendingFlowControl(unsigned long now);
+    void holdTx(unsigned long now);
+
+#if CONN_DISCOVERY_PROBE
+    // ------------------------------------------------------------------
+    // D-059 item 3 -- one-shot discovery scan (probe env only).
+    // ------------------------------------------------------------------
+    enum class ScanPhase : uint8_t { WAIT_SESSION, RUNNING, DONE };
+    ScanPhase _scanPhase = ScanPhase::WAIT_SESSION;
+    DiscoveryScan _scan;
+    int8_t _pendingScanIndex = -1;       // scan entry in flight, -1 = none (or a DID)
+    unsigned long _firstSessionRequestMs = 0;
     unsigned long _scanHoldUntilMs = 0;  // no scan request until then (a late answer may come)
 
     // Starts the scan once the session is confirmed (or one retry interval after the first
@@ -290,17 +337,6 @@ private:
     // A Single Frame answer to the scan entry in flight. False if it is not one (then the
     // normal handling runs, e.g. for a session confirm or an NRC 0x78).
     bool onScanSingleFrame(const CanFrame& frame, unsigned long now);
-    void onFirstFrame(const CanFrame& frame, unsigned long now);
-    void onConsecutiveFrame(const CanFrame& frame, unsigned long now);
-    // The reception completed or was aborted: report it and resolve the scan request.
-    void endReception(unsigned long now);
-    // Sends the generated FC.CTS on the request ID paired with the First Frame's response
-    // ID, through the same checks as every request. False if refused or not sent.
-    bool sendFlowControl(const CanFrame& firstFrame);
-    // After a complete drain: sends the pending FC (or aborts the entry) and starts the
-    // reception. Called only when the drain returned DRAINED.
-    void sendPendingFlowControl(unsigned long now);
-    void holdTx(unsigned long now);
 #endif
 };
 
