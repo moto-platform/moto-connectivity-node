@@ -13,6 +13,9 @@ const unsigned long kDidSkipCooldownMs = VEHICLE_CL250_DID_SKIP_COOLDOWN_MS;
 const unsigned long kEcuAbsentTimeoutMs = VEHICLE_CL250_ECU_ABSENT_TIMEOUT_MS;
 const unsigned long kBackoffMinMs = VEHICLE_CL250_BUS_OFF_BACKOFF_INITIAL_MS;
 const unsigned long kBackoffMaxMs = VEHICLE_CL250_BUS_OFF_BACKOFF_MAX_MS;
+// D-080 item 4 / D-068 item 1: a 0x19 transaction may hold the slot as long as an unverified
+// DID read (base timeout + one step); longer = the epoch's one 0x19 fault (MAJOR-2).
+const unsigned long kDtcSlotMaxMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + VEHICLE_CL250_CLIENT_STEP_MAX_MS;
 
 // Local policy of this TEMPORARY tester, not a vehicle definition: after this many
 // bus-off events the driver is stopped for good (until reboot) instead of rejoining the
@@ -29,8 +32,8 @@ const uint8_t kStopNrcReads = 2;
 const unsigned long kListenOnlyWindowMs = 2000;
 
 // Bounded RX drain: at most this many frames per pass. Twice the TWAI RX queue depth
-// (hal/CanRxQueue.h), so one pass empties the queue (in the D-059 probe also a whole CF
-// burst), while a flooded bus still cannot stall the loop.
+// (hal/CanRxQueue.h), so one pass empties the queue (also a whole CF burst after the FC),
+// while a flooded bus still cannot stall the loop.
 static_assert(2u * kCanRxQueueLen <= 255u, "the drain bound must fit uint8_t");
 const uint8_t kMaxRxFramesPerPass = (uint8_t)(2u * kCanRxQueueLen);
 // At most this many per-frame log lines per pass (Serial output is slow; see TWDT).
@@ -82,12 +85,10 @@ const uint8_t kSessionRequest[] = {VEHICLE_CL250_SESSION_SID, VEHICLE_CL250_SESS
 const uint8_t kTesterPresentRequest[] = {VEHICLE_CL250_TESTER_PRESENT_SID,
                                          VEHICLE_CL250_TESTER_PRESENT_SUBFUNCTION};
 
-#if CONN_DISCOVERY_PROBE
-// D-059: scan report lines go to USB serial.
-void scanSerialLine(const char* line) {
+// D-059 scan and D-080 DTC report lines go to USB serial.
+void reportSerialLine(const char* line) {
     Serial.println(line);
 }
-#endif
 } // namespace
 
 uint8_t HondaCANModule::maxTimeoutLogLinesPerWindow() {
@@ -95,9 +96,9 @@ uint8_t HondaCANModule::maxTimeoutLogLinesPerWindow() {
 }
 
 HondaCANModule::HondaCANModule(ICanBus& bus, ITesterLatchStore& latchStore)
-    : _bus(bus), _latchStore(latchStore)
+    : _bus(bus), _latchStore(latchStore), _dtc(reportSerialLine)
 #if CONN_DISCOVERY_PROBE
-    , _scan(scanSerialLine)
+    , _scan(reportSerialLine)
 #endif
 {
     _timeoutLogBudget = kMaxTimeoutLogLinesPerWindow; // the first window is open from boot
@@ -179,6 +180,51 @@ void HondaCANModule::armUnverifiedReads(unsigned long now) {
     _engineStartRearmed = false;
     _rpmZeroSeen = false;
     _rpmRunSamples = 0;
+    // D-080 item 1: the key-on run of the epoch (also its "not served" and skip state are
+    // forgotten: they hold until the next stop epoch). The warm-idle trigger starts over.
+    _dtc.startEpoch();
+    _warmIdleSinceMs = 0;
+    for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
+        _didValueMs[i] = 0;
+    }
+}
+
+bool HondaCANModule::warmIdleConditionsMet(unsigned long now) const {
+    for (uint8_t k = 0; k < VEHICLE_CL250_DTC_WARM_IDLE_CONDITION_COUNT; k++) {
+        const vehicle_cl250_dtc_condition_t& c = vehicle_cl250_dtc_warm_idle[k];
+        if (c.did_index >= VEHICLE_CL250_DID_COUNT || _didValueMs[c.did_index] == 0 ||
+            now - _didValueMs[c.did_index] > (unsigned long)vehicle_cl250_dids[c.did_index].stale_after_ms) {
+            return false; // no value, or a stale one: not met
+        }
+        const float v = _didValue[c.did_index];
+        bool met = false;
+        switch (c.op) {
+            case VEHICLE_CL250_DTC_OP_LT: met = v < c.value; break;
+            case VEHICLE_CL250_DTC_OP_LE: met = v <= c.value; break;
+            case VEHICLE_CL250_DTC_OP_GT: met = v > c.value; break;
+            case VEHICLE_CL250_DTC_OP_GE: met = v >= c.value; break;
+            case VEHICLE_CL250_DTC_OP_EQ: met = v == c.value; break; // NOLINT: exact, DIDs decode exact steps
+            default: met = false; break;
+        }
+        if (!met) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void HondaCANModule::watchWarmIdle(unsigned long now) {
+    if (!warmIdleConditionsMet(now)) {
+        _warmIdleSinceMs = 0;
+        return;
+    }
+    if (_warmIdleSinceMs == 0) {
+        _warmIdleSinceMs = (now == 0) ? 1 : now; // 0 means "not holding"
+        return;
+    }
+    if (now - _warmIdleSinceMs >= (unsigned long)VEHICLE_CL250_DTC_WARM_IDLE_MIN_DURATION_MS) {
+        _dtc.armWarmIdle(); // once per stop epoch (DtcSnapshot keeps the flag)
+    }
 }
 
 bool HondaCANModule::begin() {
@@ -360,8 +406,7 @@ void HondaCANModule::poll(SystemState& state) {
         // transmit nothing this pass (and count no timeout).
         return;
     }
-#if CONN_DISCOVERY_PROBE
-    // D-059: while a segmented answer is received nothing else is sent and no response
+    // D-059/D-080: while a segmented answer is received nothing else is sent and no response
     // timeout runs. Lost frames and N_Cr are checked only now, after the drain, against
     // the drain time of the last CF, so CFs already queued are never "late".
     if (_isoRx.active()) {
@@ -378,7 +423,9 @@ void HondaCANModule::poll(SystemState& state) {
             return; // the reception started: nothing else this pass
         }
     }
-#endif
+    // D-080: at most one line of a 0x19 answer's hex dump per pass (Serial is slow).
+    _dtc.flushOne();
+    watchWarmIdle(now);
 
     if (_sessionStartPending) {
         // First pass in normal mode, after its drain: start the extended diagnostic
@@ -439,18 +486,23 @@ void HondaCANModule::poll(SystemState& state) {
         _recoveryBackoffMs = kBackoffMinMs;
     }
 
-    // D-059 probe only (both stay true/false in every other build): txHold = the quiet
-    // time after a First Frame that got no FC or an aborted reception, in which no request
-    // at all is sent (yaml flow_control rule); during the scan, tester present and the
-    // session retry go out only between requests, never while one is in flight.
-    bool txHold = false;
+    // txHold = the quiet time after a First Frame that got no FC or an aborted reception,
+    // in which no request at all is sent (yaml flow_control rule). D-059 probe only (true in
+    // every other build): during the scan, tester present and the session retry go out only
+    // between requests, never while one is in flight.
+    const bool txHold = beforeDeadline(now, _txQuietUntilMs);
     bool auxAllowed = true;
 #if CONN_DISCOVERY_PROBE
-    txHold = beforeDeadline(now, _txQuietUntilMs);
     if (_scanPhase != ScanPhase::DONE) {
         auxAllowed = (_udsState == UdsRequestState::IDLE);
     }
 #endif
+    // D-080 (safety-reviewer MINOR-2): no tester present or session retry while a 0x19 is in
+    // flight, so no other answer lands in its (segmented) reception. At most one slot plus a
+    // reception (<= RESPONSE_TIMEOUT_MAX_MS), well inside S3 with the 1 s tester present.
+    if (_pendingDtc && _udsState == UdsRequestState::WAITING) {
+        auxAllowed = false;
+    }
     bool auxSent = false; // tester present or session retry sent this pass
 
     // 2. Tester present -- only meaningful once a session is confirmed, but harmless to
@@ -504,6 +556,7 @@ void HondaCANModule::poll(SystemState& state) {
         } else
 #endif
         {
+        bool didSent = false;
         for (uint8_t i = 0; i < VEHICLE_CL250_DID_COUNT; i++) {
             DidSlot& slot = _dids[i];
             if (beforeDeadline(now, slot.skipUntilMs)) {
@@ -532,8 +585,14 @@ void HondaCANModule::poll(SystemState& state) {
                 _pendingSawNrc78 = false;
                 _pendingRttSkip = beforeDeadline(now, _rttQuietUntilMs);
                 _responseTimeoutMs = kResponseTimeoutMs;
+                didSent = true;
                 break; // exactly one request in flight at a time
             }
+        }
+        // D-080 item 4: a 0x19 request only in a step where no DID was due (after every
+        // verified and unverified DID), and only in a confirmed session, like an unverified read.
+        if (!didSent && _sessionConfirmed && _dtc.due()) {
+            sendDtcRequest(now);
         }
         }
     } else if (_udsState == UdsRequestState::WAITING) {
@@ -552,6 +611,12 @@ void HondaCANModule::poll(SystemState& state) {
         _udsState = UdsRequestState::IDLE;
     }
 #endif
+    if (_udsState == UdsRequestState::TIMEOUT && _pendingDtc) {
+        // Not a DID: no DID timeout count. A late answer no longer matches (the run ended).
+        _pendingDtc = false;
+        _dtc.onTimeout();
+        _udsState = UdsRequestState::IDLE;
+    }
     bool timeoutThisPass = false;
     if (_udsState == UdsRequestState::TIMEOUT) {
         DidSlot& slot = _dids[_pendingDidIndex];
@@ -610,6 +675,7 @@ void HondaCANModule::poll(SystemState& state) {
         if (_pendingDidIndex >= 0) {
             _dids[_pendingDidIndex].consecutiveTimeouts = 0;
         }
+        _pendingDtc = false;
 #if CONN_DISCOVERY_PROBE
         _pendingScanIndex = -1;
 #endif
@@ -727,14 +793,13 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
         // type: 0x0X = Single Frame (X = payload length), 0x1X = First Frame, 0x2X =
         // Consecutive Frame, 0x3X = Flow Control. A First Frame's data[1] is part of the
         // multi-frame length, not a SID, so parsing it as one would silently corrupt
-        // SystemState. Multi-frame reassembly exists only in the D-059 probe env (below);
-        // moto-rt-core owns the long-term client (D-023), and every DID used today fits in
-        // a Single Frame.
+        // SystemState. Multi-frame reassembly is only for the 0x19 answers (D-080) and the
+        // D-059 probe's scan (below); moto-rt-core owns the long-term client (D-023), and
+        // every DID used today fits in a Single Frame.
         uint8_t isoTpFrameType = (rxMsg.data[0] >> 4) & 0x0F;
-#if CONN_DISCOVERY_PROBE
-        // D-059: segmented answers, only in the probe env.
+        // D-059/D-080: segmented answers (an FC only for the 0x19 or scan request in flight).
         if (isoTpFrameType == IsoTpReceiver::kPciFirstFrame) {
-            onFirstFrame(rxMsg, now);
+            onFirstFrame(rxMsg, now, logBudget);
             continue;
         }
         if (isoTpFrameType == IsoTpReceiver::kPciConsecutiveFrame) {
@@ -747,13 +812,17 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
             _isoRx.abort(IsoTpReceiver::AbortReason::UNEXPECTED_FRAME); // then handled as usual
             endReception(now);
         }
+        if (isoTpFrameType == IsoTpReceiver::kPciSingleFrame && onDtcSingleFrame(rxMsg, now)) {
+            continue;
+        }
+#if CONN_DISCOVERY_PROBE
         if (isoTpFrameType == IsoTpReceiver::kPciSingleFrame && onScanSingleFrame(rxMsg, now)) {
             continue;
         }
 #endif
         if (isoTpFrameType != 0x0) {
             if (takeLogSlot(logBudget)) {
-                Serial.printf("[UDS WARNING] Unsupported ISO-TP frame type 0x%X (PCI=0x%02X) -- multi-frame responses are not handled, dropping frame.\n",
+                Serial.printf("[UDS WARNING] Unexpected ISO-TP frame type 0x%X (PCI=0x%02X) -- dropping frame.\n",
                     isoTpFrameType, rxMsg.data[0]);
             }
             continue;
@@ -766,6 +835,8 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
         if (entry != nullptr && vehicle_cl250_parse_response(echoedDid, rxMsg.data, rxMsg.dlc, &value)) {
             const uint8_t didIndex = (uint8_t)(entry - vehicle_cl250_dids);
             storeValue(state, didIndex, value, now);
+            _didValue[didIndex] = value; // D-080 warm-idle trigger (bookkeeping only)
+            _didValueMs[didIndex] = (now == 0) ? 1 : now;
             // D-066 item 4: the same validated answer, as raw data bytes for the BLE
             // vehicle-signal block. Bookkeeping only; nothing here changes what is sent.
             vsigRecordPositive(state.vehicleSignals.dids[didIndex], &rxMsg.data[4], entry->length, (uint32_t)now);
@@ -961,9 +1032,8 @@ void HondaCANModule::latchOff(TesterLatchReason reason, const char* why) {
     Serial.printf("[UDS STOP] Vehicle-bus poller latched off until power-on: %s.\n", why);
 }
 
-#if CONN_DISCOVERY_PROBE
 // ---------------------------------------------------------------------------
-// D-059 item 3 -- one-shot discovery scan and segmented reception (probe env only).
+// D-080 -- DTC freeze frames; segmented reception of a 0x19 (or D-059 scan) answer.
 // ---------------------------------------------------------------------------
 
 void HondaCANModule::holdTx(unsigned long now) {
@@ -974,6 +1044,279 @@ void HondaCANModule::holdTx(unsigned long now) {
         _txQuietUntilMs = 1; // 0 means "none"
     }
 }
+
+void HondaCANModule::sendDtcRequest(unsigned long now) {
+    uint8_t request[DtcSnapshot::kRequestMax];
+    const uint8_t len = _dtc.buildRequest(request);
+    if (len == 0) {
+        return;
+    }
+    _pendingDtc = true;
+    _pendingDidIndex = -1; // not a DID: no round-trip sample, no DID timeout count
+    _pendingDid = 0;
+    _pendingSid = UDS_SID_READ_DTC_INFORMATION;
+    _fcSentForPending = false;
+    _requestLostBaseline = _bus.rxLostCount(); // a frame lost after this may be part of the answer
+    // A padded Single Frame like every request; sendFrame() passes it through the D-020 gate.
+    sendRequest(request, len);
+    _udsState = UdsRequestState::WAITING;
+    _requestSentMs = now;
+    _requestFirstSentMs = now;
+    _pendingSawNrc78 = false;
+    _pendingRttSkip = true;
+    _responseTimeoutMs = kResponseTimeoutMs; // D-080 item 4: never extended by NRC 0x78
+}
+
+bool HondaCANModule::onDtcSingleFrame(const CanFrame& f, unsigned long now) {
+    if (!_pendingDtc || _udsState != UdsRequestState::WAITING) {
+        return false;
+    }
+    const uint8_t len = (uint8_t)(f.data[0] & 0x0F);
+    if (len == 0 || len > isotp::kSingleFrameMaxLen || len + 1u > f.dlc) {
+        return false;
+    }
+    const uint8_t* msg = &f.data[1];
+    if (_dtc.matchesPositive(msg, len)) {
+        checkDtcSlot(now);
+        _dtc.onPositive(msg, len);
+        _lastGoodResponseMs = now;
+        _udsState = UdsRequestState::COMPLETE;
+        return true;
+    }
+    if (!_dtc.matchesNegative(msg, len)) {
+        return false;
+    }
+    _nrcCount++;
+    _lastGoodResponseMs = now; // G2.3: an NRC still proves the ECU is alive and answering
+    switch (_dtc.onNrc(msg[2])) {
+        case DtcSnapshot::NrcAction::WAIT:
+            return true; // 0x78: no extension (D-080 item 4), it times out at the base timeout
+        case DtcSnapshot::NrcAction::SESSION_LOST:
+            // D-080 item 2 / D-075 item 1: the ECU fell back to the default session; ask for
+            // it again at the next step. Its confirmation stays in the same stop epoch.
+            if (_sessionConfirmed) {
+                _sessionConfirmed = false;
+                Serial.println("[UDS] Extended session lost (NRC 0x7E/0x7F to 0x19) -- requesting it again.");
+            }
+            _sessionRetryNow = true;
+            break;
+        default:
+            break;
+    }
+    _udsState = UdsRequestState::COMPLETE;
+    return true;
+}
+
+bool HondaCANModule::segmentedRequestPending() const {
+    if (_udsState != UdsRequestState::WAITING) {
+        return false;
+    }
+#if CONN_DISCOVERY_PROBE
+    if (_pendingScanIndex >= 0) {
+        return true;
+    }
+#endif
+    return _pendingDtc;
+}
+
+void HondaCANModule::failSegmented(const char* why, uint16_t received, uint16_t announced, unsigned long now) {
+    holdTx(now);
+    if (_pendingDtc) {
+        _dtc.onSegmentedFailure(why, received, announced); // D-080 item 3: 0x19 off for the epoch
+    }
+#if CONN_DISCOVERY_PROBE
+    if (_pendingScanIndex >= 0) {
+        _scan.recordAborted((uint8_t)_pendingScanIndex, why, received, announced);
+    }
+#endif
+    _udsState = UdsRequestState::COMPLETE;
+}
+
+void HondaCANModule::checkDtcSlot(unsigned long now) {
+    if (_pendingDtc && now - _requestFirstSentMs > kDtcSlotMaxMs) {
+        _dtc.haltAfterAnswer(DtcSnapshot::Halt::SLOW);
+    }
+}
+
+void HondaCANModule::onFirstFrame(const CanFrame& f, unsigned long now, uint8_t& logBudget) {
+    if (_isoRx.active() || _fcPending) {
+        const CanFrame& current = _isoRx.active() ? f : _fcPendingFrame;
+        bool sameId = _isoRx.active() ? _isoRx.fromReceptionId(f)
+                                      : (current.id == f.id && current.extended == f.extended);
+        if (sameId) {
+            // A second First Frame on the reception's ID: no new FC, the reception ends.
+            _fcPending = false;
+            _isoRx.abort(IsoTpReceiver::AbortReason::UNEXPECTED_FRAME);
+            endReception(now);
+        } else {
+            // The other response ID answered too (requests go to both IDs): that one gets
+            // no FC, and its ECU times out on N_Bs (safety-reviewer MINOR-2).
+            holdTx(now);
+            if (_pendingDtc) {
+                // D-080 MAJOR-1 (a): this would repeat for every segmented 0x19 answer; once
+                // per epoch, then 0x19 is off (the reception in progress still completes).
+                _dtc.haltAfterAnswer(DtcSnapshot::Halt::BOTH_IDS);
+            }
+        }
+        return;
+    }
+    const uint16_t announced = IsoTpReceiver::firstFrameLength(f);
+    // The data after the 2-byte PCI, only from an 8-byte frame (a shorter FF is invalid).
+    const uint16_t inFrame = (f.dlc != VEHICLE_CL250_FRAME_DLC) ? 0u
+        : (announced < IsoTpReceiver::kFirstFramePayload) ? announced : (uint16_t)IsoTpReceiver::kFirstFramePayload;
+    // The FF must carry the in-flight request's positive SID and echo (for 0x19 0x04/0x06
+    // also the DTC), so an FC only ever goes to the answer of our own request; never within
+    // a quiet time (safety-reviewer MINOR-1).
+    bool ours = false;
+    if (segmentedRequestPending() && inFrame > 0) {
+        ours = _pendingDtc && _dtc.matchesPositive(&f.data[2], inFrame);
+#if CONN_DISCOVERY_PROBE
+        ours = ours || (_pendingScanIndex >= 0 &&
+                        DiscoveryScan::matchesPositive((uint8_t)_pendingScanIndex, &f.data[2], inFrame));
+#endif
+    }
+    if (ours && !_fcSentForPending && !beforeDeadline(now, _txQuietUntilMs) && IsoTpReceiver::acceptableLength(f) != 0) {
+        _fcSentForPending = true; // one FC per request (BS 0), also if it is never sent
+        _fcPending = true;        // sent by poll() once the drain is complete
+        _fcPendingFrame = f;
+        _fcPendingMs = now;
+        return;
+    }
+    // No FC: too long, not an answer to the request in flight, in a quiet time, or a second FF.
+    holdTx(now);
+    if (takeLogSlot(logBudget)) {
+        Serial.printf("[UDS WARNING] First Frame (FF_DL=%u) not answered with an FC; no request for %lu ms.\n",
+            announced, kResponsePendingMaxMs);
+    }
+    if (ours) {
+#if CONN_DISCOVERY_PROBE
+        if (_pendingScanIndex >= 0) {
+            _scan.recordFfRefused((uint8_t)_pendingScanIndex, announced);
+        }
+#endif
+        if (_pendingDtc) {
+            // D-080 item 3: above max_ff_dl (or no FC possible) = refused, 0x19 off for the epoch.
+            _dtc.onSegmentedFailure("First Frame refused", 0, announced);
+        }
+        _udsState = UdsRequestState::COMPLETE;
+    } else if (_udsState == UdsRequestState::WAITING && _pendingDidIndex >= 0 && inFrame >= 3 &&
+               f.data[2] == (uint8_t)(UDS_SID_READ_DATA_BY_IDENTIFIER + UDS_POSITIVE_RESPONSE_OFFSET) &&
+               (uint16_t)((f.data[3] << 8) | f.data[4]) == _pendingDid) {
+        // yaml: a segmented DID answer that got no FC is not a DID timeout (no sample either).
+        // D-068 (safety-reviewer MINOR-2): every table DID fits a Single Frame, so an
+        // unverified DID answered this way is never decoded; stop it, or its read would hold
+        // every request for the quiet time each period.
+        DidSlot& slot = _dids[_pendingDidIndex];
+        if (!slot.verified && !slot.answered) {
+            slot.unsupported = true;
+            slot.stopReason = StopReason::FIRST_FRAME;
+        } else {
+            // A verified or answered DID is never stopped: the D-050..D-053 skip, so the
+            // quiet time does not repeat every period (mirrors rt-core's stop_or_skip).
+            slot.skipUntilMs = now + kDidSkipCooldownMs;
+        }
+        _udsState = UdsRequestState::COMPLETE;
+    }
+}
+
+// A quiet time started meanwhile by an FF on the other response ID does not stop this FC: it
+// answers our own request, and the yaml quiet-time rule covers requests only (intended).
+void HondaCANModule::sendPendingFlowControl(unsigned long now) {
+    _fcPending = false;
+    if (!segmentedRequestPending()) {
+        return; // the request was resolved meanwhile (e.g. by an NRC): no FC
+    }
+    const uint16_t announced = IsoTpReceiver::firstFrameLength(_fcPendingFrame);
+    const char* why = nullptr;
+    const uint32_t lost = _bus.rxLostCount();
+    if (lost != _requestLostBaseline) {
+        why = "lost frame before the FC"; // part of the answer may be missing
+    } else if (now - _fcPendingMs > kResponseTimeoutMs) {
+        why = "FC too late"; // the drain stayed backlogged; well inside the ECU's N_Bs
+    } else if (!sendFlowControl(_fcPendingFrame)) {
+        why = "FC not sent";
+    }
+    if (why != nullptr) {
+        failSegmented(why, 0, announced, now);
+        return;
+    }
+    // Times count from this drain; the baseline is the count the request went out with.
+    _isoRx.start(_fcPendingFrame, now, lost);
+}
+
+void HondaCANModule::onConsecutiveFrame(const CanFrame& f, unsigned long now) {
+    if (!_isoRx.fromReceptionId(f)) {
+        return; // no reception (or after an abort): a stray CF is dropped, never printed
+    }
+    if (_isoRx.onConsecutive(f, now) == IsoTpReceiver::Result::IN_PROGRESS) {
+        return;
+    }
+    endReception(now);
+}
+
+void HondaCANModule::endReception(unsigned long now) {
+    _fcPending = false;
+    if (segmentedRequestPending()) {
+        if (_isoRx.complete()) {
+            // The FF matched the request's SID and echo; the payload starts at the SID.
+            if (_pendingDtc) {
+                checkDtcSlot(now);
+                _dtc.onPositive(_isoRx.payload(), _isoRx.length());
+            }
+#if CONN_DISCOVERY_PROBE
+            if (_pendingScanIndex >= 0) {
+                _scan.recordPositive((uint8_t)_pendingScanIndex, _isoRx.payload(), _isoRx.length());
+            }
+#endif
+            _lastGoodResponseMs = now;
+            _udsState = UdsRequestState::COMPLETE;
+        } else {
+            // Nothing of a partial answer is printed (in the probe it may be the VIN).
+            failSegmented(IsoTpReceiver::reasonText(_isoRx.abortReason()), _isoRx.received(), _isoRx.length(), now);
+        }
+    } else if (!_isoRx.complete()) {
+        holdTx(now);
+    }
+    _isoRx.reset();
+}
+
+bool HondaCANModule::sendFlowControl(const CanFrame& firstFrame) {
+    // The request ID paired with the response ID the First Frame came on (gen/ IDs only).
+    uint32_t id = 0;
+    bool paired = false;
+    if (firstFrame.id == VEHICLE_CL250_RESPONSE_ID && firstFrame.extended == isotp::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) {
+        id = VEHICLE_CL250_REQUEST_ID;
+        paired = true;
+    } else if (firstFrame.id == VEHICLE_CL250_FALLBACK_RESPONSE_ID &&
+               firstFrame.extended == isotp::isExtendedId(VEHICLE_CL250_FALLBACK_RESPONSE_ID)) {
+        id = VEHICLE_CL250_FALLBACK_REQUEST_ID;
+        paired = true;
+    }
+    CanFrame fc;
+    fc.id = id;
+    fc.extended = isotp::isExtendedId(id);
+    fc.dlc = VEHICLE_CL250_FRAME_DLC;
+    for (uint8_t i = 0; i < VEHICLE_CL250_FRAME_DLC; i++) {
+        fc.data[i] = vehicle_cl250_fc_cts[i]; // byte for byte from gen/ (D-059 item 1)
+    }
+    // Same last word as every request: the latches, the listen window, and the D-020 gate.
+    if (!paired || _latchedOff || _listening || !vehicle_cl250_frame_allowed(fc.data, fc.dlc)) {
+        _blockedFrames++;
+        Serial.printf("[UDS BLOCKED] Flow Control to 0x%08lX refused (total=%lu).\n",
+            (unsigned long)fc.id, (unsigned long)_blockedFrames);
+        return false;
+    }
+    if (!_bus.transmit(fc)) {
+        return false;
+    }
+    Serial.printf("[ISOTP] FC.CTS sent to 0x%08lX for a %u-byte answer.\n",
+        (unsigned long)fc.id, IsoTpReceiver::firstFrameLength(firstFrame));
+    return true;
+}
+#if CONN_DISCOVERY_PROBE
+// ---------------------------------------------------------------------------
+// D-059 item 3 -- one-shot discovery scan (probe env only).
+// ---------------------------------------------------------------------------
 
 void HondaCANModule::scanStep(unsigned long now) {
     if (_scanPhase == ScanPhase::WAIT_SESSION) {
@@ -1012,7 +1355,7 @@ void HondaCANModule::scanStep(unsigned long now) {
     _pendingDid = 0;
     _pendingSid = e.request[0];
     _fcSentForPending = false;
-    _scanLostBaseline = _bus.rxLostCount(); // a frame lost after this may be part of the answer
+    _requestLostBaseline = _bus.rxLostCount(); // a frame lost after this may be part of the answer
     // A Single Frame like every request; sendFrame() passes it through the D-020 gate.
     sendRequest(e.request, e.size);
     _udsState = UdsRequestState::WAITING;
@@ -1048,157 +1391,5 @@ bool HondaCANModule::onScanSingleFrame(const CanFrame& f, unsigned long now) {
         return true;
     }
     return false;
-}
-
-void HondaCANModule::onFirstFrame(const CanFrame& f, unsigned long now) {
-    if (_isoRx.active() || _fcPending) {
-        const CanFrame& current = _isoRx.active() ? f : _fcPendingFrame;
-        bool sameId = _isoRx.active() ? _isoRx.fromReceptionId(f)
-                                      : (current.id == f.id && current.extended == f.extended);
-        if (sameId) {
-            // A second First Frame on the reception's ID: no new FC, the reception ends.
-            _fcPending = false;
-            _isoRx.abort(IsoTpReceiver::AbortReason::UNEXPECTED_FRAME);
-            endReception(now);
-        } else {
-            // The other response ID answered too (requests go to both IDs): that one gets
-            // no FC, and its ECU times out on N_Bs (safety-reviewer MINOR-2).
-            holdTx(now);
-        }
-        return;
-    }
-    const uint16_t announced = IsoTpReceiver::firstFrameLength(f);
-    // The data after the 2-byte PCI, only from an 8-byte frame (a shorter FF is invalid).
-    const uint16_t inFrame = (f.dlc != VEHICLE_CL250_FRAME_DLC) ? 0u
-        : (announced < IsoTpReceiver::kFirstFramePayload) ? announced : (uint16_t)IsoTpReceiver::kFirstFramePayload;
-    const bool scanPending = (_udsState == UdsRequestState::WAITING) && (_pendingScanIndex >= 0);
-    // The FF must carry the in-flight entry's positive SID and echo, so an FC only ever goes
-    // to the answer of our own request; never within a quiet time (safety-reviewer MINOR-1).
-    const bool ours = scanPending && inFrame > 0 &&
-                      DiscoveryScan::matchesPositive((uint8_t)_pendingScanIndex, &f.data[2], inFrame);
-    if (ours && !_fcSentForPending && !beforeDeadline(now, _txQuietUntilMs) && IsoTpReceiver::acceptableLength(f) != 0) {
-        _fcSentForPending = true; // one FC per request (BS 0), also if it is never sent
-        _fcPending = true;        // sent by poll() once the drain is complete
-        _fcPendingFrame = f;
-        _fcPendingMs = now;
-        return;
-    }
-    // No FC: too long, not an answer to the request in flight, in a quiet time, or a second FF.
-    holdTx(now);
-    Serial.printf("[UDS WARNING] First Frame (FF_DL=%u) not answered with an FC; no request for %lu ms.\n",
-        announced, kResponsePendingMaxMs);
-    if (ours) {
-        _scan.recordFfRefused((uint8_t)_pendingScanIndex, announced);
-        _udsState = UdsRequestState::COMPLETE;
-    } else if (_udsState == UdsRequestState::WAITING && _pendingDidIndex >= 0 && inFrame >= 3 &&
-               f.data[2] == (uint8_t)(UDS_SID_READ_DATA_BY_IDENTIFIER + UDS_POSITIVE_RESPONSE_OFFSET) &&
-               (uint16_t)((f.data[3] << 8) | f.data[4]) == _pendingDid) {
-        // yaml: a segmented DID answer that got no FC is not a DID timeout (no sample either).
-        // D-068 (safety-reviewer MINOR-2): every table DID fits a Single Frame, so an
-        // unverified DID answered this way is never decoded; stop it, or its read would hold
-        // every request for the quiet time each period.
-        DidSlot& slot = _dids[_pendingDidIndex];
-        if (!slot.verified && !slot.answered) {
-            slot.unsupported = true;
-            slot.stopReason = StopReason::FIRST_FRAME;
-        } else {
-            // A verified or answered DID is never stopped: the D-050..D-053 skip, so the
-            // quiet time does not repeat every period (mirrors rt-core's stop_or_skip).
-            slot.skipUntilMs = now + kDidSkipCooldownMs;
-        }
-        _udsState = UdsRequestState::COMPLETE;
-    }
-}
-
-// A quiet time started meanwhile by an FF on the other response ID does not stop this FC: it
-// answers our own request, and the yaml quiet-time rule covers requests only (intended).
-void HondaCANModule::sendPendingFlowControl(unsigned long now) {
-    _fcPending = false;
-    if (_pendingScanIndex < 0 || _udsState != UdsRequestState::WAITING) {
-        return; // the request was resolved meanwhile (e.g. by an NRC): no FC
-    }
-    const uint8_t i = (uint8_t)_pendingScanIndex;
-    const uint16_t announced = IsoTpReceiver::firstFrameLength(_fcPendingFrame);
-    const char* why = nullptr;
-    const uint32_t lost = _bus.rxLostCount();
-    if (lost != _scanLostBaseline) {
-        why = "lost frame before the FC"; // part of the answer may be missing
-    } else if (now - _fcPendingMs > kResponseTimeoutMs) {
-        why = "FC too late"; // the drain stayed backlogged; well inside the ECU's N_Bs
-    } else if (!sendFlowControl(_fcPendingFrame)) {
-        why = "FC not sent";
-    }
-    if (why != nullptr) {
-        _scan.recordAborted(i, why, 0, announced);
-        holdTx(now);
-        _udsState = UdsRequestState::COMPLETE;
-        return;
-    }
-    // Times count from this drain; the baseline is the count the request went out with.
-    _isoRx.start(_fcPendingFrame, now, lost);
-}
-
-void HondaCANModule::onConsecutiveFrame(const CanFrame& f, unsigned long now) {
-    if (!_isoRx.fromReceptionId(f)) {
-        return; // no reception (or after an abort): a stray CF is dropped, never printed
-    }
-    if (_isoRx.onConsecutive(f, now) == IsoTpReceiver::Result::IN_PROGRESS) {
-        return;
-    }
-    endReception(now);
-}
-
-void HondaCANModule::endReception(unsigned long now) {
-    _fcPending = false;
-    if (_pendingScanIndex >= 0 && _udsState == UdsRequestState::WAITING) {
-        uint8_t i = (uint8_t)_pendingScanIndex;
-        if (_isoRx.complete()) {
-            // The FF matched the entry's SID and echo; the payload starts at the SID.
-            _scan.recordPositive(i, _isoRx.payload(), _isoRx.length());
-            _lastGoodResponseMs = now;
-        } else {
-            // Nothing of a partial answer is printed (it may be the VIN).
-            _scan.recordAborted(i, IsoTpReceiver::reasonText(_isoRx.abortReason()), _isoRx.received(), _isoRx.length());
-            holdTx(now);
-        }
-        _udsState = UdsRequestState::COMPLETE;
-    } else if (!_isoRx.complete()) {
-        holdTx(now);
-    }
-    _isoRx.reset();
-}
-
-bool HondaCANModule::sendFlowControl(const CanFrame& firstFrame) {
-    // The request ID paired with the response ID the First Frame came on (gen/ IDs only).
-    uint32_t id = 0;
-    bool paired = false;
-    if (firstFrame.id == VEHICLE_CL250_RESPONSE_ID && firstFrame.extended == isotp::isExtendedId(VEHICLE_CL250_RESPONSE_ID)) {
-        id = VEHICLE_CL250_REQUEST_ID;
-        paired = true;
-    } else if (firstFrame.id == VEHICLE_CL250_FALLBACK_RESPONSE_ID &&
-               firstFrame.extended == isotp::isExtendedId(VEHICLE_CL250_FALLBACK_RESPONSE_ID)) {
-        id = VEHICLE_CL250_FALLBACK_REQUEST_ID;
-        paired = true;
-    }
-    CanFrame fc;
-    fc.id = id;
-    fc.extended = isotp::isExtendedId(id);
-    fc.dlc = VEHICLE_CL250_FRAME_DLC;
-    for (uint8_t i = 0; i < VEHICLE_CL250_FRAME_DLC; i++) {
-        fc.data[i] = vehicle_cl250_fc_cts[i]; // byte for byte from gen/ (D-059 item 1)
-    }
-    // Same last word as every request: the latches, the listen window, and the D-020 gate.
-    if (!paired || _latchedOff || _listening || !vehicle_cl250_frame_allowed(fc.data, fc.dlc)) {
-        _blockedFrames++;
-        Serial.printf("[UDS BLOCKED] Flow Control to 0x%08lX refused (total=%lu).\n",
-            (unsigned long)fc.id, (unsigned long)_blockedFrames);
-        return false;
-    }
-    if (!_bus.transmit(fc)) {
-        return false;
-    }
-    Serial.printf("[ISOTP] D-059 FC.CTS sent to 0x%08lX for a %u-byte answer.\n",
-        (unsigned long)fc.id, IsoTpReceiver::firstFrameLength(firstFrame));
-    return true;
 }
 #endif // CONN_DISCOVERY_PROBE

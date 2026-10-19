@@ -12,7 +12,7 @@ TwaiCanBus::TwaiCanBus(gpio_num_t txPin, gpio_num_t rxPin)
 bool TwaiCanBus::install(twai_mode_t mode) {
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(_txPin, _rxPin, mode);
-    g_config.rx_queue_len = kCanRxQueueLen; // CanRxQueue.h: 64 in the D-059 probe, else 32
+    g_config.rx_queue_len = kCanRxQueueLen; // CanRxQueue.h: 64 (a whole CF burst, D-080)
     g_config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_ABOVE_ERR_WARN;
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 

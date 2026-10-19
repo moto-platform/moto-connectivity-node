@@ -9,10 +9,10 @@
 # window: the tester env, the GPS bring-up env esp32-s3-devkitc-1-gps (D-060) and the D-059
 # discovery probe esp32-s3-devkitc-1-probe) must enable CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM
 # in its generated sdkconfig.h.
-# D-059 item 3: only the probe compiles the discovery scan and the segmented reception (the
-# one FC.CTS sender). Their strings must be in the probe ELF and absent from the tester ELF.
-# (vehicle_cl250_fc_cts itself is in every tester ELF: the stateless D-020 frame gate
-# compares against it, so the check uses the probe-only code's strings.)
+# D-059 item 3: only the probe compiles the discovery scan. Its banner must be in the probe
+# ELF and absent from the tester ELF. Since D-080 every tester build has the segmented
+# reception (the one FC.CTS sender) for the 0x19 answers, so its log string is a positive
+# control in both.
 # Run after `pio run` of these envs.
 set -euo pipefail
 
@@ -47,8 +47,8 @@ for env in esp32-s3-devkitc-1-listen-only esp32-s3-devkitc-1 esp32-s3-devkitc-1-
     fi
 done
 
-# Probe-only strings (src/DiscoveryScan.h banner, HondaCANModule::sendFlowControl log).
-probe_markers=("D-059 discovery scan" "D-059 FC.CTS sent")
+# Probe-only strings (src/DiscoveryScan.h banner).
+probe_markers=("D-059 discovery scan")
 for marker in "${probe_markers[@]}"; do
     for env in esp32-s3-devkitc-1-probe esp32-s3-devkitc-1; do
         elf="$ROOT/.pio/build/$env/firmware.elf"
@@ -62,7 +62,15 @@ for marker in "${probe_markers[@]}"; do
         exit 1
     fi
     if grep -aq "$marker" "$ROOT/.pio/build/esp32-s3-devkitc-1/firmware.elf"; then
-        echo "the tester ELF contains the probe-only '$marker' (segmented reception outside the probe env)" >&2
+        echo "the tester ELF contains the probe-only '$marker' (discovery scan outside the probe env)" >&2
+        exit 1
+    fi
+done
+
+# D-080: both tester builds send the FC.CTS for a segmented 0x19 answer (positive control).
+for env in esp32-s3-devkitc-1-probe esp32-s3-devkitc-1; do
+    if ! grep -aq "FC.CTS sent" "$ROOT/.pio/build/$env/firmware.elf"; then
+        echo "positive control failed: the $env ELF has no FC.CTS sender (D-080)" >&2
         exit 1
     fi
 done
@@ -75,4 +83,4 @@ if [ "$listen_only" -ne 0 ]; then
     echo "the listen-only ELF contains twai_transmit ($listen_only symbol lines)" >&2
     exit 1
 fi
-echo "listen-only ELF: no twai_transmit; tester ELF: $tester twai_transmit symbol line(s), no discovery scan; listen-only errata workaround on in the capture, tester, GPS and probe builds"
+echo "listen-only ELF: no twai_transmit; tester ELF: $tester twai_transmit symbol line(s), FC sender, no discovery scan; listen-only errata workaround on in the capture, tester, GPS and probe builds"
