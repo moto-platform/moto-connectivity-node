@@ -4,7 +4,7 @@
 
 <!-- Source of truth: moto-workspace/PLATFORM-RULES.md. Copies in each repo's .claude/ are written by scripts/sync_claude.py — edit only the source. -->
 
-SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). **Scope (D-078):** for now only a test prototype is built and tested on the CL250; the scale is widened into a commercial multi-vehicle product later, so keep vehicle facts in per-vehicle defs files and never delete a catalog DID because the CL250 does not serve it. Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
+SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). **Scope (D-078):** for now only a test prototype is built and tested on the CL250; the scale is widened into a commercial multi-vehicle product later, so keep vehicle facts in per-vehicle defs files and never delete a catalog DID because the CL250 does not serve it. Senior thesis → GitHub org `moto-platform` (12 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
 
 ## Where things are
 
@@ -27,6 +27,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 | `moto-server` | Raspi (edge) + remote, VPS-ready (D-077) | Python (FastAPI) | Ingestion, storage, MDF4/Parquet, OTA packages |
 | `moto-ml` | Offline | Python | Training only |
 | `moto-mobile` | Phone | Flutter (D-022) | Loosely coupled companion |
+| `moto-analyzer` | Host (browser, later Tauri desktop) | TypeScript/React, Rust HAL later (D-081) | CAN analyzer for both buses; listen-only adapters, never transmits on a vehicle bus |
 | `moto-workspace` | — | — | Manifest, setup script, shared Claude agents/skills (source of truth) |
 | `HondaCl250_Telemetry` | — | archived | Read-only legacy reference (verified CL250 CAN/UDS code). Never modify it; extract facts per D-023 |
 
