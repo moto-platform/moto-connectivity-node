@@ -28,6 +28,7 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 - **moto-linux-node** — red: `*ota*`; everything else: **yellow**
 - **moto-server** — red: `*ota*`; yellow: `*gps*`, `*position*`; everything else: **green**
 - **moto-mobile** — yellow: `lib/services/session_upload*`, `lib/services/upload_client*`; everything else: **green**
+- **moto-analyzer** — red: `src/services/webSerialCan*`, `src/services/udsComposer*`, `src-tauri/*`; yellow: `src/defs/*`; everything else: **green**
 - **moto-mcp** — everything: **yellow**
 - **moto-ml** — everything: **green**
 - Unlisted repos and paths: yellow. Where two globs match, the more specific one listed first in
@@ -42,6 +43,8 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 - **Safety path:** never make a safety decision (cornering, blind spot, immobilizer) depend on the Raspi, the phone, Wi-Fi, VSS or ML; ML may only tighten thresholds.
 - **No new dependency** in firmware or in `pyproject.toml` / `pubspec.yaml` without asking the user.
 - **Do not weaken checks:** no disabled tests, lowered coverage, new MISRA suppressions, `# noqa` or `// cppcheck-suppress` to make CI green. Fix the code or log the problem.
+- **No new repositories.** Never create a repo in the org or a new top-level project; propose it under "For Claude" in your log (a new repo needs a D-xxx, its zones and the shared assets first, D-081).
+- **Hardware facts need a source.** Part numbers, pinouts, dimensions and prices you could not verify are marked **CONFIRM**; never rank an open question's candidates (Q-xxx) as decided, and never move a safety input (M4 board, D-082) onto a QM or detachable board.
 - **No releases:** no tags, no version bumps, no submodule pin changes, no `manifest.yaml` edits (D-036). Never merge a PR and never push to `main`; the user merges.
 
 ## 4. Workflow
@@ -59,6 +62,7 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 | moto-connectivity-node | `scripts/native_tests.sh` (or `pio test -e native`); `pio run -e esp32-s3-devkitc-1-mock`; cppcheck as in CI |
 | moto-mobile | `flutter pub get && flutter analyze && flutter test` (never commit a local `pubspec.lock` rewrite) |
 | moto-server | `uv sync && uv run pytest && uv run ruff check . && uv run ruff format --check .` |
+| moto-analyzer | `git submodule update --init && npm ci && npm test && npm run build` |
 | other repos | the commands in that repo's README/CLAUDE.md "Build" section |
 
 ## 5. Session log (mandatory)
@@ -73,7 +77,7 @@ Red-zone edits; signal, UDS, BLE and limit changes (`/signal-change`) and every 
 
 <!-- Source of truth: moto-workspace/PLATFORM-RULES.md. Copies in each repo's .claude/ are written by scripts/sync_claude.py — edit only the source. -->
 
-SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). **Scope (D-078):** for now only a test prototype is built and tested on the CL250; the scale is widened into a commercial multi-vehicle product later, so keep vehicle facts in per-vehicle defs files and never delete a catalog DID because the CL250 does not serve it. Senior thesis → GitHub org `moto-platform` (11 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
+SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first vehicle: Honda CL250). **Scope (D-078):** for now only a test prototype is built and tested on the CL250; the scale is widened into a commercial multi-vehicle product later, so keep vehicle facts in per-vehicle defs files and never delete a catalog DID because the CL250 does not serve it. Senior thesis → GitHub org `moto-platform` (12 platform repos + moto-workspace, **public** — D-033; never commit keys, real GPS/ride data or personal data). The user writes in Turkish. Reply in Turkish, but write every project artifact (code, comments, docs, commits) in English.
 
 ### Where things are
 
@@ -96,6 +100,7 @@ SDV-architecture diagnostics / telemetry / ADAS platform for motorcycles (first 
 | `moto-server` | Raspi (edge) + remote, VPS-ready (D-077) | Python (FastAPI) | Ingestion, storage, MDF4/Parquet, OTA packages |
 | `moto-ml` | Offline | Python | Training only |
 | `moto-mobile` | Phone | Flutter (D-022) | Loosely coupled companion |
+| `moto-analyzer` | Host (browser, later Tauri desktop) | TypeScript/React, Rust HAL later (D-081) | CAN analyzer for both buses; listen-only adapters, never transmits on a vehicle bus |
 | `moto-workspace` | — | — | Manifest, setup script, shared Claude agents/skills (source of truth) |
 | `HondaCl250_Telemetry` | — | archived | Read-only legacy reference (verified CL250 CAN/UDS code). Never modify it; extract facts per D-023 |
 
