@@ -1108,6 +1108,12 @@ bool HondaCANModule::onDtcSingleFrame(const CanFrame& f, unsigned long now) {
     if (!positive && !_dtc.matchesNegative(msg, len)) {
         return false;
     }
+    if (!positive && !_dtcLocked && msg[2] == UDS_NRC_RESPONSE_PENDING) {
+        // E-21 MINOR-1: NRC 0x78 is not an answer. It must not lock the run (a fallback-ID
+        // node's 7F 19 78 would otherwise shut out the real ECU's count); the run stays
+        // unlocked and waits for the real answer within the base timeout (no extension).
+        return true;
+    }
     if (!acceptDtcAnswerFrom(f)) {
         return true; // the other addressing (or after a First Frame of ours): ignored
     }
@@ -1297,7 +1303,13 @@ void HondaCANModule::sendPendingFlowControl(unsigned long now) {
     _fcPending = false;
     if (!segmentedRequestPending()) {
         // The request was resolved meanwhile: no FC, so the yaml quiet time (round-2 MAJOR-B).
+        // E-21 NIT: no trigger is known; if one shows up it is an FF we did not answer, so
+        // 0x19 is off for the epoch like every other quiet time caused by a 0x19 answer.
         holdTx(now);
+        if (_fcPendingFrame.dlc > 2 &&
+            _fcPendingFrame.data[2] == (uint8_t)(UDS_SID_READ_DTC_INFORMATION + UDS_POSITIVE_RESPONSE_OFFSET)) {
+            _dtc.haltAfterAnswer(DtcSnapshot::Halt::BOTH_IDS);
+        }
         return;
     }
     const uint16_t announced = IsoTpReceiver::firstFrameLength(_fcPendingFrame);
