@@ -612,6 +612,133 @@ static size_t gapsOver(const Rig& r, unsigned long ms) {
     return n;
 }
 
+// E-21 MINOR-1: NRC 0x78 is not an answer. The fallback node's 7F 19 78 must not lock the run;
+// the primary ID's positive count then locks it and the run goes on.
+void test_nrc_0x78_from_the_fallback_id_does_not_lock_the_run(void) {
+    Rig r;
+    r.ecu.bothIds = true;
+    r.ecu.count = countOf(1);
+    r.ecu.list = listOf(1);
+    r.ecu.snapshot = recordOf(0x04, 0);
+    r.ecu.extData = recordOf(0x06, 0);
+    r.ecu.fbCount = {0x7F, UDS_SID_READ_DTC_INFORMATION, UDS_NRC_RESPONSE_PENDING};
+    r.ecu.dtcLatencyMs = 20; // the primary answers after the fallback's 0x78
+    TEST_ASSERT_TRUE(r.start());
+    r.runFor(5000, 1);
+    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NONE, r.module.dtcSnapshot().halt());
+    TEST_ASSERT_EQUAL(1, countLines("ended: done (1 DTCs, 4 requests)"));
+    TEST_ASSERT_EQUAL_size_t(4, r.ecu.dtcRequests.size());
+    TEST_ASSERT_EQUAL_size_t(1, r.ecu.fallbackDtcRequests); // the count only
+    TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
+}
+
+// A 7F 19 78 alone (no real answer) times out as before, from either ID.
+void test_nrc_0x78_alone_from_the_fallback_id_times_out(void) {
+    Rig r;
+    r.ecu.bothIds = true;
+    r.ecu.count.clear(); // the primary says nothing
+    r.ecu.fbCount = {0x7F, UDS_SID_READ_DTC_INFORMATION, UDS_NRC_RESPONSE_PENDING};
+    TEST_ASSERT_TRUE(r.start());
+    r.runFor(5000, 1);
+    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NO_ANSWER, r.module.dtcSnapshot().halt());
+    TEST_ASSERT_EQUAL(1, countLines("ended: no answer"));
+    TEST_ASSERT_EQUAL_size_t(1, r.ecu.dtcRequests.size());
+}
+
+// E-21 MINOR-2: the other ID's Single Frame while our First Frame waits for its FC (same
+// drain) or is being received: 0x19 is off for the epoch, the reception still completes, no
+// quiet time.
+void test_other_id_single_frame_during_our_first_frame_halts_without_a_hold(void) {
+    const unsigned long stepMs[] = {5, 1};
+    const unsigned long delays[] = {0, 5}; // 5 ms steps: same drain as the FF; 1 ms: during the CFs
+    for (size_t i = 0; i < 2; i++) {
+        g_lines.clear();
+        Rig r;
+        r.ecu.bothIds = true;
+        r.ecu.count = {0x59, 0x01, 0xFF, UDS_DTC_FORMAT_ISO_14229_1, 0x00, 0x08, 0, 0, 0, 0, 0, 0};
+        r.ecu.fbCount = countOf(8); // a Single Frame
+        r.ecu.fbDelayMs = delays[i];
+        r.ecu.cfGapMs = 40;
+        TEST_ASSERT_TRUE(r.start());
+        r.runFor(5000, stepMs[i]);
+        TEST_ASSERT_EQUAL(DtcSnapshot::Halt::BOTH_IDS, r.module.dtcSnapshot().halt());
+        TEST_ASSERT_EQUAL_size_t(1, r.fcCount());
+        TEST_ASSERT_EQUAL_size_t(1, r.ecu.dtcRequests.size());
+        TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
+        TEST_ASSERT_EQUAL(1, countLines("0x19 0x01 answer"));
+    }
+}
+
+// E-21 MINOR-2: a First Frame from the locked-out ID at a later step (while the list is in
+// flight): no FC, one quiet time (a gap >= 1500 ms), then 0x19 is off for the epoch.
+void test_first_frame_from_the_locked_out_id_at_a_later_step_costs_one_hold(void) {
+    Rig r;
+    r.ecu.bothIds = true;
+    r.ecu.count = countOf(1);
+    r.ecu.list = listOf(1);
+    r.ecu.snapshot = recordOf(0x04, 0);
+    r.ecu.extData = recordOf(0x06, 0);
+    r.ecu.fbDelayMs = 30; // the fallback's count is ignored (locked to the primary)
+    r.ecu.dtcLatencyMs = 30;
+    TEST_ASSERT_TRUE(r.start());
+    while (r.ecu.dtcRequests.size() < 2 && r.t < 5000) {
+        r.runFor(1, 1);
+    }
+    TEST_ASSERT_EQUAL_size_t(2, r.ecu.dtcRequests.size()); // the list is in flight
+    r.ecu.answer(r.bus, listOf(3), 5, VEHICLE_CL250_FALLBACK_RESPONSE_ID); // a First Frame
+    r.runFor(5000, 1);
+    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::BOTH_IDS, r.module.dtcSnapshot().halt());
+    TEST_ASSERT_EQUAL_size_t(0, r.fcCount());
+    TEST_ASSERT_EQUAL_size_t(1, gapsOver(r, 1500));
+    TEST_ASSERT_EQUAL(1, countLines("0x19 0x02 answer"));
+}
+
+// E-21 M1: the LOCKED path. The count locks the run to the primary ID; the list then gets
+// 7F 19 78 from it: counted as an NRC, WAIT, no extension. It times out at the base timeout,
+// 0x19 is off for the epoch and the next request is not held longer.
+void test_nrc_0x78_from_the_locked_id_is_no_extension(void) {
+    Rig r;
+    r.ecu.count = countOf(1);
+    r.ecu.list = {0x7F, UDS_SID_READ_DTC_INFORMATION, UDS_NRC_RESPONSE_PENDING};
+    TEST_ASSERT_TRUE(r.start());
+    r.runFor(5000, 1);
+    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NO_ANSWER, r.module.dtcSnapshot().halt());
+    TEST_ASSERT_EQUAL_size_t(2, r.ecu.dtcRequests.size()); // the count and the list, nothing after
+    size_t listIdx = r.sent.size();
+    for (size_t i = 0; i < r.sent.size(); i++) {
+        if (r.sent[i].second.data[1] == UDS_SID_READ_DTC_INFORMATION &&
+            r.sent[i].second.data[2] == UDS_READ_DTC_REPORT_DTC_BY_STATUS_MASK) {
+            listIdx = i;
+        }
+    }
+    TEST_ASSERT_TRUE(listIdx + 1 < r.sent.size());
+    TEST_ASSERT_TRUE(r.sent[listIdx + 1].first - r.sent[listIdx].first <=
+                     VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + 2);
+    TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
+}
+
+// E-21 N1 (accepted trade-off): the primary ID sends 7F 19 78 first, then the fallback ID
+// answers the count positively. The first ID that answers locks the run, so it locks to the
+// fallback; the rest goes to its request ID only (read services, bounds unchanged).
+void test_primary_0x78_then_fallback_positive_count_locks_to_the_fallback(void) {
+    Rig r;
+    r.ecu.bothIds = true;
+    r.ecu.count = {0x7F, UDS_SID_READ_DTC_INFORMATION, UDS_NRC_RESPONSE_PENDING};
+    r.ecu.fbCount = countOf(1);
+    r.ecu.list = listOf(1);
+    r.ecu.snapshot = recordOf(0x04, 0);
+    r.ecu.extData = recordOf(0x06, 0);
+    r.ecu.fbDelayMs = 20;
+    TEST_ASSERT_TRUE(r.start());
+    r.runFor(5000, 1);
+    TEST_ASSERT_EQUAL(DtcSnapshot::Halt::NONE, r.module.dtcSnapshot().halt());
+    TEST_ASSERT_EQUAL_size_t(1, r.ecu.dtcRequests.size());         // the count, primary ID only
+    TEST_ASSERT_EQUAL_size_t(4, r.ecu.fallbackDtcRequests);        // count + the rest, fallback ID
+    TEST_ASSERT_EQUAL(1, countLines("ended: done (1 DTCs, 4 requests)"));
+    TEST_ASSERT_EQUAL_size_t(0, gapsOver(r, 1500));
+    TEST_ASSERT_EQUAL_UINT32(0, r.module.blockedFrameCount());
+}
+
 // Round-2 MAJOR-A/B: both addressings answer the count; the run is locked to the first
 // answering ID, the rest goes there only, so no quiet time and no halt at any delay.
 void test_both_ids_the_run_is_locked_to_the_first_answering_id(void) {
@@ -814,6 +941,12 @@ int main(int, char**) {
     RUN_TEST(test_nrc_0x11_0x12_0x31_mean_not_served_until_the_next_epoch);
     RUN_TEST(test_nrc_0x7f_requests_the_session_and_resends_then_halts_on_the_second);
     RUN_TEST(test_nrc_0x78_is_not_an_extension);
+    RUN_TEST(test_nrc_0x78_from_the_fallback_id_does_not_lock_the_run);
+    RUN_TEST(test_nrc_0x78_alone_from_the_fallback_id_times_out);
+    RUN_TEST(test_nrc_0x78_from_the_locked_id_is_no_extension);
+    RUN_TEST(test_primary_0x78_then_fallback_positive_count_locks_to_the_fallback);
+    RUN_TEST(test_other_id_single_frame_during_our_first_frame_halts_without_a_hold);
+    RUN_TEST(test_first_frame_from_the_locked_out_id_at_a_later_step_costs_one_hold);
     RUN_TEST(test_dtc_request_holds_the_slot_for_the_base_timeout_only);
     RUN_TEST(test_first_frame_above_max_ff_dl_is_refused_and_halts_the_epoch);
     RUN_TEST(test_aborted_reception_halts_the_epoch_and_starts_the_quiet_time);
