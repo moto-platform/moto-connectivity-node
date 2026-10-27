@@ -5,9 +5,9 @@
 #include <stdint.h>
 
 #include "GpsFix.h"
-#include "ble_schema.h" // generated: external/moto-vehicle-defs/gen/c/conn/ (D-061)
+#include "ble_schema.h" // generated: external/vehicle-defs/gen/c/conn/ (D-061)
 
-// GPS block notification (moto-vehicle-defs ble/ble_schema.json `gpsBlock`, D-060, D-061);
+// GPS block notification (vehicle-defs ble/ble_schema.json `gpsBlock`, D-060, D-061);
 // sizes, offsets, scales and flag bits come from the generated ble_schema.h. Little-endian,
 // written byte by byte (no struct punning), 26 bytes:
 //   version u8, seq u8, deviceTimeMs u32, groundSpeed i32, headingOfMotion i32,

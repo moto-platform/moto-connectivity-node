@@ -11,7 +11,7 @@
 // GATT-server-side and independent of the ATT PROPERTY_* bits.
 #include <BLESecurity.h>
 
-// GATT UUIDs and the MTU the central requests come from moto-vehicle-defs (ble_schema.h,
+// GATT UUIDs and the MTU the central requests come from vehicle-defs (ble_schema.h,
 // D-061); the Device Information Service below is a Bluetooth SIG assigned number.
 #define SERVICE_UUID            BLE_GATT_SERVICE_UUID
 #define CHARACTERISTIC_UUID_TX  BLE_GATT_TELEMETRY_CHAR_UUID
@@ -40,7 +40,7 @@ GpsErrorCounters gpsErrorCounters(const GpsStatus& gps) {
 
 BLEServerModule::BLEServerModule(ImuRing* imuRing) : _imuRing(imuRing) {}
 
-// BLE stack task context. The central starts the MTU exchange (moto-mobile requests
+// BLE stack task context. The central starts the MTU exchange (vehicle-mobile requests
 // 185); until then, and for every new connection, the ATT default of 23 applies.
 void BLEServerModule::gattsEventHandler(esp_gatts_cb_event_t event, esp_gatt_if_t gattsIf,
                                         esp_ble_gatts_cb_param_t* param) {
@@ -78,7 +78,7 @@ bool BLEServerModule::begin() {
     // is to stop opportunistic/unpaired writes from strangers in BLE range, not to defend
     // against an active attacker during the one-time pairing handshake.
     //
-    // UX note: because bonding is now mandatory, the phone app (moto-mobile) will see an
+    // UX note: because bonding is now mandatory, the phone app (vehicle-mobile) will see an
     // OS-level "Pair with Honda-CL250-Telemetry?" prompt on first connection. No mobile
     // code change is required -- the OS Bluetooth stack triggers this pairing dialog
     // automatically in response to the peripheral's security requirements.

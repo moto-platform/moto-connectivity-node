@@ -6,7 +6,7 @@
 #include "TesterLatch.h"
 #include "TesterStatsTracker.h"
 #include "hal/CanRxQueue.h" // also defaults CONN_DISCOVERY_PROBE to 0
-#include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+#include "vehicle_cl250.h" // generated: external/vehicle-defs/gen/c/conn/
 #include "DtcSnapshot.h"
 #include "IsoTpReceiver.h"
 #if CONN_DISCOVERY_PROBE
@@ -17,11 +17,11 @@
  * @brief UDS tester for the Honda CL250 engine ECU over a generic ICanBus.
  * Sends every request on the 29-bit primary ID and the 11-bit fallback ID.
  *
- * This node is the TEMPORARY sole vehicle-bus tester (D-023). Once moto-rt-core polls
+ * This node is the TEMPORARY sole vehicle-bus tester (D-023). Once vehicle-rt-core polls
  * the ECU, this poller must be disabled: two testers are never allowed (D-021).
  *
  * All IDs, DIDs, formulas and timings come from the generated table
- * (moto-vehicle-defs uds/vehicle_cl250.yaml). Every frame goes through
+ * (vehicle-defs uds/vehicle_cl250.yaml). Every frame goes through
  * vehicle_cl250_frame_allowed() before it is sent, so only the D-020 service allow-list
  * can ever reach the vehicle bus.
  *

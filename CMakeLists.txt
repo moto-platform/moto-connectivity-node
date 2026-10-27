@@ -4,4 +4,4 @@ cmake_minimum_required(VERSION 3.16.0)
 # (esp_app_get_description()->version). Bump it in the release PR.
 set(PROJECT_VER "0.4.0")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(moto-connectivity-node)
+project(vehicle-connectivity-node)

@@ -4,17 +4,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "ble_schema.h"    // generated: external/moto-vehicle-defs/gen/c/conn/ (D-061)
+#include "ble_schema.h"    // generated: external/vehicle-defs/gen/c/conn/ (D-061)
 #include "vehicle_cl250.h" // generated: the tester's DID table
 
-// Vehicle-signal block notification (moto-vehicle-defs ble/ble_schema.json
+// Vehicle-signal block notification (vehicle-defs ble/ble_schema.json
 // `vehicleSignalBlock`, D-066 item 4): one record per DID of the generated DID table, keyed by
 // DID, so a DID promoted from the candidate catalog flows without a change here. Little-endian,
 // written byte by byte (no struct punning):
 //   header (10): version u8, seq u8, deviceTimeMs u32, totalRecords u8, firstRecord u8,
 //                recordCount u8, reserved u8
 //   record (9):  did u16, state u8, ageMs u16, raw u32
-// raw = the DID's data bytes as an unsigned big-endian number; moto-mobile and moto-server
+// raw = the DID's data bytes as an unsigned big-endian number; vehicle-mobile and vehicle-server
 // decode it with the generated vehicle catalog. Nothing here touches the bus: the tester only
 // writes VehicleSignalRecord, BLEServerModule only reads it (both on the loop task).
 

@@ -33,7 +33,7 @@ const unsigned long kDtcSlotMaxMs = VEHICLE_CL250_RESPONSE_TIMEOUT_BASE_MS + VEH
 
 // Local policy of this TEMPORARY tester, not a vehicle definition: after this many
 // bus-off events the driver is stopped for good (until reboot) instead of rejoining the
-// OEM bus forever and putting error frames on it. Candidate for moto-vehicle-defs.
+// OEM bus forever and putting error frames on it. Candidate for vehicle-defs.
 const uint32_t kMaxBusOffEvents = 5;
 
 // D-068 item 2 (safety-reviewer MAJOR-2): NRC 0x31 on this many separate reads, with no
@@ -42,7 +42,7 @@ const uint8_t kStopNrcReads = 2;
 
 // Local policy of this TEMPORARY tester (Q-018): listen-only for this long after begin()
 // before the first request, so a tester that is already polling the ECU is seen before
-// this node ever transmits (D-021). Candidate for moto-vehicle-defs, like the one above.
+// this node ever transmits (D-021). Candidate for vehicle-defs, like the one above.
 const unsigned long kListenOnlyWindowMs = 2000;
 
 // Bounded RX drain: at most this many frames per pass. Twice the TWAI RX queue depth
@@ -810,7 +810,7 @@ HondaCANModule::DrainResult HondaCANModule::drainRx(SystemState& state, unsigned
         // Consecutive Frame, 0x3X = Flow Control. A First Frame's data[1] is part of the
         // multi-frame length, not a SID, so parsing it as one would silently corrupt
         // SystemState. Multi-frame reassembly is only for the 0x19 answers (D-080) and the
-        // D-059 probe's scan (below); moto-rt-core owns the long-term client (D-023), and
+        // D-059 probe's scan (below); vehicle-rt-core owns the long-term client (D-023), and
         // every DID used today fits in a Single Frame.
         uint8_t isoTpFrameType = (rxMsg.data[0] >> 4) & 0x0F;
         // D-059/D-080: segmented answers (an FC only for the 0x19 or scan request in flight).

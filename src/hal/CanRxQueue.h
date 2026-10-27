@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+#include "vehicle_cl250.h" // generated: external/vehicle-defs/gen/c/conn/
 
 #ifndef CONN_DISCOVERY_PROBE
 #define CONN_DISCOVERY_PROBE 0

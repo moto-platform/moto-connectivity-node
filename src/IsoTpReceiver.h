@@ -5,13 +5,13 @@
 #include <string.h>
 
 #include "hal/CanFrame.h"
-#include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+#include "vehicle_cl250.h" // generated: external/vehicle-defs/gen/c/conn/
 
 /**
  * @brief D-059 item 3 / D-080: reassembly of ONE segmented ISO-TP answer (ISO 15765-2 First Frame
  * + Consecutive Frames) into a static buffer of VEHICLE_CL250_MAX_FF_DL bytes. Used for the
  * D-080 0x19 answers in every tester build and for the D-059 discovery scan in the probe env.
- * TEMPORARY, like conn's tester (D-023): moto-rt-core owns the long-term ISO-TP client.
+ * TEMPORARY, like conn's tester (D-023): vehicle-rt-core owns the long-term ISO-TP client.
  *
  * Pure logic, no CAN access and no transmission: HondaCANModule decides whether a First
  * Frame gets the one FC.CTS, sends it through the D-020 frame gate and only then calls

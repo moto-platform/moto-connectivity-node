@@ -5,7 +5,7 @@
 
 #include "GpsFix.h"
 #include "VehicleSignalBlock.h"
-#include "vehicle_cl250.h" // generated: external/moto-vehicle-defs/gen/c/conn/
+#include "vehicle_cl250.h" // generated: external/vehicle-defs/gen/c/conn/
 
 // G0.3 -- Data staleness tracking.
 // Each CAN signal carries the millis() timestamp of its last producer write,
@@ -19,7 +19,7 @@ inline bool isStale(uint32_t lastUpdateMs, uint32_t thresholdMs = STALE_THRESHOL
 }
 
 // Staleness threshold for a polled DID: the generated stale_after_ms of that DID
-// (moto-vehicle-defs, 3 x poll period, D-025/D-029). The legacy code used one 500 ms
+// (vehicle-defs, 3 x poll period, D-025/D-029). The legacy code used one 500 ms
 // value for everything (docs/legacy-telemetry-notes.md).
 inline uint32_t didStaleThresholdMs(uint8_t didIndex) {
     return vehicle_cl250_dids[didIndex].stale_after_ms;
@@ -58,7 +58,7 @@ struct TelematicsData {
 };
 
 // Vehicle-bus CAN/tester health, written by the CAN producer (HondaCANModule) and sent
-// in BLE telemetry v4 (moto-vehicle-defs ble/ble_schema.json, D-061). The numeric values of
+// in BLE telemetry v4 (vehicle-defs ble/ble_schema.json, D-061). The numeric values of
 // CanHealthState and the CAN_HEALTH_FLAG_* bits are part of that schema (static_assert in
 // BLETelemetryPacket.h).
 enum class CanHealthState : uint8_t {

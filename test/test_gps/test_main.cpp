@@ -597,7 +597,7 @@ void test_gps_block_from_a_parsed_nav_pvt_has_no_position() {
 
 namespace {
 
-const uint16_t kRoomy = 182u;  // blePayloadLimit(185), the MTU moto-mobile requests
+const uint16_t kRoomy = 182u;  // blePayloadLimit(185), the MTU vehicle-mobile requests
 const uint16_t kAttDefault = 20u; // blePayloadLimit(23), every connection's first MTU
 
 GpsFix trackerFix(uint8_t fixType = 3u, uint8_t gnssFixOk = 1u) {

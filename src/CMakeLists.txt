@@ -1,7 +1,7 @@
-# Application component: everything under src/ plus the generated moto-vehicle-defs
+# Application component: everything under src/ plus the generated vehicle-defs
 # code for this node (only the CL250 DID table is used today; this node is not on the
-# platform bus yet, so platform.c / moto_e2e.c are not linked).
-set(DEFS_GEN ${CMAKE_SOURCE_DIR}/external/moto-vehicle-defs/gen/c/conn)
+# platform bus yet, so platform.c / vehicle_e2e.c are not linked).
+set(DEFS_GEN ${CMAKE_SOURCE_DIR}/external/vehicle-defs/gen/c/conn)
 if(NOT EXISTS ${DEFS_GEN}/vehicle_cl250.c)
     message(FATAL_ERROR "Missing ${DEFS_GEN}. Run: git submodule update --init")
 endif()
