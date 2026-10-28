@@ -216,48 +216,17 @@ void BLEServerModule::onDisconnect(BLEServer* pServer) {
 void BLEServerModule::onWrite(BLECharacteristic* pCharacteristic) {
     // Runs on the BLE stack task -- parse into a local, stack-only event and enqueue it.
     // SystemState itself is only ever written from update() on the main loop task.
-    std::string rxValue = pCharacteristic->getValue();
-    if (rxValue.length() == 0 || !_telematicsQueue) {
+    // E-25 (3): the ATT value is parsed in place (fixed-size, no heap, no std::string,
+    // no sscanf); getLength() bounds every read, the value has no NUL terminator.
+    if (!_telematicsQueue || pCharacteristic == nullptr) {
         return;
     }
 
-    const char* data = rxValue.c_str();
     TelematicsEvent evt;
-    evt.type = TelematicsEventType::DATA;
-
-    const char* songPtr = strstr(data, "SONG:");
-    if (songPtr) {
-        sscanf(songPtr, "SONG:%31[^|]", evt.songTitle);
-        evt.hasSong = true;
+    if (!parseTelematicsWrite(pCharacteristic->getData(), pCharacteristic->getLength(), evt)) {
+        return; // empty, malformed, all fields out of range or the write was too long
     }
-
-    const char* artistPtr = strstr(data, "ARTIST:");
-    if (artistPtr) {
-        sscanf(artistPtr, "ARTIST:%31[^|]", evt.artistName);
-        evt.hasArtist = true;
-    }
-
-    const char* distPtr = strstr(data, "DIST:");
-    if (distPtr) {
-        int distVal = 0;
-        if (sscanf(distPtr, "DIST:%d", &distVal) == 1) {
-            evt.navDistance = (uint16_t)distVal;
-            evt.hasDistance = true;
-        }
-    }
-
-    const char* iconPtr = strstr(data, "ICON:");
-    if (iconPtr) {
-        int iconVal = 0;
-        if (sscanf(iconPtr, "ICON:%d", &iconVal) == 1) {
-            evt.navIconID = (uint8_t)iconVal;
-            evt.hasIcon = true;
-        }
-    }
-
-    if (evt.hasSong || evt.hasArtist || evt.hasDistance || evt.hasIcon) {
-        xQueueSend(_telematicsQueue, &evt, 0);
-    }
+    xQueueSend(_telematicsQueue, &evt, 0);
 }
 
 void BLEServerModule::update(SystemState& state) {
