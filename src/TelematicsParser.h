@@ -9,7 +9,10 @@
 // builds on the host), no heap, no std::string and no sscanf. It never reads past `len`;
 // the write is not NUL-terminated.
 
-// Longest accepted telematics write. A longer write is dropped as a whole.
+// Longest accepted telematics write. A longer write is dropped as a whole. The largest
+// valid write is about 100 bytes ("SONG:" + 31, "|ARTIST:" + 31, "|DIST:65535",
+// "|ICON:255"); 160 leaves room for the phone adding a field without making the
+// bound a scan cost (E-25 (3), conn#39).
 constexpr size_t kTelematicsMaxWrite = 160;
 
 enum class TelematicsEventType : uint8_t { CONNECTION, DATA };
