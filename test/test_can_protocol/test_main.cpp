@@ -14,7 +14,7 @@
 // is completely unmodified for this to work; it only depends on ICanBus + the two
 // stubbed Arduino symbols (Serial, millis/delay) already provided for test_native.
 #include "../../src/HondaCANModule.cpp"
-#include "../../external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.c"
+#include "../../external/vehicle-defs/gen/c/conn/vehicle_cl250.c"
 
 // G5.1 -- Native tests for HondaCANModule's actual UDS protocol logic (request state
 // machine, NRC handling, ISO-TP frame checking, bus-off recovery, ECU-presence
@@ -407,7 +407,7 @@ void test_all_dids_decode_with_generated_formulas(void) {
 
 void test_short_battery_response_is_dropped(void) {
     // The legacy A/10 fallback for short VEHICLE_CL250_DID_BATTERY_VOLTAGE responses was not carried over
-    // (docs/legacy-telemetry-notes.md in moto-vehicle-defs): a one-byte answer is dropped.
+    // (docs/legacy-telemetry-notes.md in vehicle-defs): a one-byte answer is dropped.
     MockCanBus bus;
     MockTesterLatchStore latchStore;
     HondaCANModule module(bus, latchStore);

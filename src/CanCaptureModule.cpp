@@ -14,7 +14,7 @@ void CanCaptureModule::SerialSink::write(const char* data, size_t len) {
 bool CanCaptureModule::begin() {
     _started = _rx.begin();
     if (_started) {
-        Serial.println("# moto-connectivity-node CAN capture: TWAI listen-only, 500 kbps, accept-all.");
+        Serial.println("# vehicle-connectivity-node CAN capture: TWAI listen-only, 500 kbps, accept-all.");
         Serial.println("# F,<t_us>,<id hex>,<S|X>,<dlc>,<data hex> | S,... summary every 10 s | FINAL,... at 300 s");
         _lastMicros32 = (uint32_t)micros();
     }

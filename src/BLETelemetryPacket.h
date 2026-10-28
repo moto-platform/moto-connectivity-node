@@ -5,12 +5,12 @@
 #include <stddef.h>
 
 #include "SystemState.h"
-#include "ble_schema.h" // generated: external/moto-vehicle-defs/gen/c/conn/ (D-061)
+#include "ble_schema.h" // generated: external/vehicle-defs/gen/c/conn/ (D-061)
 
-// The telemetry layouts are defined in moto-vehicle-defs ble/ble_schema.json (D-061) and
+// The telemetry layouts are defined in vehicle-defs ble/ble_schema.json (D-061) and
 // generated into ble_schema.h as offset/size macros. The packed structs below static_assert
 // every field against those macros, so a layout change is a defs change (version bump) that
-// fails the build here until the structs follow. moto-mobile and moto-server use the Python
+// fails the build here until the structs follow. vehicle-mobile and vehicle-server use the Python
 // and Dart outputs generated from the same file.
 //
 // Version 4 (D-058) is the normal packet: version 3 (node clock, per-signal ages, CAN/tester

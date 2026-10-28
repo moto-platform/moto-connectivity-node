@@ -7,7 +7,7 @@
 
 #include "SystemState.h"
 #include "IModule.h"
-// D-021/D-023: while no moto-rt-core exists, this node is the TEMPORARY sole tester on
+// D-021/D-023: while no vehicle-rt-core exists, this node is the TEMPORARY sole tester on
 // the vehicle bus (its TWAI is wired to the CL250 DLC). CONN_VEHICLE_TESTER selects it:
 //   1 = poll the ECU (only while rt-core does not poll; two testers are never allowed)
 //   0 = poller off: the TWAI driver is never installed, so this node transmits nothing

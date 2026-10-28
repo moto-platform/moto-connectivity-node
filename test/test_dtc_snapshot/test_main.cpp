@@ -16,7 +16,7 @@
 #include <vector>
 
 #include "../../src/HondaCANModule.cpp"
-#include "../../external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.c"
+#include "../../external/vehicle-defs/gen/c/conn/vehicle_cl250.c"
 
 typedef std::vector<uint8_t> Bytes;
 

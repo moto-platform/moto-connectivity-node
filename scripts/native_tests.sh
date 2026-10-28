@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UNITY_TAG="v2.6.0"
 CACHE="$ROOT/.cache"
 UNITY="$CACHE/unity-$UNITY_TAG"
-GEN="$ROOT/external/moto-vehicle-defs/gen/c/conn"
+GEN="$ROOT/external/vehicle-defs/gen/c/conn"
 
 if [ ! -f "$GEN/vehicle_cl250.h" ]; then
     echo "missing $GEN -- run: git submodule update --init" >&2

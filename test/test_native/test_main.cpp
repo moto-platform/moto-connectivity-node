@@ -10,7 +10,7 @@
 // [env:native] builds no src/ and no library, so this suite pulls in the implementation
 // files it needs as one translation unit (same pattern as test/test_can_protocol).
 #include "../../src/TelemetryJson.cpp"
-#include "../../external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.c"
+#include "../../external/vehicle-defs/gen/c/conn/vehicle_cl250.c"
 
 // G5.1/G5.2 -- Native (host-compiled, no ESP32/device needed) tests for the
 // hardware-independent pieces of the telemetry stack: SystemState's staleness

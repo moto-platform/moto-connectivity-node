@@ -9,7 +9,7 @@
 // [env:native] builds no src/, so the implementation files are included directly.
 #include "../../src/CanCaptureModule.h"
 #include "../../src/CanCaptureModule.cpp"
-#include "../../external/moto-vehicle-defs/gen/c/conn/vehicle_cl250.c"
+#include "../../external/vehicle-defs/gen/c/conn/vehicle_cl250.c"
 
 // Compile-level guarantee: the capture code only ever sees the receive-only interface. If
 // anything in CanCaptureModule.h / CanCaptureCore.h pulled in ICanBus (which can transmit),

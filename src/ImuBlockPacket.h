@@ -7,7 +7,7 @@
 #include "BLETelemetryPacket.h" // blePayloadLimit(), ble_schema.h
 #include "ImuRingBuffer.h"
 
-// IMU block notification (moto-vehicle-defs ble/ble_schema.json `imuBlock`, D-032, D-061);
+// IMU block notification (vehicle-defs ble/ble_schema.json `imuBlock`, D-032, D-061);
 // sizes and offsets come from the generated ble_schema.h. Little-endian, written byte by
 // byte (no struct punning):
 //   header (12): version u8, seq u8, deviceTimeMs u32, firstSampleIndex u16,

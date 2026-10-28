@@ -1,10 +1,10 @@
 ---
 name: feature-module
-description: Add or substantially change a firmware feature module (src/features/<name>/) in moto-rt-core, moto-safety-node, moto-io-node or the HIL simulator, following the platform's layering, memory, test and safety rules. Use for requests like "implement ISO-TP", "add the cornering EKF", "add the blind-spot filter".
+description: Add or substantially change a firmware feature module (src/features/<name>/) in vehicle-rt-core, vehicle-safety-node, vehicle-io-node or the HIL simulator, following the platform's layering, memory, test and safety rules. Use for requests like "implement ISO-TP", "add the cornering EKF", "add the blind-spot filter".
 argument-hint: <repo> <feature-name>
 ---
 
-<!-- Synced from moto-workspace/.claude/skills/feature-module/SKILL.md by scripts/sync_claude.py. Do not edit here; edit the source and re-run the sync. -->
+<!-- Synced from vehicle-workspace/.claude/skills/feature-module/SKILL.md by scripts/sync_claude.py. Do not edit here; edit the source and re-run the sync. -->
 
 # Firmware feature module
 
@@ -34,7 +34,7 @@ tests/host/test_<name>.c
 
 - Unity tests for the `_core` logic: nominal cases, boundary values, invalid/missing input, E2E faults (bad CRC, frozen counter, timeout) where applicable, and state-machine transitions.
 - Name tests after requirement IDs where they exist (`test_REQ_UDS_012_...`) for the traceability matrix (Ç8).
-- Propose one HIL scenario (name + expected measurable result) for `moto-hil-bench/scenarios/`. Write it only if the host schema exists.
+- Propose one HIL scenario (name + expected measurable result) for `vehicle-hil-bench/scenarios/`. Write it only if the host schema exists.
 
 ## 4. Integrate
 

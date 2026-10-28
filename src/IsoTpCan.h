@@ -6,7 +6,7 @@
 // Transport-layer constants from ISO 11898 (CAN) and ISO 15765-2 (ISO-TP) that are the
 // same for every ECU. They are NOT vehicle definitions: vehicle IDs, DIDs, formulas,
 // timings and the D-020 allow-list come only from the generated vehicle_cl250.h, and the
-// UDS codes from the generated uds_iso14229.h (D-040), both from moto-vehicle-defs.
+// UDS codes from the generated uds_iso14229.h (D-040), both from vehicle-defs.
 // Whatever is built from these constants still has to pass vehicle_cl250_frame_allowed().
 
 namespace isotp {
