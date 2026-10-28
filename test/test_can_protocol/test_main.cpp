@@ -1987,15 +1987,19 @@ static CanFrame makeAnswerFor(uint16_t did) {
 
 // Steps 1 ms at a time up to relative time `until`; a DID read is answered on the next pass
 // as `ecu` says. Returns the largest gap between two requests of `watch` (0 = no watch).
+// `maxTxPerPass`, if given, is raised to the most frames one update() pass transmitted.
 static unsigned long runEcu(HondaCANModule& module, MockCanBus& bus, SystemState& state,
                             unsigned long& t, unsigned long until, EcuBehaviour ecu,
-                            uint16_t watch = 0) {
+                            uint16_t watch = 0, size_t* maxTxPerPass = nullptr) {
     unsigned long lastWatch = 0, maxGap = 0;
     while (t < until) {
         const size_t before = bus.txLog.size();
         t++;
         setClock(t);
         module.update(state);
+        if (maxTxPerPass != nullptr && bus.txLog.size() - before > *maxTxPerPass) {
+            *maxTxPerPass = bus.txLog.size() - before;
+        }
         uint16_t did = 0;
         if (!newDidRequest(bus, before, did)) continue;
         if (did == watch) {
@@ -2083,6 +2087,28 @@ static EcuReply ecuSilentOnStopDid(uint16_t did) {
     return did == gStopDid ? EcuReply::SILENT : EcuReply::ANSWER;
 }
 static EcuReply ecuSilent(uint16_t) { return EcuReply::SILENT; }
+
+// E-25 (4): TwaiCanBus::transmit waits up to 5 ms per frame when the TWAI TX queue is full
+// (an unacknowledged bus, e.g. the ECU powered off). The worst pass sends tester present and
+// a DID read, each on both request IDs: 4 frames, so up to 20 ms against client_step_max_ms
+// (10 ms). This pins the 4-frame bound the stall estimate in ISSUES E-25 (4) rests on.
+static const size_t kMaxTxFramesPerPass = 4;
+
+void test_e25_one_pass_sends_at_most_four_frames(void) {
+    for (int answering = 0; answering < 2; answering++) {
+        MockCanBus bus;
+        MockTesterLatchStore latchStore;
+        HondaCANModule module(bus, latchStore);
+        SystemState state;
+        startPolling(module, state);
+        unsigned long t = 0;
+        size_t maxTx = 0;
+        const EcuBehaviour ecu = answering ? ecuAnswersAll : ecuSilent;
+        if (answering) confirmSession(module, bus, state, t, ecu);
+        runEcu(module, bus, state, t, 60000, ecu, 0, &maxTx);
+        TEST_ASSERT_EQUAL_UINT32(kMaxTxFramesPerPass, maxTx);
+    }
+}
 
 void test_d068_nrc31_stops_an_unverified_did_until_the_next_stop_epoch(void) {
     MockCanBus bus;
@@ -3666,6 +3692,7 @@ int main(int, char**) {
     RUN_TEST(test_vehicle_signals_nrc_cleared_by_a_timeout_and_by_the_latch);
     RUN_TEST(test_vehicle_signals_quiet_window_nrc_then_answer_stays_valid);
     RUN_TEST(test_tester_stats_do_not_change_what_is_sent);
+    RUN_TEST(test_e25_one_pass_sends_at_most_four_frames);
     RUN_TEST(test_d068_table_puts_unverified_dids_after_the_verified_ones);
     RUN_TEST(test_d068_unverified_dids_wait_for_the_session_then_are_read_at_once);
     RUN_TEST(test_d068_nrc31_stops_an_unverified_did_until_the_next_stop_epoch);
