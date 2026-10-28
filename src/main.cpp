@@ -375,7 +375,7 @@ void setup() {
     delay(500);
 
     Serial.println("\n==================================================");
-    Serial.println("   MOTO-CONNECTIVITY-NODE (CL250 TELEMETRY) START  ");
+    Serial.println(" VEHICLE-CONNECTIVITY-NODE (CL250 TELEMETRY) START ");
     Serial.println("==================================================");
     Serial.printf(" [BOOT] Reset reason: %s\n", resetReasonName(esp_reset_reason()));
 
