@@ -6,10 +6,12 @@
 #include "../../src/ImuBlockPacket.h"
 #include "../../src/VehicleSignalBlock.h"
 #include "../../src/TelemetryJson.h"
+#include "../../src/TelematicsParser.h"
 
 // [env:native] builds no src/ and no library, so this suite pulls in the implementation
 // files it needs as one translation unit (same pattern as test/test_can_protocol).
 #include "../../src/TelemetryJson.cpp"
+#include "../../src/TelematicsParser.cpp"
 #include "../../external/vehicle-defs/gen/c/conn/vehicle_cl250.c"
 
 // G5.1/G5.2 -- Native (host-compiled, no ESP32/device needed) tests for the
@@ -814,6 +816,154 @@ void test_vsig_period_plan_pages_through_the_table(void) {
     TEST_ASSERT_EQUAL_UINT8(0, planVehicleSignalPeriod(200, 1).first[0]);
 }
 
+// ---------------------------------------------------------------------------
+// TelematicsParser (E-25 3) -- BLE telematics writes, no heap/sscanf/strstr
+// ---------------------------------------------------------------------------
+
+static TelematicsEvent parseTelematics(const char* text, bool& ok) {
+    TelematicsEvent evt;
+    ok = parseTelematicsWrite(reinterpret_cast<const uint8_t*>(text), strlen(text), evt);
+    return evt;
+}
+
+void test_telematics_parse_all_four_fields(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("SONG:Highway Star|ARTIST:Deep Purple|DIST:1234|ICON:7", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL(TelematicsEventType::DATA, evt.type);
+    TEST_ASSERT_TRUE(evt.hasSong);
+    TEST_ASSERT_EQUAL_STRING("Highway Star", evt.songTitle);
+    TEST_ASSERT_TRUE(evt.hasArtist);
+    TEST_ASSERT_EQUAL_STRING("Deep Purple", evt.artistName);
+    TEST_ASSERT_TRUE(evt.hasDistance);
+    TEST_ASSERT_EQUAL_UINT16(1234, evt.navDistance);
+    TEST_ASSERT_TRUE(evt.hasIcon);
+    TEST_ASSERT_EQUAL_UINT8(7, evt.navIconID);
+}
+
+void test_telematics_fields_may_come_in_any_order(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("ICON:3|DIST:7|ARTIST:A|SONG:B", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL_STRING("A", evt.artistName);
+    TEST_ASSERT_EQUAL_STRING("B", evt.songTitle);
+    TEST_ASSERT_EQUAL_UINT16(7, evt.navDistance);
+    TEST_ASSERT_EQUAL_UINT8(3, evt.navIconID);
+}
+
+void test_telematics_single_field_and_no_trailing_pipe(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("SONG:Yesterday", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasSong);
+    TEST_ASSERT_EQUAL_STRING("Yesterday", evt.songTitle);
+    TEST_ASSERT_FALSE(evt.hasArtist);
+    TEST_ASSERT_FALSE(evt.hasDistance);
+    TEST_ASSERT_FALSE(evt.hasIcon);
+}
+
+void test_telematics_empty_or_unknown_write_is_rejected(void) {
+    TelematicsEvent evt;
+    TEST_ASSERT_FALSE(parseTelematicsWrite(nullptr, 0, evt));
+    TEST_ASSERT_FALSE(parseTelematicsWrite(reinterpret_cast<const uint8_t*>(""), 0, evt));
+    bool ok = true;
+    evt = parseTelematics("FOO:bar", ok);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(evt.hasSong || evt.hasArtist || evt.hasDistance || evt.hasIcon);
+}
+
+void test_telematics_song_is_truncated_at_31_chars(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("SONG:1234567890123456789012345678901", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL_STRING("1234567890123456789012345678901", evt.songTitle);
+    TEST_ASSERT_EQUAL_UINT32(31, strlen(evt.songTitle));
+    evt = parseTelematics("SONG:1234567890123456789012345678901234567890", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL_STRING("1234567890123456789012345678901", evt.songTitle);
+    TEST_ASSERT_EQUAL_UINT32(31, strlen(evt.songTitle));
+}
+
+void test_telematics_dist_range_and_syntax(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("DIST:0", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasDistance);
+    TEST_ASSERT_EQUAL_UINT16(0, evt.navDistance);
+    evt = parseTelematics("DIST:65535", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasDistance);
+    TEST_ASSERT_EQUAL_UINT16(65535, evt.navDistance);
+    evt = parseTelematics("DIST:65536", ok);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(evt.hasDistance);
+    evt = parseTelematics("DIST:-1", ok);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(evt.hasDistance);
+    evt = parseTelematics("DIST:abc", ok);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(evt.hasDistance);
+    // sscanf("%d") stops at the first non-digit; the wire format keeps that behaviour.
+    evt = parseTelematics("DIST:12km", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasDistance);
+    TEST_ASSERT_EQUAL_UINT16(12, evt.navDistance);
+}
+
+void test_telematics_icon_range(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("ICON:255", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasIcon);
+    TEST_ASSERT_EQUAL_UINT8(255, evt.navIconID);
+    evt = parseTelematics("ICON:256", ok);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(evt.hasIcon);
+}
+
+void test_telematics_partial_write_does_not_touch_other_fields(void) {
+    bool ok = false;
+    TelematicsEvent evt = parseTelematics("DIST:42", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasDistance);
+    TEST_ASSERT_FALSE(evt.hasSong);
+    TEST_ASSERT_FALSE(evt.hasArtist);
+    TEST_ASSERT_FALSE(evt.hasIcon);
+    TEST_ASSERT_EQUAL_STRING("", evt.songTitle);
+    TEST_ASSERT_EQUAL_STRING("", evt.artistName);
+    // An empty text field still clears that field (the old code set the has flag on the
+    // key alone, with an empty buffer when sscanf matched nothing).
+    evt = parseTelematics("SONG:", ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(evt.hasSong);
+    TEST_ASSERT_EQUAL_STRING("", evt.songTitle);
+}
+
+void test_telematics_write_without_nul_terminator(void) {
+    uint8_t buf[32];
+    memcpy(buf, "SONG:Holiday", 12);
+    buf[12] = 'X'; // no NUL anywhere in [0, 13)
+    TelematicsEvent evt;
+    TEST_ASSERT_TRUE(parseTelematicsWrite(buf, 13, evt));
+    TEST_ASSERT_TRUE(evt.hasSong);
+    TEST_ASSERT_EQUAL_STRING("HolidayX", evt.songTitle);
+}
+
+void test_telematics_write_over_the_max_is_dropped(void) {
+    uint8_t buf[kTelematicsMaxWrite + 1];
+    memset(buf, 'A', sizeof(buf));
+    memcpy(buf, "SONG:x", 6);
+    TelematicsEvent evt;
+    TEST_ASSERT_EQUAL_UINT32(kTelematicsMaxWrite + 1, sizeof(buf));
+    TEST_ASSERT_FALSE(parseTelematicsWrite(buf, sizeof(buf), evt));
+    TEST_ASSERT_FALSE(evt.hasSong);
+    // A write exactly at the limit still parses.
+    memset(buf, 'A', sizeof(buf));
+    memcpy(buf, "SONG:x", 6);
+    TEST_ASSERT_TRUE(parseTelematicsWrite(buf, kTelematicsMaxWrite, evt));
+    TEST_ASSERT_TRUE(evt.hasSong);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_system_state_initial_values);
@@ -854,5 +1004,15 @@ int main(int, char**) {
     RUN_TEST(test_vsig_block_layout_matches_the_schema);
     RUN_TEST(test_vsig_block_refuses_bad_ranges_and_small_buffers);
     RUN_TEST(test_vsig_period_plan_pages_through_the_table);
+    RUN_TEST(test_telematics_parse_all_four_fields);
+    RUN_TEST(test_telematics_fields_may_come_in_any_order);
+    RUN_TEST(test_telematics_single_field_and_no_trailing_pipe);
+    RUN_TEST(test_telematics_empty_or_unknown_write_is_rejected);
+    RUN_TEST(test_telematics_song_is_truncated_at_31_chars);
+    RUN_TEST(test_telematics_dist_range_and_syntax);
+    RUN_TEST(test_telematics_icon_range);
+    RUN_TEST(test_telematics_partial_write_does_not_touch_other_fields);
+    RUN_TEST(test_telematics_write_without_nul_terminator);
+    RUN_TEST(test_telematics_write_over_the_max_is_dropped);
     return UNITY_END();
 }
